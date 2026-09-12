@@ -26,7 +26,7 @@ import pytest
 
 from app import k8s_client
 from app.controller import ControllerState, OnDemandCandidate
-from app.k8s_client import emit_lease_denied_event
+from app.k8s_client import emit_lease_denied_event, format_duration_compact
 from app.reservation_client import LeaseAttempt, ReservationClient
 from app.schemas import OnDemandAdmissionCandidate, OnDemandReservationRequest
 
@@ -40,6 +40,9 @@ from tests.conftest import (
 )
 
 NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
+# The ask the app refused: a 3 h pod minimum runtime plus the default 10 min
+# lease buffer, which is what the Event reports.
+LEASE_SECONDS = 3 * 3600 + 10 * 60
 DETAIL = "Only 2 GPU(s) available for this group at 2024-01-15 09:00 (group ceiling: 4)"
 
 
@@ -174,12 +177,13 @@ class _CapturingCore:
         return SimpleNamespace()
 
 
-def _emit(core, monkeypatch, *, detail=DETAIL):
+def _emit(core, monkeypatch, *, detail=DETAIL, duration_seconds=LEASE_SECONDS):
     monkeypatch.setattr(k8s_client, "_core_v1", core)
     asyncio.run(
         emit_lease_denied_event(
             "uid-1", "pod-1", USERNAME, detail,
             gpu_class=GPU_CLASS_LABEL, gpu_count=2,
+            duration_seconds=duration_seconds,
         )
     )
 
@@ -213,6 +217,25 @@ class TestEmitLeaseDeniedEvent:
         assert DETAIL in event.message
         assert "2 x " + GPU_CLASS_LABEL in event.message
 
+    def test_message_states_the_requested_duration(self, monkeypatch):
+        # The duration is half the ask and is frequently why it was refused:
+        # without it the owner of a long job cannot tell a capacity shortage
+        # from a length they could shorten.
+        core = _CapturingCore()
+        _emit(core, monkeypatch)
+        _ns, event = core.events[0]
+        assert (
+            f"On-demand GPU lease for 2 x {GPU_CLASS_LABEL}, minimum duration 3h10m "
+            f"was denied by the reservation service: {DETAIL}."
+        ) in event.message
+
+    def test_sub_minute_duration_still_renders(self, monkeypatch):
+        # A duration must never render blank, whatever its magnitude.
+        core = _CapturingCore()
+        _emit(core, monkeypatch, duration_seconds=45)
+        _ns, event = core.events[0]
+        assert "minimum duration 45s was denied" in event.message
+
     def test_generate_name_so_repeats_never_409(self, monkeypatch):
         core = _CapturingCore()
         _emit(core, monkeypatch)
@@ -244,6 +267,25 @@ class TestEmitLeaseDeniedEvent:
         assert event.involved_object.uid == "uid-1"
 
 
+class TestFormatDurationCompact:
+    @pytest.mark.parametrize(
+        "seconds,expected",
+        [
+            (3 * 3600 + 10 * 60, "3h10m"),   # the common ask: 3 h + 10 min buffer
+            (3600, "1h"),                     # zero components are dropped
+            (3660, "1h1m"),
+            (3601, "1h1s"),                   # ...including the middle one
+            (600, "10m"),
+            (90, "1m30s"),
+            (45, "45s"),
+            (0, "0s"),                        # never blank
+            (-5, "0s"),                       # nor negative
+        ],
+    )
+    def test_renders_non_zero_components_only(self, seconds, expected):
+        assert format_duration_compact(seconds) == expected
+
+
 # ---------------------------------------------------------------------------
 # main._emit_lease_denial_event — the throttle
 # ---------------------------------------------------------------------------
@@ -254,16 +296,24 @@ class _Recorder:
         self.calls: list = []
         self._raises = raises
 
-    async def __call__(self, uid, name, namespace, detail, *, gpu_class, gpu_count):
+    async def __call__(
+        self, uid, name, namespace, detail, *, gpu_class, gpu_count, duration_seconds
+    ):
         if self._raises is not None:
             raise self._raises
-        self.calls.append((uid, name, namespace, detail, gpu_class, gpu_count))
+        self.calls.append(
+            (uid, name, namespace, detail, gpu_class, gpu_count, duration_seconds)
+        )
 
 
 def _run(m, monkeypatch, config, candidate, detail, now, recorder=None):
     recorder = recorder or _Recorder()
     monkeypatch.setattr(m, "emit_lease_denied_event", recorder)
-    asyncio.run(m._emit_lease_denial_event(config, "uid-1", candidate, detail, now))
+    asyncio.run(
+        m._emit_lease_denial_event(
+            config, "uid-1", candidate, detail, now, LEASE_SECONDS
+        )
+    )
     return recorder
 
 
@@ -387,7 +437,7 @@ def _grant_and_admit(m, monkeypatch, status, detail, config=None):
         group_name=GROUP_NAME,
         gpu_class_id=GPU_CLASS_ID,
         gpu_count=2,
-        duration_seconds=1200,
+        duration_seconds=LEASE_SECONDS,
     )
     done = asyncio.run(
         m._grant_and_admit(
@@ -405,6 +455,14 @@ class TestGrantAndAdmitDenialWiring:
         rec, _candidate_out = _grant_and_admit(m, monkeypatch, 409, DETAIL)
         assert len(rec.calls) == 1
         assert rec.calls[0][3] == DETAIL
+
+    def test_the_reported_duration_is_the_one_that_was_asked_for(self, monkeypatch):
+        # Taken from the preflight-built ask (minimum runtime + buffer), not
+        # re-derived at the Event, so the pod states the duration the app
+        # actually refused.
+        m = _main_module(monkeypatch)
+        rec, _candidate_out = _grant_and_admit(m, monkeypatch, 409, DETAIL)
+        assert rec.calls[0][6] == LEASE_SECONDS
 
     def test_409_detail_is_logged_alongside(self, monkeypatch, caplog):
         m = _main_module(monkeypatch)

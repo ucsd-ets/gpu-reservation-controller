@@ -416,6 +416,29 @@ def local_display(dt: datetime) -> str:
     return format_local(dt, _display_tz)
 
 
+def format_duration_compact(seconds: int) -> str:
+    """Render a duration as a compact ``3h10m``, for prose a person reads.
+
+    Only non-zero components appear, largest first, so a lease sized in whole
+    minutes reads ``3h10m`` rather than ``3h10m00s`` — the fixed-width
+    ``{h}h{mm}m{ss}s`` form the guarantee and overstay messages use is right for
+    comparing two elapsed times against each other, and needlessly noisy for a
+    single requested length.  A sub-minute (or zero) duration still renders its
+    seconds, so the value is never blank.
+    """
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return "".join(parts)
+
+
 # Annotation keys describing the reservation an admitted pod is running under,
 # stamped alongside the runtime guarantee (see annotate_runtime_guarantee).
 # ``galends/guaranteed-until`` is the end of the guarantee *chain*, which says
@@ -1379,6 +1402,7 @@ async def emit_lease_denied_event(
     *,
     gpu_class: str,
     gpu_count: int,
+    duration_seconds: int,
 ) -> None:
     """Create a ``Warning`` Event linked to a pod whose JIT lease was refused.
 
@@ -1395,6 +1419,14 @@ async def emit_lease_denied_event(
     until something changes — which also matches how kube-scheduler reports the
     neighbouring condition, ``FailedScheduling``.  Informational only: the
     controller keeps retrying on its own cadence either way.
+
+    The message states the *whole* ask, not just its GPU half: *duration_seconds*
+    is the lease length the controller requested (the pod's
+    ``galends/minimum-runtime-seconds`` plus ``ONDEMAND_LEASE_BUFFER_MINUTES``),
+    and it is frequently why an ask was refused — the same GPUs are free now but
+    booked before the run would end.  Without it the owner of a long job reads
+    "1 x xtra was denied" and has no way to tell a capacity shortage from a
+    length they could shorten.
     """
     await _emit_pod_event(
         pod_uid,
@@ -1405,7 +1437,8 @@ async def emit_lease_denied_event(
         action="RequestOnDemandLease",
         event_type="Warning",
         message=(
-            f"On-demand GPU lease for {gpu_count} x {gpu_class} was denied by the "
+            f"On-demand GPU lease for {gpu_count} x {gpu_class}, minimum duration "
+            f"{format_duration_compact(duration_seconds)} was denied by the "
             f"reservation service: {detail}. The pod stays Pending; the controller "
             f"will keep retrying."
         ),

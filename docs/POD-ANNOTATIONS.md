@@ -503,11 +503,18 @@ Events:
   Type     Reason                Age    From                          Message
   ----     ------                ----   ----                          -------
   Warning  FailedScheduling      5m12s  default-scheduler             0/41 nodes are available: ...
-  Warning  OnDemandLeaseDenied   4m58s  gpu-reservation-controller    On-demand GPU lease for 2 x a100 was denied by the reservation service: Only 1 GPU(s) available for this group at 2026-08-21 14:00 (group ceiling: 4). The pod stays Pending; the controller will keep retrying.
+  Warning  OnDemandLeaseDenied   4m58s  gpu-reservation-controller    On-demand GPU lease for 2 x a100, minimum duration 4h10m was denied by the reservation service: Only 1 GPU(s) available for this group at 2026-08-21 14:00 (group ceiling: 4). The pod stays Pending; the controller will keep retrying.
 ```
 
-Three things worth knowing about it:
+Four things worth knowing about it:
 
+- **It states the whole ask, duration included.** `minimum duration 4h10m` is
+  the lease the controller requested on the pod's behalf: its
+  `galends/minimum-runtime-seconds` (§3) plus the deployment's lease buffer
+  (`ONDEMAND_LEASE_BUFFER_MINUTES`, 10 minutes by default). The length is often
+  *why* an ask was refused — the GPUs are free now but booked before the run
+  would end — so a job that declares a shorter minimum runtime may get in where
+  this one did not.
 - **It is not a terminal state.** The controller keeps retrying on its own
   cadence (2–5 minutes); the Event is a report, not a rejection. A pod denied
   for capacity usually gets in once someone else's job ends.

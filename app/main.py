@@ -1175,6 +1175,7 @@ async def _emit_lease_denial_event(
     candidate: OnDemandCandidate,
     detail: Optional[str],
     now: datetime,
+    duration_seconds: int,
 ) -> None:
     """Tell the pod's owner why its JIT lease was refused, via a Kubernetes Event.
 
@@ -1191,6 +1192,14 @@ async def _emit_lease_denial_event(
     than reporting once and going quiet: Events expire (an hour, by default), so
     a pod still waiting must restate its reason or ``kubectl describe`` goes
     blank on a pod that is still blocked.  ``0`` disables the throttle entirely.
+
+    *duration_seconds* is the lease length the ask carried (the pod's minimum
+    runtime plus the configured buffer), taken from the preflight-built ask
+    rather than re-derived here, so the Event states the same duration the app
+    refused.  It is fixed for a candidate's life -- ``min_runtime_seconds`` is
+    read once, when the candidate is created -- so the throttle above stays
+    keyed on *detail* alone: the duration half of the message cannot change
+    between two denials of the same candidate.
 
     Best-effort throughout, like every other emitter here: a failure to emit is
     logged and never disturbs the retry cadence, which is the thing that
@@ -1213,6 +1222,7 @@ async def _emit_lease_denial_event(
             detail,
             gpu_class=candidate.gpu_class_label,
             gpu_count=candidate.gpu_requested,
+            duration_seconds=duration_seconds,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
@@ -1294,7 +1304,9 @@ async def _grant_and_admit(
                 # Surface the app's reason on the pod itself: the retry cadence
                 # below is invisible to its owner, who otherwise sees only a pod
                 # that stays Pending with nothing saying why.
-                await _emit_lease_denial_event(config, uid, candidate, attempt.detail, now)
+                await _emit_lease_denial_event(
+                    config, uid, candidate, attempt.detail, now, ask.duration_seconds,
+                )
         else:
             # A fault waiting will not fix — a read-only service key, a schema
             # mismatch after an app upgrade, an unknown group name.  WARNING so

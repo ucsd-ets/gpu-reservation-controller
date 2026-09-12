@@ -187,7 +187,10 @@ reservation rather than creating a duplicate.
   ceiling: 4)` — that reason is also mirrored onto the pod as a `Warning`
   Kubernetes Event (`reason=OnDemandLeaseDenied`), so the pod's **owner** can see
   why their job is still Pending with `kubectl describe pod` rather than needing
-  the controller's logs.  An unchanged reason is restated at most once per
+  the controller's logs.  The Event names the whole ask — GPU count, class, and
+  the requested lease duration (`minimum duration 4h10m`: the pod's
+  `galends/minimum-runtime-seconds` plus `ONDEMAND_LEASE_BUFFER_MINUTES`), which
+  is frequently what made it infeasible.  An unchanged reason is restated at most once per
   `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (a changed one is reported at once), and
   only the app's own denial is surfaced this way — a network failure or a
   controller misconfiguration is an operator's problem and stays in the log.

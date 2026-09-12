@@ -1013,7 +1013,14 @@ Four properties are load-bearing:
 - **The detail is carried, not re-derived.**  `LeaseAttempt.detail` (already
   truncated to 200 chars by `_response_detail`, so a proxy's HTML error page
   cannot become a 5 KB Event message) is the single value both the `lease.denied`
-  log line and the Event render.
+  log line and the Event render.  The Event's own half of the message states the
+  whole ask — GPU count, class, **and the requested lease duration**, rendered
+  compactly by `k8s_client.format_duration_compact` (`3h10m`) and taken from the
+  preflight-built `OnDemandAdmissionCandidate.duration_seconds` (minimum runtime
+  + `ONDEMAND_LEASE_BUFFER_MINUTES`) rather than re-derived, so the pod reports
+  the duration the app actually refused.  The length is often *why* it was
+  refused, and without it the owner of a long job cannot tell a capacity shortage
+  from a length they could shorten.
 - **Throttled by content first, clock second.**  A *changed* reason is new
   information and emits immediately; an *unchanged* one waits out
   `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30).  The retry cadence is
