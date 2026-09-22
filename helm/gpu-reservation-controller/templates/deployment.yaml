@@ -84,6 +84,8 @@ spec:
               value: {{ .Values.config.noshowGraceMinutes | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.config.logLevel | quote }}
+            - name: LIBRARY_LOG_LEVEL
+              value: {{ .Values.config.libraryLogLevel | quote }}
             {{- if .Values.config.podSchedulingGateName }}
             - name: POD_SCHEDULING_GATE_NAME
               value: {{ .Values.config.podSchedulingGateName | quote }}

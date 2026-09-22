@@ -167,13 +167,33 @@ for _handler in logging.root.handlers:
 log = logging.getLogger(__name__)
 
 
+# Third-party client libraries whose verbose output is wire-level tracing, not
+# controller behaviour: ``kubernetes.client.rest`` dumps whole response bodies at
+# DEBUG, ``urllib3`` / ``httpcore`` log every connection and request, and
+# ``httpx`` logs one ``HTTP Request:`` line per call even at INFO.
+_LIBRARY_LOGGERS = ("httpx", "httpcore", "urllib3", "kubernetes")
+
+
 def _configure_logging(config: Config) -> None:
-    """Apply the configured root log level (LOG_LEVEL via Config, CODE-REVIEW H1).
+    """Apply the configured log levels (LOG_LEVEL via Config, CODE-REVIEW H1).
 
     Keeps all environment parsing in ``config.py`` — ``main.py`` no longer reads
     ``os.environ`` directly.
+
+    The client libraries get ``LIBRARY_LOG_LEVEL`` instead of inheriting the
+    root level, so ``LOG_LEVEL=DEBUG`` shows the controller's own DEBUG events
+    without the raw API traces underneath them.  It can only make them quieter:
+    the effective level is the stricter of the two, so ``LOG_LEVEL`` stays the
+    ceiling on verbosity and ``LOG_LEVEL=ERROR`` still silences library warnings.
     """
-    logging.getLogger().setLevel(config.log_level.upper())
+    root = logging.getLogger()
+    root.setLevel(config.log_level.upper())
+    library_level = max(
+        root.getEffectiveLevel(),
+        logging.getLevelNamesMapping()[config.library_log_level],
+    )
+    for name in _LIBRARY_LOGGERS:
+        logging.getLogger(name).setLevel(library_level)
 
 
 # Retry backoff shared by both admission paths (CODE-REVIEW D1e).  The jittered

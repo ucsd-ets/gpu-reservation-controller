@@ -9,7 +9,11 @@ names below are the ones that appear on the line; look them up in the dictionary
 for types and semantics.
 
 `LOG_LEVEL` (default `INFO`) sets the threshold. Everything marked DEBUG below is
-suppressed unless you set `LOG_LEVEL=DEBUG`. All timestamps and all window
+suppressed unless you set `LOG_LEVEL=DEBUG`. The HTTP and Kubernetes client
+libraries (`httpx`, `httpcore`, `urllib3`, `kubernetes`) are held separately at
+`LIBRARY_LOG_LEVEL` (default `WARNING`) — their verbose output is raw API
+request/response traces, not controller events — and can only be quieter than
+`LOG_LEVEL`, never louder; set both to `DEBUG` to see those traces. All timestamps and all window
 arithmetic are UTC; `TZ` affects only how the timestamp column is rendered.
 
 ---
@@ -79,7 +83,7 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
-| WARNING | `config.invalid` | `name value reason detail` | An environment variable was junk, out of range or an unknown timezone and the **default was used instead** (`reason=not_an_integer` \| `out_of_range` \| `unknown_timezone`). Emitted from `Config.from_env`, so it precedes every other line. |
+| WARNING | `config.invalid` | `name value reason detail` | An environment variable was junk, out of range, an unknown timezone or an unknown log level and the **default was used instead** (`reason=not_an_integer` \| `out_of_range` \| `unknown_timezone` \| `unknown_log_level`). Emitted from `Config.from_env`, so it precedes every other line. |
 | INFO | `config.timezone` | `name value` | The timezone the human-readable Event and annotation prose renders in, and which variable decided it (`EVENT_DISPLAY_TIMEZONE` when set, else `TZ`). Logged because the default is *derived* from the process environment rather than read off a variable, so it is otherwise unknowable from the Deployment. Display only — every log field here, and every `galends/*` timestamp annotation, stays UTC. |
 | INFO | `startup.initial_fetch` | — | Synchronous first fetch, before the loops launch. |
 | INFO | `startup.initial_fetch_complete` | `reservations classes` | |

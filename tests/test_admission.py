@@ -39,6 +39,7 @@ _CONFIG_ENV = [
     "POD_NAMESPACE",
     "HOSTNAME",
     "LOG_LEVEL",
+    "LIBRARY_LOG_LEVEL",
 ]
 
 
@@ -78,6 +79,7 @@ class TestConfigFromEnv:
         c = Config.from_env()
         assert c.reservation_api_url == "http://x"   # trailing slash stripped
         assert c.log_level == "INFO"
+        assert c.library_log_level == "WARNING"
         assert c.noshow_timeout_minutes == 15
         assert c.noshow_grace_minutes == 30
         assert c.queue_processor_interval == 300
