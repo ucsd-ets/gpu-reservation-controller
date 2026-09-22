@@ -1569,6 +1569,7 @@ the claimed set and the grace re-arm path above applies.
 | `POD_NAME` | *(hostname)* | This pod's name (downward API) — the Lease holder identity; falls back to `HOSTNAME`, then the system hostname |
 | `POD_NAMESPACE` | *(SA namespace)* | Namespace the Lease lives in (downward API); falls back to the service-account namespace file, then `default` |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
+| `LIBRARY_LOG_LEVEL` | `WARNING` | Level for the HTTP/Kubernetes client libraries (`httpx`, `httpcore`, `urllib3`, `kubernetes`), whose verbose output is raw API traces, so `LOG_LEVEL=DEBUG` shows the controller's own DEBUG events without them. The effective level is the stricter of this and `LOG_LEVEL`; set both to `DEBUG` for the raw traces. Unknown level ⇒ `config.invalid`, default used |
 
 ---
 

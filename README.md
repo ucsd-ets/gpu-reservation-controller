@@ -481,6 +481,7 @@ All settings are supplied via environment variables.
 | `POD_NAME` | no | *(hostname)* | This pod's name, from the downward API; used as the singleton Lease holder identity. Falls back to `HOSTNAME`, then the system hostname |
 | `POD_NAMESPACE` | no | *(service-account namespace)* | Namespace the singleton Lease is created in, from the downward API. Falls back to the in-cluster service-account namespace, then `default` |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
+| `LIBRARY_LOG_LEVEL` | no | `WARNING` | Logging level for the HTTP and Kubernetes client libraries (`httpx`, `httpcore`, `urllib3`, `kubernetes`), whose verbose output is raw API request/response traces — so `LOG_LEVEL=DEBUG` shows the controller's own DEBUG events without them. Can only quieten the libraries below `LOG_LEVEL`, never raise them above it; set both to `DEBUG` to see the raw traces. An unknown level logs `config.invalid` and falls back |
 
 > **Security note:** The controller needs a **`read_write`**-scoped service
 > key: besides the read endpoints (`/api/reservations`, `/api/gpu-classes`),

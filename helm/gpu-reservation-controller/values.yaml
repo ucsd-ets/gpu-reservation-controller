@@ -131,6 +131,12 @@ config:
   # Log level: DEBUG, INFO, WARNING, ERROR
   logLevel: "INFO"
 
+  # Log level for the HTTP and Kubernetes client libraries (httpx, httpcore,
+  # urllib3, kubernetes), whose verbose output is raw API request/response
+  # traces.  Can only make them quieter than logLevel, never louder — to see
+  # the raw traces, set both to DEBUG.
+  libraryLogLevel: "WARNING"
+
   # Name of the SchedulingGate to remove when admitting a pod.
   # Leave empty to disable scheduling gate management.
   podSchedulingGateName: ""

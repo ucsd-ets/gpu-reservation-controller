@@ -125,6 +125,29 @@ def _env_tz(name: str, default: Optional[tzinfo] = None) -> Optional[tzinfo]:
         return default
 
 
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _env_log_level(name: str, default: str) -> str:
+    """Read a logging level name, falling back to *default* on an unknown one.
+
+    The same tolerant posture as ``_env_bool`` / ``_env_int``: a typo'd level
+    must not kill startup over a *logging* setting, so it logs
+    ``config.invalid`` and falls back.  Case-insensitive; returned upper-case.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    value = raw.upper()
+    if value not in _LOG_LEVELS:
+        log.warning("%s", kv(
+            event="config.invalid", name=name, value=raw,
+            reason="unknown_log_level", detail=f"using default {default}",
+        ))
+        return default
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     reservation_api_url: str
@@ -186,6 +209,9 @@ class Config:
     # every galends/* timestamp annotation and every log field stays UTC.
     display_timezone: Optional[tzinfo] = None
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
+    # Level for the HTTP/Kubernetes client libraries (LIBRARY_LOG_LEVEL), whose
+    # DEBUG output is raw wire traces.  Can only quieten them below LOG_LEVEL.
+    library_log_level: str = "WARNING"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -275,4 +301,5 @@ class Config:
             # events read local.
             display_timezone=_env_tz("EVENT_DISPLAY_TIMEZONE"),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
+            library_log_level=_env_log_level("LIBRARY_LOG_LEVEL", "WARNING"),
         )
