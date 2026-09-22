@@ -1263,9 +1263,10 @@ async def _emit_pod_event(
 
     Takes the pod **uid** rather than the pod object because that is the only
     field of it this needs (the ``involvedObject`` reference), and the
-    lease-denial emitter has a uid in hand without a pod: its candidate was
-    never admitted, so re-reading the pod purely to fill in an event would be a
-    second API call for a field the caller already knows.
+    lease-denial and admission-paused emitters have a uid in hand without a
+    pod: their candidate was never admitted, so re-reading the pod purely to
+    fill in an event would be a second API call for a field the caller already
+    knows.
     """
     now = datetime.now(timezone.utc)
     event = k8s_client.CoreV1Event(
@@ -1413,6 +1414,45 @@ async def emit_lease_denied_event(
     log.info("%s", kv(
         event="k8s.event_emitted", ns=namespace, pod=pod_name,
         reason="OnDemandLeaseDenied", clabel=gpu_class, gpus=gpu_count,
+    ))
+
+
+async def emit_admission_paused_event(
+    pod_uid: str,
+    pod_name: str,
+    namespace: str,
+    message: str,
+    *,
+    gpu_class: str,
+    guard: int,
+) -> None:
+    """Create a ``Warning`` Event on a pod whose on-demand admission is paused.
+
+    The sibling of ``emit_lease_denied_event`` for the other way a JIT candidate
+    sits Pending: never offered to the app at all, because a class-wide gate —
+    guard 3's stuck-holder interlock or guard 4's capacity overcommit — holds
+    every on-demand pod of its GPU class until something outside the pod
+    changes.  An operator hears about that from the ``ondemand.gated`` log line;
+    this is how the pod's owner does.
+
+    *message* is rendered by the caller (``main._admission_paused_message``),
+    which knows what each guard means; this only writes it.  ``Warning`` for
+    the same reason as the denial: the pod is not running and will not until
+    something changes.
+    """
+    await _emit_pod_event(
+        pod_uid,
+        pod_name,
+        namespace,
+        name_prefix="gpu-admission-paused-",
+        reason="OnDemandAdmissionPaused",
+        action="HoldOnDemandAdmission",
+        event_type="Warning",
+        message=message,
+    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name,
+        reason="OnDemandAdmissionPaused", clabel=gpu_class, guard=guard,
     ))
 
 

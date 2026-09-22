@@ -194,12 +194,27 @@ config:
   # Set to false to disable.
   ondemandDenialEventEnabled: true
 
-  # How long an *unchanged* denial reason is suppressed before being restated on
-  # the pod.  The lease retry cadence is 2-5 minutes, so without this a blocked
-  # pod would collect a new Event every few minutes; the repeat still fires
-  # because Events expire and a pod that is still stuck should still say so.  A
-  # reason that *changes* is emitted immediately regardless.  0 = every denial.
+  # How long an *unchanged* status is suppressed before being restated on a
+  # pending pod -- a lease denial, or an admission pause (ondemandPauseEventEnabled
+  # below; the two share this one cadence).  The lease retry cadence is 2-5
+  # minutes, so without this a blocked pod would collect a new Event every few
+  # minutes; the repeat still fires because Events expire and a pod that is still
+  # stuck should still say so.  A status that *changes* is emitted immediately
+  # regardless.  0 = every attempt.
   ondemandDenialEventRepeatMinutes: 30
+
+  # Put a Warning Kubernetes Event (reason=OnDemandAdmissionPaused) on every pod
+  # held by a class-wide on-demand pause -- a reservation holder stuck Pending on
+  # the class, or the reservation app counting more GPUs than the cluster has --
+  # telling its owner why it is still Pending and to contact support if it
+  # persists.  Restated on the ondemandDenialEventRepeatMinutes cadence above.
+  # Set to false to disable.
+  ondemandPauseEventEnabled: true
+
+  # How pod owners reach support -- an email address or URL -- named at the end
+  # of that Event ("If this persists, contact support: <supportContact>").  Keep
+  # it short; it is part of every such Event.  Empty = the Event names no one.
+  supportContact: ""
 
   # Stamp pods at risk of demand-driven preemption with informational
   # galends/termination-warning-* annotations (projected termination time, risk

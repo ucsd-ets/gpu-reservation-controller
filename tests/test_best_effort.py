@@ -318,6 +318,7 @@ def _preflight_config(**overrides):
         ondemand_lease_buffer_minutes=10,
         scheduling_gate_name=None,
         ondemand_denial_event_enabled=False,
+        ondemand_pause_event_enabled=False,
     )
     base.update(overrides)
     return SimpleNamespace(**base)

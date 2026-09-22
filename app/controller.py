@@ -404,13 +404,18 @@ class OnDemandCandidate:
     # the flat 2-5 min denial cadence forever.  Reset on any grant or routine
     # denial.  See main._grant_and_admit and _error_retry_at.
     lease_error_count: int = 0
-    # What the last denial Event on this pod said, and when it was emitted, so a
-    # reason that has not changed is not restated every 2-5 min.  In-memory like
-    # the rest of the candidate: after a restart the pod is re-warned once, which
-    # is the right side to err on -- Events expire, so a fresh one restores a
-    # signal that would otherwise have aged out.  See main._emit_lease_denial_event.
-    denial_event_detail: Optional[str] = None
-    denial_event_at: Optional[datetime] = None
+    # The last pending-status Event put on this pod -- its reason plus the text
+    # that varies with it (the app's denial detail, or the rendered pause
+    # message) -- and when it was emitted, so a status that has not changed is
+    # not restated on every retry.  One pair shared by OnDemandLeaseDenied and
+    # OnDemandAdmissionPaused, so the pod's Events tell a single story: moving
+    # from one to the other is a change and is reported at once, and whichever
+    # holds repeats on the one cadence.  In-memory like the rest of the
+    # candidate: after a restart the pod is re-told once, which is the right
+    # side to err on -- Events expire, so a fresh one restores a signal that
+    # would otherwise have aged out.  See main._post_pending_status.
+    status_event_key: Optional[tuple[str, str]] = None
+    status_event_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)

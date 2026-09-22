@@ -232,6 +232,22 @@ GPU class is stuck in Pending (admitted but the scheduler cannot place it),
 lease requests are suspended for that class until the stuck pod is resolved.
 Other GPU classes are unaffected.
 
+**Telling the pod's owner about a paused class** — guard 3 and the capacity
+audit's overcommit pause (guard 4) hold *every* on-demand pod of a GPU class
+until something outside the pod changes, and the app is never asked, so there
+is no denial to relay.  Each pod they hold gets a `Warning` Kubernetes Event
+(`reason=OnDemandAdmissionPaused`) saying that on-demand admission for its class
+is paused, why in plain terms, that nothing about the pod needs to change, and
+to contact support if it persists — naming `SUPPORT_CONTACT` when that is set.
+It runs on the denial Event's throttle and cadence: a changed status is reported
+at once, an unchanged one at most once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES`,
+and because the two Events share that throttle, the newest one on a pod always
+describes what is holding it now.  It never names the stuck holders (other
+users' pods) or the capacity counts; an operator has those in the
+`ondemand.gated` log line.  A fully drained class (guard 1b) and a fragmented
+one (guard 5) are not reported this way.  `ONDEMAND_PAUSE_EVENT_ENABLED=false`
+disables it.  See [`docs/POD-ANNOTATIONS.md` §5.2](docs/POD-ANNOTATIONS.md).
+
 **Per-node feasibility (guard 5)** — GPUs are node-scoped: a pod requesting N
 `nvidia.com/gpu` only schedules if a *single* node has N free (Kubernetes never
 splits a job across nodes).  Before requesting a lease for a **multi-GPU (≥2)**
@@ -454,7 +470,9 @@ All settings are supplied via environment variables.
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | no | `true` | Mirror the reservation app's **409** denial reason for a JIT lease onto the waiting pod as a `Warning` Kubernetes Event (`reason=OnDemandLeaseDenied`), so its owner can see why it is still Pending without access to the controller's logs. Informational only — the controller retries either way. Only the app's own denial is surfaced; a network failure or a non-409 fault stays in the log. Set to `false` to disable |
-| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | no | `30` | How long an **unchanged** denial reason is suppressed before being restated on the pod. The retry cadence is 2–5 min, so without this a blocked pod would accumulate a new Event every few minutes; the repeat still fires because Events expire, and a pod that is still stuck should still say so. A reason that **changes** is emitted immediately regardless. `0` emits on every denial |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | no | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial, or an admission pause (`ONDEMAND_PAUSE_EVENT_ENABLED`); the name predates the second. The retry cadence is 2–5 min, so without this a blocked pod would accumulate a new Event every few minutes; the repeat still fires because Events expire, and a pod that is still stuck should still say so. A status that **changes** — including a switch between a denial and a pause — is emitted immediately regardless. `0` emits on every attempt |
+| `ONDEMAND_PAUSE_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event (`reason=OnDemandAdmissionPaused`) on every pod held by a class-wide on-demand pause — a stuck reservation holder (guard 3) or an app-side capacity overcommit (guard 4) — saying why it is still Pending and suggesting its owner contact support if it persists. Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
+| `SUPPORT_CONTACT` | no | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of that suggestion (`If this persists, contact support: <value>`). Keep it short: it is part of every such Event. Unset, the suggestion names no one |
 | `BEST_EFFORT_ENABLED` | no | `false` | Honour a pod's `galends/runtime-guarantee: none` annotation by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation rather than a guaranteed lease — no runtime guarantee, no Service Units, preemptible from the first second. Requires an app build serving the best-effort create shape; `false` ignores the annotation entirely |
 | `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. The app endpoint is shipped but selects grant-all today, so enabling this changes no behaviour until the app carries real admission policy |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side |

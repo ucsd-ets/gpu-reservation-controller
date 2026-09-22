@@ -1021,10 +1021,12 @@ Four properties are load-bearing:
   2–5 min, so emitting every denial would bury the pod's other Events — but
   reporting once and going quiet is equally wrong, because Events expire and a
   pod still blocked an hour later would `kubectl describe` clean.  The repeat is
-  what keeps the two failure modes apart.
-- **Best-effort, and the stamp follows the emit.**  `denial_event_detail` /
-  `denial_event_at` on the `OnDemandCandidate` are written **only** after a
-  successful emit, so a failed one is retried on the next denial rather than
+  what keeps the two failure modes apart.  The throttle is
+  `main._post_pending_status`, shared with the admission-paused Event (see
+  **Telling the pod's owner that admission is paused**).
+- **Best-effort, and the stamp follows the emit.**  `status_event_key` /
+  `status_event_at` on the `OnDemandCandidate` are written **only** after a
+  successful emit, so a failed one is retried on the next attempt rather than
   suppressed for the whole interval.  A failure logs `k8s.event_failed` and never
   disturbs the retry cadence, which is the thing that actually gets the pod
   running.  The state is in-memory like the rest of the candidate: after a
@@ -1215,6 +1217,61 @@ guard-4 line states both counts) and the queue tick keeps the stuck holders' nam
 (`stuck_holder_pods`, so a guard-3 line names the pods to inspect).  Guard 5 is
 deliberately not reported (per-ask fragmentation, not a fault).  **RBAC / config**:
 none new; in-memory reads only; runs only when `ONDEMAND_LEASE_ENABLED`.
+The pod owner's side of guards 3 and 4 is the next section.
+
+### Telling the pod's owner that admission is paused
+
+The operator warning reaches the controller's log; the owner of a pod the pause
+is holding cannot read that log, and — unlike a 409 — there is no denial to
+mirror, because a class-wide gate means the app is never asked.  What they saw
+was a pod Pending with nothing explaining it, for as long as the pause stood.
+
+So each **guard 3** or **guard 4** hold in `_preflight_ondemand_candidate` also
+calls `main._emit_admission_paused_event`, which puts a **`Warning` Event**
+(`reason=OnDemandAdmissionPaused`, via `k8s_client.emit_admission_paused_event`)
+on the pod: the class is paused, why in plain terms, nothing about the pod needs
+to change, and — the point of it — **if this persists, contact support**.
+`SUPPORT_CONTACT` (an address or URL) is named at the end of that sentence when
+set, with no full stop after it so it copies cleanly out of `kubectl describe`.
+
+- **Emitted where the hold is decided, not from the gate-warning loop.**  The
+  preflight knows this pod was held and by which guard; `plan_ondemand_gates`
+  counts every candidate of a class, including ones held earlier (guard 1a/1b)
+  or about to be rerouted to a reservation.  It also keeps
+  `ondemand_gate_warning_loop` what it is documented as — in-memory reads, no API
+  calls.  Guard 3 runs before guard 4, so a class under both reports guard 3.
+- **One throttle, one cadence, one story.**  `main._post_pending_status` is the
+  throttle for *both* pending-pod Events, keyed per candidate on
+  `(reason, varying text)` — the app's `detail` for a denial, the rendered
+  message for a pause.  So the pause runs on exactly the denial's cadence
+  (changed status at once, unchanged once per
+  `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES`; the name predates the pause and was
+  kept rather than breaking deployed values), and moving between the two is a
+  change that is reported immediately.  A throttle per Event reason would have
+  let a pod go paused → denied → paused with the third notice suppressed, so the
+  newest Event on it described a block that no longer applied.  A pod flapping
+  between the two is told on every flip; the gates themselves only move on the
+  queue tick (and, for guard 4, the hourly audit), which bounds that.
+- **The message is the throttle key, so it must not drift.**
+  `_admission_paused_message` carries no count and no timestamp — either would
+  make every retry a "changed" status and restate the Event each time.  It also
+  deliberately leaves out what only an operator can act on: the capacity counts,
+  and the stuck holders' names, which are *other users'* pods (a namespace is a
+  username).  An operator correlates a quoted Event with `ondemand.gated` by
+  `clabel`.
+- **Scope is guards 3 and 4.**  Guard 1b (no schedulable node) is not told: the
+  inventory already counts cordoned and deleting nodes out, so it takes every
+  node of the class being cordoned or removed — an operator's own act, typically
+  maintenance — and "contact support" would only turn that into tickets.  Guard 5
+  is fragmentation that clears as jobs finish.  A best-effort candidate is exempt
+  from guard 4, so it is never told about one.
+- **Best-effort like every emitter.**  The hold's `next_attempt_at` is set before
+  the emit; a failure logs `k8s.event_failed reason=OnDemandAdmissionPaused`,
+  stamps nothing (so the next hold retries it), and changes nothing else.
+
+**RBAC / config**: none new — `events: create` is already required.
+`ONDEMAND_PAUSE_EVENT_ENABLED=false` disables it; `SUPPORT_CONTACT` is optional.
+User-facing documentation is `docs/POD-ANNOTATIONS.md` §5.2.
 
 ### Per-node capacity accounting
 
@@ -1582,7 +1639,9 @@ the claimed set and the grace re-arm path above applies.
 | `BEST_EFFORT_ENABLED` | `false` | Honour a pod's `galends/runtime-guarantee: none` by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation instead of a guaranteed lease (see **Best-effort admission**). Ships dark: the app must serve the best-effort create shape, and against one that does not, every such candidate takes a non-retryable 4xx into `lease.error` backoff. The pod annotation alone is deliberately *not* the opt-in — unlike `galends/force-node-capacity`, any pod author can set it |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's **409** denial reason for a JIT lease onto the waiting pod as a `Warning` Event (`reason=OnDemandLeaseDenied`), so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
-| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** denial reason is suppressed before being restated on the pod — the retry cadence is 2–5 min, and Events expire, so neither "every denial" nor "once only" is right. A **changed** reason emits immediately regardless; `0` emits on every denial |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial *or* an admission pause, which share one throttle (the name predates the pause) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between the two, emits immediately regardless; `0` emits on every attempt |
+| `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
+| `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of that Event's "contact support" suggestion. Unset = the suggestion names no one |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
 | `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |

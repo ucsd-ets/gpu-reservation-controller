@@ -172,9 +172,18 @@ class Config:
     # the waiting pod, so its owner can see why it is still Pending.  The repeat
     # interval throttles an *unchanged* reason (the retry cadence is 2-5 min, far
     # faster than anyone needs to be told the same thing); a reason that changes
-    # is emitted at once regardless, and 0 means emit on every denial.
+    # is emitted at once regardless, and 0 means emit on every denial.  The
+    # interval governs the admission-paused Event below too -- the name predates
+    # it -- so every status update on a pending pod runs on one cadence.
     ondemand_denial_event_enabled: bool = True
     ondemand_denial_event_repeat_minutes: int = 30
+    # Tell the owner of a pod held by a class-wide on-demand pause (guard 3's
+    # stuck-holder interlock, guard 4's capacity overcommit) with a Warning
+    # Event, suggesting they contact support if it persists.
+    ondemand_pause_event_enabled: bool = True
+    # How a pod's owner reaches support -- an email address or URL -- named in
+    # that suggestion.  None = the suggestion names no one.
+    support_contact: Optional[str] = None
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
     # Honour galends/runtime-guarantee=none by admitting the pod under a
@@ -265,6 +274,10 @@ class Config:
             ondemand_denial_event_repeat_minutes=_env_int(
                 "ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES", 30, minimum=0
             ),
+            ondemand_pause_event_enabled=_env_bool(
+                "ONDEMAND_PAUSE_EVENT_ENABLED", True
+            ),
+            support_contact=(os.environ.get("SUPPORT_CONTACT") or "").strip() or None,
             preemption_delegate_selection=_env_bool(
                 "PREEMPTION_DELEGATE_SELECTION", True
             ),

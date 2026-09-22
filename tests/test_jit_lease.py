@@ -772,7 +772,7 @@ class TestTryRequestLease:
 
         config = SimpleNamespace(
             ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
-            scheduling_gate_name=None,
+            scheduling_gate_name=None, ondemand_pause_event_enabled=False,
         )
         result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
 

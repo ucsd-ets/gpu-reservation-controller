@@ -274,7 +274,7 @@ class TestDenialEventThrottle:
         rec = _run(m, monkeypatch, _config(), candidate, DETAIL, NOW)
         assert len(rec.calls) == 1
         assert rec.calls[0][3] == DETAIL
-        assert candidate.denial_event_at == NOW
+        assert candidate.status_event_at == NOW
 
     def test_same_reason_within_the_interval_is_suppressed(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -297,7 +297,7 @@ class TestDenialEventThrottle:
         later = NOW + timedelta(minutes=31)
         _run(m, monkeypatch, _config(), candidate, DETAIL, later, rec)
         assert len(rec.calls) == 2
-        assert candidate.denial_event_at == later
+        assert candidate.status_event_at == later
 
     def test_a_changed_reason_emits_immediately(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -325,7 +325,7 @@ class TestDenialEventThrottle:
         rec = _run(m, monkeypatch, _config(ondemand_denial_event_enabled=False),
                    candidate, DETAIL, NOW)
         assert rec.calls == []
-        assert candidate.denial_event_at is None
+        assert candidate.status_event_at is None
 
     @pytest.mark.parametrize("detail", [None, ""])
     def test_no_detail_emits_nothing(self, monkeypatch, detail):
@@ -346,8 +346,8 @@ class TestDenialEventThrottle:
         assert kv_fields(failed[0].getMessage())["reason"] == "OnDemandLeaseDenied"
         # Not stamped, so the next denial retries rather than being suppressed
         # for the whole repeat interval.
-        assert candidate.denial_event_detail is None
-        assert candidate.denial_event_at is None
+        assert candidate.status_event_key is None
+        assert candidate.status_event_at is None
         ok = _Recorder()
         _run(m, monkeypatch, _config(), candidate, DETAIL,
              NOW + timedelta(seconds=30), ok)
