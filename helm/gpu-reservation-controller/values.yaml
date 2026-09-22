@@ -204,10 +204,11 @@ config:
   ondemandDenialEventRepeatMinutes: 30
 
   # Put a Warning Kubernetes Event (reason=OnDemandAdmissionPaused) on every pod
-  # held by a class-wide on-demand pause -- a reservation holder stuck Pending on
-  # the class, or the reservation app counting more GPUs than the cluster has --
-  # telling its owner why it is still Pending and to contact support if it
-  # persists.  Restated on the ondemandDenialEventRepeatMinutes cadence above.
+  # held by a class-wide on-demand pause -- no schedulable node left in the
+  # class, a reservation holder stuck Pending on it, or the reservation app
+  # counting more GPUs than the cluster has -- telling its owner why it is still
+  # Pending and to contact support if it persists.  Restated on the
+  # ondemandDenialEventRepeatMinutes cadence above.
   # Set to false to disable.
   ondemandPauseEventEnabled: true
 

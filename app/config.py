@@ -177,9 +177,10 @@ class Config:
     # it -- so every status update on a pending pod runs on one cadence.
     ondemand_denial_event_enabled: bool = True
     ondemand_denial_event_repeat_minutes: int = 30
-    # Tell the owner of a pod held by a class-wide on-demand pause (guard 3's
-    # stuck-holder interlock, guard 4's capacity overcommit) with a Warning
-    # Event, suggesting they contact support if it persists.
+    # Tell the owner of a pod held by a class-wide on-demand pause (guard 1b's
+    # drained class, guard 3's stuck-holder interlock, guard 4's capacity
+    # overcommit) with a Warning Event, suggesting they contact support if it
+    # persists.
     ondemand_pause_event_enabled: bool = True
     # How a pod's owner reaches support -- an email address or URL -- named in
     # that suggestion.  None = the suggestion names no one.

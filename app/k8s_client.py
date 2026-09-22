@@ -1430,10 +1430,10 @@ async def emit_admission_paused_event(
 
     The sibling of ``emit_lease_denied_event`` for the other way a JIT candidate
     sits Pending: never offered to the app at all, because a class-wide gate —
-    guard 3's stuck-holder interlock or guard 4's capacity overcommit — holds
-    every on-demand pod of its GPU class until something outside the pod
-    changes.  An operator hears about that from the ``ondemand.gated`` log line;
-    this is how the pod's owner does.
+    guard 1b (no schedulable node), guard 3's stuck-holder interlock or guard
+    4's capacity overcommit — holds every on-demand pod of its GPU class until
+    something outside the pod changes.  An operator hears about that from the
+    ``ondemand.gated`` log line; this is how the pod's owner does.
 
     *message* is rendered by the caller (``main._admission_paused_message``),
     which knows what each guard means; this only writes it.  ``Warning`` for

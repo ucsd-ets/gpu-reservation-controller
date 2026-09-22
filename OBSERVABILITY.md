@@ -140,7 +140,7 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | INFO | `pod.toleration_applied` | `ns pod tol_key tol_value booking_ref` | The patch landed. |
 | INFO | `pod.admitted` | `ns pod rid clabel gpus free reserved until` | The one line to grep for a successful admission. |
 | INFO | `pod.guarantee_recorded` | `ns pod guarantee_s until` | Informational annotations; Kubernetes enforces nothing. |
-| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus` \| `clabel guard`) | `reason=RuntimeGuaranteed` \| `BestEffortAdmitted` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `OnDemandLeaseDenied` \| `OnDemandAdmissionPaused`. `BestEffortAdmitted` replaces `RuntimeGuaranteed` for a pod admitted with no runtime guarantee (a `RuntimeGuaranteed` message would read "guaranteed for 0m00s, until \<the instant the pod started\>"). `OnDemandLeaseDenied` and `OnDemandAdmissionPaused` (`guard=3` \| `4`) are the only `Warning`-type Events — a still-Pending pod's status, on one shared throttle (§5); they and `BestEffortAdmitted` are the three addressed to the pod's *owner* rather than to an operator. |
+| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus` \| `clabel guard`) | `reason=RuntimeGuaranteed` \| `BestEffortAdmitted` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `OnDemandLeaseDenied` \| `OnDemandAdmissionPaused`. `BestEffortAdmitted` replaces `RuntimeGuaranteed` for a pod admitted with no runtime guarantee (a `RuntimeGuaranteed` message would read "guaranteed for 0m00s, until \<the instant the pod started\>"). `OnDemandLeaseDenied` and `OnDemandAdmissionPaused` (`guard=1` \| `3` \| `4`) are the only `Warning`-type Events — a still-Pending pod's status, on one shared throttle (§5); they and `BestEffortAdmitted` are the three addressed to the pod's *owner* rather than to an operator. |
 | INFO | `pod.dequeued` | `ns pod reason` | e.g. `toleration_already_present`. |
 | INFO | `pod.queue_dropped` | `ns pod` + `rid reason` \| `phase reason` | Window expired, reservation cancelled with no replacement, or the pod went terminal. |
 | INFO | `pod.requeued` | `ns pod reason old.rid new.rid` | Re-matched after its reservation was cancelled. |
@@ -172,7 +172,7 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | INFO | `ondemand.candidate_added` | `ns pod poduid clabel gpus group` (+ `min_runtime_s` \| `best_effort`) | `min_runtime_s` is absent for a **best-effort** candidate, which sizes nothing; `best_effort` is emitted only when true. |
 | DEBUG | `ondemand.candidate_removed` | `ns pod poduid` | |
 | INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for something no lease can fix (`detail` carries the scheduler's verdict). |
-| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free claimed nodes`) | **The guard number is the field** — see below. `claimed` (guard 5) is the GPUs already taken by earlier candidates in the same batch. A guard 3 or 4 hold is also told to the pod's owner as an `OnDemandAdmissionPaused` Event — see below. |
+| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free claimed nodes`) | **The guard number is the field** — see below. `claimed` (guard 5) is the GPUs already taken by earlier candidates in the same batch. A guard 1 `no_class_nodes`, 3 or 4 hold is also told to the pod's owner as an `OnDemandAdmissionPaused` Event — see below. |
 | WARNING | `ondemand.gated` | `clabel guard reason dur_s candidates detail` (+ `app_gpus phys_gpus` \| `pods`) | **Every 60 s, one line per GPU class whose on-demand admission is paused**, for as long as it stays paused — see below. |
 | ERROR | `ondemand.gate_warning_failed` | `err` | The warning pass raised; retried next minute. |
 | DEBUG | `ondemand.schedule_verdict` | `ns pod` | Scheduler verdict arrived; re-attempting immediately. |
@@ -194,7 +194,7 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | `guard=` | `reason=` | Meaning |
 |---|---|---|
 | 1 | `schedule_verdict_pending` | No `PodScheduled` verdict yet, so there is nothing to classify. Transient — the MODIFIED fast path shortens it to ~1 s. |
-| 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained/cordoned). Fail-open when unknown. |
+| 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained/cordoned). Known means the reservation app lists the class: the node inventory omits a class with no schedulable node, so every app-known class is recorded explicitly, as zero when it has none. Fail-open when unknown — a label the app does not list, or no snapshot yet. |
 | 3 | `stuck_holder_interlock` | A reservation holder is stuck Pending on this class. |
 | 4 | `class_overcommitted` | App-side capacity exceeds physical (see §8). **Not applied to a best-effort candidate**, which consumes no app-side capacity to overcommit. |
 | 5 | `no_single_node_fit` | No single node has enough free GPUs for the ask, net of `claimed` (GPUs taken by earlier candidates this batch). Applies to a ≥2-GPU ask, and to **every** best-effort ask — see below. Fail-open when unknown. |
@@ -231,8 +231,9 @@ the healthy state.
 `grep 'event=ondemand.candidate_held guard=4'` answers "how often is the capacity
 audit blocking admission" without matching on message text.
 
-**The pod's owner hears about guards 3 and 4 too**, because those two hold a pod
-for reasons outside it and never ask the app, so there is no denial to relay.
+**The pod's owner hears about guards 1 `no_class_nodes`, 3 and 4 too**, because
+those hold a pod for reasons outside it and never ask the app, so there is no
+denial to relay.
 Each hold puts a `Warning` Event on the pod (`reason=OnDemandAdmissionPaused`,
 logged as `k8s.event_emitted` with `guard=`) saying the class is paused, why in
 plain terms, and to contact support if it persists (`SUPPORT_CONTACT` names who).
@@ -242,10 +243,11 @@ throttle with `OnDemandLeaseDenied`: a changed status is emitted at once, an
 unchanged one at most once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default
 30), so the newest Event on a pod is always the thing holding it now.  A user
 quoting that Event maps straight to the `ondemand.gated` line for the same
-`clabel`.  Guard 1 `no_class_nodes` is not told — every node of the class
-cordoned or removed is an operator's own act, typically maintenance — nor is
-guard 5.  `ONDEMAND_PAUSE_EVENT_ENABLED=false` turns it off; a failed write logs
-`k8s.event_failed reason=OnDemandAdmissionPaused` and changes nothing else.
+`clabel`.  Guard 5 is not told.  A fully drained class usually reads as
+overcommitted too (the app still counts its GPUs); guard 1 runs first, so the
+pod is told about the drain.  `ONDEMAND_PAUSE_EVENT_ENABLED=false` turns it off;
+a failed write logs `k8s.event_failed reason=OnDemandAdmissionPaused` and
+changes nothing else.
 
 Guard 5 is the **only** physical bound on best-effort admission, which is why it
 applies there at every GPU count rather than only at ≥2.  A guaranteed lease is

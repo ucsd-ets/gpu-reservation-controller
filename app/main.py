@@ -973,8 +973,8 @@ async def _preflight_ondemand_candidate(
     4. Guard 3 (stuck reservation-holder safety interlock).
     5. Guard 4 (over-committed gpu-class admission pause) — not applied to a
        best-effort candidate, which consumes no app-side capacity to overcommit.
-       A pod held by guard 3 or 4 is told so with an ``OnDemandAdmissionPaused``
-       Event (``_emit_admission_paused_event``).
+       A pod held by guard 1b, 3 or 4 is told so with an
+       ``OnDemandAdmissionPaused`` Event (``_emit_admission_paused_event``).
     6. Guard 5 (per-node feasibility: no single node can host the ask) — applied
        to a multi-GPU ask, and to **every** best-effort ask regardless of count,
        since nothing app-side bounds how many of those are admitted.
@@ -1077,7 +1077,12 @@ async def _preflight_ondemand_candidate(
     # already excludes cordoned and terminating nodes, so a known count of zero
     # means a fully drained class — hold, since nodes come back.  A class with
     # no data is unknown and never blocks (fail-open, matching guard 5), so a
-    # snapshot gap cannot wedge admission.
+    # snapshot gap cannot wedge admission.  (Zero is "known" for every class
+    # the app knows; see node_counts_by_class.)
+    #
+    # Guards 1b, 3 and 4 are class-wide pauses the pod's owner can neither see
+    # nor fix, so each hold is also told to them as an Event (throttled; see
+    # _emit_admission_paused_event).
     class_nodes = state.class_node_counts.get(candidate.gpu_class_label)
     if class_nodes == 0:
         log.info("%s", kv(
@@ -1086,13 +1091,11 @@ async def _preflight_ondemand_candidate(
             clabel=candidate.gpu_class_label, nodes=0,
         ))
         candidate.next_attempt_at = _short_retry_at(now)
+        await _emit_admission_paused_event(config, uid, candidate, 1, now)
         return _PREFLIGHT_RETRY, None
 
     # Guard 3: safety interlock — hold JIT requests for any GPU class that has
-    # a stuck reservation-holder pod.  Other classes are unaffected.  Guards 3
-    # and 4 are class-wide pauses the pod's owner cannot see or fix, so each
-    # hold is also told to them as an Event (throttled; see
-    # _emit_admission_paused_event).
+    # a stuck reservation-holder pod.  Other classes are unaffected.
     if candidate.gpu_class_label in state.stuck_holder_gpu_classes:
         log.debug("%s", kv(
             event="ondemand.candidate_held", guard=3, reason="stuck_holder_interlock",
@@ -1286,7 +1289,10 @@ async def _emit_lease_denial_event(
 
 
 def _admission_paused_message(guard: int, gpu_class: str, config: Config) -> str:
-    """What the owner of a pod held by class-wide guard *guard* (3 or 4) reads.
+    """What the owner of a pod held by class-wide guard *guard* reads.
+
+    *guard* is 1 (meaning 1b -- the only guard-1 outcome that holds a class; 1a
+    drops a pod or waits on the scheduler), 3 or 4, as in ``ondemand.gated``.
 
     The pod-facing sibling of ``_ondemand_gate_detail``: the same gates, told to
     a user instead of an operator.  So it says what is happening, that nothing
@@ -1306,12 +1312,18 @@ def _admission_paused_message(guard: int, gpu_class: str, config: Config) -> str
             f"under maintenance), so no new on-demand jobs are started on this "
             f"GPU class until that is resolved"
         )
-    else:  # guard 3
+    elif guard == 3:
         cause = (
             f"jobs that already hold a reservation for {gpu_class} GPUs are still "
             f"waiting for the cluster to place them, and reserved jobs go first, "
             f"so no new on-demand jobs are started on this GPU class until they "
             f"are running"
+        )
+    else:  # guard 1b
+        cause = (
+            f"there are no {gpu_class} GPU nodes available in the cluster right now "
+            f"(for example, they are all down for maintenance), so no new on-demand "
+            f"jobs are started on this GPU class until one is back"
         )
     # The contact ends the message with no full stop after it, so an address or
     # URL copied out of `kubectl describe` does not pick one up.
@@ -1335,19 +1347,14 @@ async def _emit_admission_paused_event(
 ) -> None:
     """Tell the pod's owner that on-demand admission for its GPU class is paused.
 
-    Guards 3 and 4 hold every on-demand candidate of a class until something
-    outside the pod changes -- a stuck reservation holder schedules, or an
-    operator reconciles app-side and physical capacity -- so the app is never
-    asked and there is no denial to relay.  The operator gets ``ondemand.gated``
-    every minute; the owner, who cannot read the controller's log, otherwise
-    gets nothing but a pod that stays Pending.
-
-    Guard 1b (no schedulable node left in the class) is deliberately not told.
-    The node inventory already counts cordoned and deleting nodes out, so it
-    takes every node of the class being cordoned or removed -- an operator's
-    own act, typically maintenance -- and a "contact support" nudge would only
-    turn that into tickets.  Guard 5 is per-ask fragmentation that clears as
-    other jobs finish, i.e. a full cluster rather than a fault.
+    Guards 1b, 3 and 4 hold every on-demand candidate of a class until something
+    outside the pod changes -- a node of the class comes back, a stuck
+    reservation holder schedules, or an operator reconciles app-side and
+    physical capacity -- so the app is never asked and there is no denial to
+    relay.  The operator gets ``ondemand.gated`` every minute; the owner, who
+    cannot read the controller's log, otherwise gets nothing but a pod that
+    stays Pending.  Guard 5 is not told: it is per-ask fragmentation that clears
+    as other jobs finish, i.e. a full cluster rather than a fault.
 
     Throttled by ``_post_pending_status`` on the same cadence as a lease denial,
     keyed on the message itself.
@@ -2306,8 +2313,9 @@ async def _run_queue_tick(
             # Guard 1b reads the node *count* from the same inventory: free
             # GPUs cannot distinguish "class is full" from "class has no nodes
             # left", and those want opposite treatment (grant and wait, versus
-            # do not mint a lease at all).
-            state.class_node_counts = node_counts_by_class(inventory)
+            # do not mint a lease at all).  The classes the app knows are passed
+            # in because a drained class is absent from the inventory, not zero.
+            state.class_node_counts = node_counts_by_class(inventory, state.gpu_class_ids)
             # Guard 4: re-check the overcommit pause from the same inventory, so
             # it lifts (or engages) on this tick's cadence instead of waiting
             # for the hourly audit.

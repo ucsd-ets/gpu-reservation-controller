@@ -182,17 +182,28 @@ def gpu_capacity_by_class(
 
 def node_counts_by_class(
     capacity_by_node_class: dict[str, dict[str, int]],
+    known_classes: Iterable[str] = (),
 ) -> dict[str, int]:
     """Collapse a per-node inventory to the number of nodes backing each class.
 
-    ``{gpu_class: node count}``.  ``snapshot_node_gpu_inventory`` already
-    excludes cordoned and terminating nodes, so a count of ``0`` — or a class
-    absent from the map entirely — means no schedulable node currently carries
-    that class's reservation taint.  Guard 1 reads this: a lease minted for a
+    ``{gpu_class: node count}``.  Guard 1b reads this: a lease minted for a
     class with nowhere to run is an SU charge against a pod that cannot start.
-    Pure.
+
+    ``snapshot_node_gpu_inventory`` excludes cordoned and terminating nodes and
+    lists a class only when at least one node survives that, so a class whose
+    nodes are all cordoned or gone is not ``0`` in the inventory — it is
+    *absent*.  Read as-is, that is indistinguishable from "no data", which guard
+    1b fails open on, so the guard could never fire.  Every class in
+    *known_classes* (the labels the reservation app knows) is therefore recorded
+    explicitly, as ``0`` when the inventory has no node for it.  A label outside
+    it stays absent — unknown, never blocking — as does everything before the
+    first successful snapshot.  Pure.
     """
-    return {gpu_class: len(nodes) for gpu_class, nodes in capacity_by_node_class.items()}
+    counts = dict.fromkeys(known_classes, 0)
+    counts.update(
+        (gpu_class, len(nodes)) for gpu_class, nodes in capacity_by_node_class.items()
+    )
+    return counts
 
 
 class LockContractError(RuntimeError):

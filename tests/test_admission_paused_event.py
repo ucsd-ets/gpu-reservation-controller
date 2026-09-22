@@ -1,10 +1,10 @@
 """Unit tests for telling a pod's owner that on-demand admission is paused.
 
-Guards 3 (the stuck reservation-holder interlock) and 4 (app-side capacity
-overcommit) hold every on-demand candidate of a GPU class until something
-outside the pod changes.  The operator hears about it every minute
-(``ondemand.gated``); the pod's owner, who cannot read the controller's log,
-saw only a pod that stayed Pending.  Each hold now puts an
+Guards 1b (no schedulable node in the class), 3 (the stuck reservation-holder
+interlock) and 4 (app-side capacity overcommit) hold every on-demand candidate
+of a GPU class until something outside the pod changes.  The operator hears
+about it every minute (``ondemand.gated``); the pod's owner, who cannot read the
+controller's log, saw only a pod that stayed Pending.  Each hold now puts an
 ``OnDemandAdmissionPaused`` Warning Event on the pod, on the same throttle and
 cadence as the ``OnDemandLeaseDenied`` Event.  Layers, none of them touching a
 real cluster or the app:
@@ -14,6 +14,9 @@ real cluster or the app:
 - ``main._preflight_ondemand_candidate`` — which holds are told, and that
   telling never disturbs the hold itself.
 - ``main._post_pending_status`` — the throttle shared with the denial Event.
+- ``main._run_queue_tick`` end to end, for guard 1b: the real node snapshot
+  omits a fully cordoned class rather than reporting it as zero, which is why
+  guard 1b used to be unable to hold anything.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import pytest
 from app import k8s_client
 from app.controller import ControllerState, OnDemandCandidate
 from app.k8s_client import emit_admission_paused_event
+from app.reservation_client import LeaseAttempt
 
 from tests.conftest import (
     GPU_CLASS_ID,
@@ -214,13 +218,22 @@ class TestAdmissionPausedMessage:
         assert "reserved jobs go first" in msg
         assert msg.endswith("If this persists, contact support.")
 
-    def test_the_two_causes_read_differently(self, monkeypatch):
+    def test_a_drained_class_says_there_is_nowhere_to_run(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        msg = m._admission_paused_message(1, GPU_CLASS_LABEL, _config())
+        assert f"gpu-class {GPU_CLASS_LABEL} is paused" in msg
+        assert f"no {GPU_CLASS_LABEL} GPU nodes available" in msg
+        assert "Nothing about this pod needs to change" in msg
+        assert msg.endswith("If this persists, contact support.")
+
+    def test_the_three_causes_read_differently(self, monkeypatch):
         m = _main_module(monkeypatch)
         config = _config()
-        assert (
-            m._admission_paused_message(3, GPU_CLASS_LABEL, config)
-            != m._admission_paused_message(4, GPU_CLASS_LABEL, config)
-        )
+        messages = {
+            m._admission_paused_message(guard, GPU_CLASS_LABEL, config)
+            for guard in (1, 3, 4)
+        }
+        assert len(messages) == 3
 
     def test_a_configured_contact_is_named_last(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -346,14 +359,53 @@ class TestPreflightTellsThePod:
         assert status == m._PREFLIGHT_RETRY
         assert [c["guard"] for c in rec.calls] == [3]
 
-    def test_a_drained_class_is_not_told(self, monkeypatch):
-        # Guard 1b: every node of the class cordoned or removed -- an operator's
-        # own act, typically maintenance.
+    def test_a_drained_class_hold_is_told(self, monkeypatch):
         m = _main_module(monkeypatch)
         state = _state()
         state.class_node_counts = {GPU_CLASS_LABEL: 0}
-        status, rec = _preflight(monkeypatch, m, state, _candidate())
+        candidate = _candidate()
+        before = candidate.next_attempt_at
+
+        status, rec = _preflight(monkeypatch, m, state, candidate)
+
         assert status == m._PREFLIGHT_RETRY
+        assert candidate.next_attempt_at > before
+        assert [c["guard"] for c in rec.calls] == [1]
+        assert rec.calls[0]["message"] == m._admission_paused_message(
+            1, GPU_CLASS_LABEL, _config()
+        )
+
+    def test_a_drained_class_reports_the_drain_not_the_overcommit(self, monkeypatch):
+        # A class with no nodes also reads as overcommitted whenever the app
+        # counts any GPUs for it (physical 0 < app-side N).  Guard 1b runs
+        # first, and "no nodes" is the more specific account of the two.
+        m = _main_module(monkeypatch)
+        state = _state()
+        state.class_node_counts = {GPU_CLASS_LABEL: 0}
+        state.overcommitted_gpu_classes = {GPU_CLASS_LABEL}
+        _status, rec = _preflight(monkeypatch, m, state, _candidate())
+        assert [c["guard"] for c in rec.calls] == [1]
+
+    def test_a_best_effort_pod_is_told_about_a_drained_class(self, monkeypatch):
+        # Unlike guard 4, guard 1b has no best-effort exemption: a pod that asks
+        # for no guarantee still needs a node to run on.
+        m = _main_module(monkeypatch)
+        state = _state()
+        state.class_node_counts = {GPU_CLASS_LABEL: 0}
+        status, rec = _preflight(
+            monkeypatch, m, state, _candidate(best_effort=True)
+        )
+        assert status == m._PREFLIGHT_RETRY
+        assert [c["guard"] for c in rec.calls] == [1]
+
+    def test_an_unknown_node_count_is_not_a_pause(self, monkeypatch):
+        # Fail-open: no snapshot yet, or a label the app does not know.  Nothing
+        # is held, so there is nothing to tell.
+        m = _main_module(monkeypatch)
+        state = _state()
+        state.class_node_counts = {}
+        status, rec = _preflight(monkeypatch, m, state, _candidate())
+        assert status == m._PREFLIGHT_READY
         assert rec.calls == []
 
     def test_a_fragmented_class_is_not_told(self, monkeypatch):
@@ -428,6 +480,80 @@ class TestAdmissionBatchTellsEachHeldPod:
         assert sorted(c["uid"] for c in rec.calls) == ["uid-1", "uid-2"]
         # Held, not dropped: both wait for the pause to lift.
         assert set(state.ondemand_candidates) == {"uid-1", "uid-2"}
+
+
+class TestCordonedClassEndToEnd:
+    """Guard 1b through the real node snapshot, not a hand-built count.
+
+    ``snapshot_node_gpu_inventory`` lists a class only while one of its nodes is
+    schedulable, so a class with every node cordoned is *absent* from the
+    inventory, never ``0``.  Guard 1b fails open on an absent class, and every
+    earlier test injected the ``0`` directly — which is how the guard went
+    unable to hold anything without a test noticing.
+    """
+
+    def _tick(self, monkeypatch, *, cordoned, app_knows_class=True):
+        from tests.test_k8s_capacity import TAINT_KEY, _FakeCoreV1, _node, _taint
+
+        m = _main_module(monkeypatch)
+        nodes = [
+            _node(
+                "gpu-1", taints=[_taint(TAINT_KEY, GPU_CLASS_LABEL)],
+                allocatable={"nvidia.com/gpu": "8"}, unschedulable=cordoned,
+            ),
+        ]
+        monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1(nodes))
+
+        async def no_pods(*a, **kw):
+            return []
+
+        async def fake_read_pod(name, namespace):
+            return _pod(name.removeprefix("pod-"))
+
+        class _LeaseRecorder:
+            def __init__(self):
+                self.requests = []
+
+            async def create_ondemand_reservation(self, req):
+                self.requests.append(req)
+                return LeaseAttempt(status=409, detail="no capacity")
+
+        rec, client = _Recorder(), _LeaseRecorder()
+        monkeypatch.setattr(m, "snapshot_tolerated_pods", no_pods)
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        monkeypatch.setattr(m, "emit_admission_paused_event", rec)
+        monkeypatch.setattr(m, "emit_lease_denied_event", _DenialRecorder())
+
+        state = _state()
+        if not app_knows_class:
+            state.gpu_class_ids = {}
+        state.ondemand_candidates["uid-1"] = _candidate("uid-1")
+        asyncio.run(m._run_queue_tick(state, client, _config()))
+        return state, rec, client
+
+    def test_a_fully_cordoned_class_is_held_and_the_pod_told(self, monkeypatch):
+        state, rec, client = self._tick(monkeypatch, cordoned=True)
+        assert state.class_node_counts == {GPU_CLASS_LABEL: 0}
+        assert [c["guard"] for c in rec.calls] == [1]
+        # Held before the app is asked: no lease is requested for a class with
+        # nowhere to run.
+        assert client.requests == []
+        assert "uid-1" in state.ondemand_candidates
+
+    def test_a_schedulable_node_lets_it_through(self, monkeypatch):
+        state, rec, client = self._tick(monkeypatch, cordoned=False)
+        assert state.class_node_counts == {GPU_CLASS_LABEL: 1}
+        assert rec.calls == []
+        assert len(client.requests) == 1
+
+    def test_a_class_the_app_does_not_know_is_never_held_by_it(self, monkeypatch):
+        # Fail-open stays fail-open for a label the controller cannot vouch for.
+        # (Such a candidate stops at class_id_unknown further on instead.)
+        state, rec, client = self._tick(
+            monkeypatch, cordoned=True, app_knows_class=False
+        )
+        assert state.class_node_counts == {}
+        assert rec.calls == []
 
 
 # ---------------------------------------------------------------------------

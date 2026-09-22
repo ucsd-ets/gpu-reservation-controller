@@ -359,10 +359,11 @@ What that buys, and what it costs:
   GPU caps and group validity dates all apply exactly as for a lease, and the
   controller will not admit the pod unless a node physically has the GPUs free.
   A refusal arrives as an `OnDemandLeaseDenied` Event (§5.1), same as any other,
-  and a paused class as `OnDemandAdmissionPaused` (§5.2) — though only the
-  reserved-jobs-waiting pause holds a best-effort pod. It books no capacity in
-  the reservation service, so a gap between that service's count and the
-  hardware does not apply to it.
+  and a paused class as `OnDemandAdmissionPaused` (§5.2) — except the
+  short-of-hardware pause, which does not hold a best-effort pod. It books no
+  capacity in the reservation service, so a gap between that service's count
+  and the hardware does not apply to it; a class with no node available at all
+  still does.
 
 `galends/minimum-runtime-seconds` is not required, and is ignored for sizing if
 present — there is nothing to size. The two compose without conflict: a pod may
@@ -529,16 +530,19 @@ Three things worth knowing about it:
 ### 5.2 When on-demand admission is paused: `OnDemandAdmissionPaused`
 
 Sometimes the controller does not ask for a lease at all, because on-demand
-admission for the pod's whole GPU class is on hold. Two situations do that:
+admission for the pod's whole GPU class is on hold. Three situations do that:
 
-- **Reserved jobs are waiting.** A pod that already holds a *reservation* for
-  this GPU class has been admitted but the cluster cannot place it. Reserved
-  jobs go first, so no new on-demand jobs start on the class until the waiting
-  ones are running.
+- **No node of the class is available.** Every node of this GPU class is out of
+  service — typically down for maintenance — so there is nowhere for the job to
+  run. Admission resumes as soon as one is back.
 - **The class is short of hardware.** The reservation service expects more GPUs
   of this class than are currently online — a node is down, say. Leases sold
   against GPUs that do not exist could never run, so on-demand admission for the
   class stops until the two agree again.
+- **Reserved jobs are waiting.** A pod that already holds a *reservation* for
+  this GPU class has been admitted but the cluster cannot place it. Reserved
+  jobs go first, so no new on-demand jobs start on the class until the waiting
+  ones are running.
 
 Neither is anything the pod's owner did or can fix, so each pod held this way
 gets a `Warning` Event saying so:
