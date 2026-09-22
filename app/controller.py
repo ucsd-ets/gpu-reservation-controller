@@ -293,6 +293,34 @@ def reconcile_capacity(
     return diffs, overcommitted
 
 
+class OnDemandGate(NamedTuple):
+    """One GPU class on which JIT on-demand admission is currently paused.
+
+    Produced by :meth:`ControllerState.plan_ondemand_gates` for the periodic
+    ``ondemand.gated`` WARNING (``main.ondemand_gate_warning_loop``).  Only the
+    **class-wide** gates appear — guard 1b (no schedulable node), guard 3 (a
+    stuck reservation holder) and guard 4 (app-side overcommit).  These hold
+    every candidate of the class regardless of its ask and persist until an
+    operator (or the cluster) changes something.  Guard 5 is deliberately
+    absent: it is per-candidate fragmentation that clears as pods finish, which
+    is the cluster being full rather than a fault anyone must act on.
+
+    ``since`` is when this controller first observed the gate (at most one
+    warning interval late, and reset by a restart); ``waiting`` counts the
+    pending candidates it is holding back right now.  The remaining fields are
+    the evidence a sysadmin needs for *this* guard and are ``None`` otherwise.
+    """
+
+    label: str
+    guard: int
+    reason: str
+    since: datetime
+    waiting: int
+    app_gpus: Optional[int] = None    # guard 4: the app's effective_gpus_today
+    phys_gpus: Optional[int] = None   # guard 4: last audited physical capacity
+    stuck_pods: tuple[str, ...] = ()  # guard 3: "ns.name" of the stuck holders
+
+
 # ---------------------------------------------------------------------------
 # Task queue entry
 # ---------------------------------------------------------------------------
@@ -722,6 +750,13 @@ class ControllerState:
         # deficiency is resolved.  Empty = no pause.
         self.overcommitted_gpu_classes: set[str] = set()
 
+        # Physical per-class GPU capacity as of the last *successful* capacity
+        # audit (label → allocatable GPUs), kept so the ondemand.gated warning
+        # can state both sides of a guard-4 overcommit, not just that one
+        # exists.  Written only alongside overcommitted_gpu_classes, so the two
+        # always describe the same audit.
+        self.physical_gpu_capacity: dict[str, int] = {}
+
         # Name of the pod label naming the usage group to match (REQUIRED_GROUP_LABEL),
         # or None when the feature is disabled.  Set once from config at startup.
         # When set, the reserved-path matchers additionally require a pod's group
@@ -752,6 +787,16 @@ class ControllerState:
         # queue_processor_loop tick.  On-demand placement is held for any class
         # in this set; other classes are unaffected.  Empty = no interlock.
         self.stuck_holder_gpu_classes: set[str] = set()
+        # The stuck holder pods behind each class in stuck_holder_gpu_classes
+        # ("ns.name"), refreshed on the same tick, so the periodic
+        # ondemand.gated warning can name the pods an operator must inspect.
+        self.stuck_holder_pods: dict[str, list[str]] = {}
+
+        # When each class-wide on-demand gate — keyed (class label, guard) —
+        # was first observed, for the ondemand.gated warning's dur_s.  Owned by
+        # plan_ondemand_gates, which adds and prunes it; in-memory, so a
+        # restart re-dates a standing gate from the restart.
+        self.ondemand_gate_since: dict[tuple[str, int], datetime] = {}
 
         # Per-node feasibility (guard 5): the largest number of free GPUs on any
         # *single* node, per GPU-class label (max over nodes of allocatable minus
@@ -1524,6 +1569,58 @@ class ControllerState:
                 event="ondemand.candidate_removed", ns=c.pod_namespace,
                 pod=c.pod_name, poduid=pod_uid,
             ))
+
+    def plan_ondemand_gates(self, now: datetime) -> list[OnDemandGate]:
+        """Every class-wide gate currently pausing JIT on-demand admission.
+
+        Reads the same state ``main._preflight_ondemand_candidate`` consults —
+        ``class_node_counts`` (guard 1b), ``stuck_holder_gpu_classes`` (guard 3)
+        and ``overcommitted_gpu_classes`` (guard 4) — so the warning can never
+        describe a gate the preflight is not actually applying, including guard
+        1b's fail-open (only a *known* zero counts) and guard 4's best-effort
+        exemption (a best-effort candidate is not counted as held by it).
+
+        Side effect: maintains ``ondemand_gate_since`` — a gate seen for the
+        first time is stamped *now*, and a gate no longer in force is pruned,
+        so one that clears and later recurs is re-dated.  Sorted by (label,
+        guard) so consecutive warnings line up in the log.
+        """
+        def waiting(label: str, *, count_best_effort: bool = True) -> int:
+            return sum(
+                1 for c in self.ondemand_candidates.values()
+                if c.gpu_class_label == label
+                and (count_best_effort or not c.best_effort)
+            )
+
+        gates: list[OnDemandGate] = []
+
+        def add(label: str, guard: int, reason: str, **evidence) -> None:
+            since = self.ondemand_gate_since.setdefault((label, guard), now)
+            gates.append(OnDemandGate(
+                label=label, guard=guard, reason=reason, since=since, **evidence,
+            ))
+
+        for label, nodes in self.class_node_counts.items():
+            if nodes == 0:
+                add(label, 1, "no_class_nodes", waiting=waiting(label))
+        for label in self.stuck_holder_gpu_classes:
+            add(
+                label, 3, "stuck_holder_interlock", waiting=waiting(label),
+                stuck_pods=tuple(sorted(self.stuck_holder_pods.get(label, ()))),
+            )
+        for label in self.overcommitted_gpu_classes:
+            add(
+                label, 4, "class_overcommitted",
+                waiting=waiting(label, count_best_effort=False),
+                app_gpus=self.gpu_class_capacity.get(label),
+                phys_gpus=self.physical_gpu_capacity.get(label),
+            )
+
+        live = {(g.label, g.guard) for g in gates}
+        for key in list(self.ondemand_gate_since):
+            if key not in live:
+                del self.ondemand_gate_since[key]
+        return sorted(gates, key=lambda g: (g.label, g.guard))
 
     # ------------------------------------------------------------------
     # Occupancy: availability, placement, release, reconciliation

@@ -53,6 +53,7 @@ from .controller import (
     ControllerState,
     GuaranteeStatus,
     OnDemandCandidate,
+    OnDemandGate,
     PodRuntimeView,
     PreemptionForecast,
     QueueEntry,
@@ -2143,6 +2144,10 @@ async def _run_queue_tick(
         new_classes = {gpu_class for _, _, gpu_class in stuck}
         old_classes = state.stuck_holder_gpu_classes
         state.stuck_holder_gpu_classes = new_classes
+        state.stuck_holder_pods = {
+            gpu_class: [f"{ns}.{name}" for ns, name, gc in stuck if gc == gpu_class]
+            for gpu_class in new_classes
+        }
         for gpu_class in new_classes - old_classes:
             affected = [(ns, name) for ns, name, gc in stuck if gc == gpu_class]
             log.warning("%s", kv(
@@ -3078,6 +3083,7 @@ async def _run_capacity_audit(
             event="capacity_audit.resumed", clabels=sorted(resumed),
         ))
     state.overcommitted_gpu_classes = overcommitted
+    state.physical_gpu_capacity = dict(physical)
 
 
 async def capacity_audit_loop(
@@ -3095,7 +3101,109 @@ async def capacity_audit_loop(
 
 
 # ---------------------------------------------------------------------------
-# Background loop 6: singleton lease renewal
+# Background loop 6: on-demand gate warning
+# ---------------------------------------------------------------------------
+
+# Fixed rather than configurable: the point is a line that keeps showing up in
+# whatever log view an operator has open until the cause is fixed, and a knob to
+# quieten it would be the wrong fix for that.
+ONDEMAND_GATE_WARNING_INTERVAL_S = 60
+
+
+def _ondemand_gate_detail(gate: OnDemandGate, config: Config) -> str:
+    """Plain-English account of *gate*: what is paused, why, what to check,
+    and what lifts it — written for an operator who has never seen this
+    service.  Rendered into the ``detail=`` field of ``ondemand.gated``."""
+    c = gate.label
+    paused = (
+        f"On-demand GPU jobs for GPU class '{c}' are paused: the controller is "
+        f"not granting new on-demand reservations for pods labelled gpu-class={c}, "
+        f"so those pods stay Pending."
+    )
+    if gate.guard == 4:
+        app = "an unknown number of" if gate.app_gpus is None else str(gate.app_gpus)
+        phys = "fewer" if gate.phys_gpus is None else f"only {gate.phys_gpus}"
+        best_effort = (
+            " Best-effort pods (galends/runtime-guarantee: none) are not affected."
+            if config.best_effort_enabled else ""
+        )
+        return (
+            f"{paused} Cause: capacity mismatch. The reservation app believes this "
+            f"class has {app} GPUs today, but schedulable Kubernetes nodes tainted "
+            f"{TOLERATION_KEY}={c} provide {phys} (allocatable nvidia.com/gpu, or "
+            f"the node's galends/force-node-capacity annotation). Leases sold "
+            f"against GPUs that do not exist could never run. To fix: check for "
+            f"cordoned, NotReady or missing GPU nodes and a failing NVIDIA device "
+            f"plugin (kubectl get nodes; kubectl describe node <node>), or, if the "
+            f"hardware is really gone, lower the class's GPU count or add a capacity "
+            f"override for today in the reservation app.{best_effort} Clears "
+            f"automatically at the next capacity audit once the counts agree (every "
+            f"{config.capacity_check_interval}s, CAPACITY_CHECK_INTERVAL; restarting "
+            f"the controller audits immediately)."
+        )
+    if gate.guard == 3:
+        return (
+            f"{paused} Cause: safety interlock. {len(gate.stuck_pods)} pod(s) already "
+            f"admitted under a reservation for this class are stuck Pending — the "
+            f"scheduler cannot place them even with the reservation toleration — so "
+            f"the controller assumes the class is out of room and will not hand out "
+            f"more. To fix: run kubectl describe pod on the pods listed in pods= and "
+            f"read their scheduling events; common causes are GPUs taken by pods this "
+            f"controller does not manage, a down or cordoned GPU node, insufficient "
+            f"CPU/memory on the GPU nodes, or a volume that cannot attach. Clears "
+            f"automatically within one queue tick (every "
+            f"{config.queue_processor_interval}s, QUEUE_PROCESSOR_INTERVAL) after "
+            f"those pods schedule or are deleted."
+        )
+    # guard 1b
+    return (
+        f"{paused} Cause: no schedulable node carries the taint {TOLERATION_KEY}={c}, "
+        f"so a lease would be charged for a job with nowhere to run. To fix: check "
+        f"whether this class's GPU nodes are cordoned, draining or NotReady (kubectl "
+        f"get nodes; kubectl describe node <node>) and uncordon or repair them. "
+        f"Clears automatically within one queue tick (every "
+        f"{config.queue_processor_interval}s, QUEUE_PROCESSOR_INTERVAL) once a node "
+        f"is back."
+    )
+
+
+def _warn_ondemand_gates(state: ControllerState, config: Config) -> None:
+    """Emit one ``ondemand.gated`` WARNING per class-wide gate in force."""
+    now = datetime.now(timezone.utc)
+    for gate in state.plan_ondemand_gates(now):
+        log.warning("%s", kv(
+            event="ondemand.gated", clabel=gate.label, guard=gate.guard,
+            reason=gate.reason, dur_s=int((now - gate.since).total_seconds()),
+            candidates=gate.waiting, app_gpus=gate.app_gpus,
+            phys_gpus=gate.phys_gpus, pods=list(gate.stuck_pods) or None,
+            detail=_ondemand_gate_detail(gate, config),
+        ))
+
+
+async def ondemand_gate_warning_loop(
+    state: ControllerState, config: Config
+) -> None:
+    """Every ``ONDEMAND_GATE_WARNING_INTERVAL_S`` s, restate at WARNING every
+    class-wide gate pausing JIT on-demand admission (guards 1b, 3, 4).
+
+    The transition lines (``capacity_audit.paused``, ``interlock.activated``)
+    fire once and are easy to scroll past, and the per-candidate
+    ``ondemand.candidate_held`` lines are per pod, partly DEBUG, and silent
+    when nobody is waiting.  This repeats for as long as the gate stands —
+    whether or not a pod is currently held by it — and says what to do.
+    Reads in-memory state only; no API calls.
+    """
+    while True:
+        await asyncio.sleep(ONDEMAND_GATE_WARNING_INTERVAL_S)
+        with trace.scope("gate"):
+            try:
+                _warn_ondemand_gates(state, config)
+            except Exception as exc:  # noqa: BLE001
+                log.error("%s", kv(event="ondemand.gate_warning_failed", err=exc), exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Background loop 7: singleton lease renewal
 # ---------------------------------------------------------------------------
 
 
@@ -3266,7 +3374,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:  # noqa: BLE001
             log.warning("%s", kv(event="startup.capacity_audit_failed", err=exc), exc_info=True)
 
-    # Launch the five background loops as asyncio tasks, each supervised by
+    # Launch the background loops as asyncio tasks, each supervised by
     # _on_task_done so an unhandled crash is logged and flips /health to 503.
     tasks = [
         asyncio.create_task(
@@ -3282,6 +3390,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             capacity_audit_loop(state, config), name="capacity-audit"
         ),
     ]
+    if config.ondemand_lease_enabled:
+        tasks.append(
+            asyncio.create_task(
+                ondemand_gate_warning_loop(state, config), name="ondemand-gate-warning"
+            )
+        )
     if config.singleton_lease_enabled:
         tasks.append(
             asyncio.create_task(

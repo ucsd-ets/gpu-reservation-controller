@@ -65,6 +65,7 @@ app/
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee: reactively, when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**), and — throttled to `HEADROOM_CHECK_INTERVAL` — anticipatorily, to hold a fixed fraction of each class free for on-demand jobs that have not arrived yet (see **Anticipatory headroom preemption**) |
 | `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
+| `ondemand_gate_warning_loop` | every 60 s (only when `ONDEMAND_LEASE_ENABLED`) | Restates at WARNING (`ondemand.gated`) every GPU class whose JIT admission is paused by a class-wide gate — guard 1b, 3 or 4 — with a plain-English cause and remedy for an operator (see **Operator warning for paused on-demand admission**) |
 | `lease_guard_loop` | every 20 s (only when `SINGLETON_LEASE_ENABLED`) | Renews the singleton `coordination.k8s.io` Lease; terminates the process if another live instance takes it (see **Singleton lease guard**) |
 
 Every task is **supervised**: `_on_task_done` records an unhandled exception in
@@ -1177,6 +1178,30 @@ the JIT/on-demand path is gated; reserved-path admission under a real user
 booking is untouched (a booking already implies the app granted real calendar
 capacity).  **RBAC**: none new — the audit reuses the existing `nodes: list`
 permission.
+
+### Operator warning for paused on-demand admission
+
+Three JIT guards pause admission for a **whole GPU class** until something
+changes: guard 1b (no schedulable node), guard 3 (stuck holder interlock) and
+guard 4 (app-side overcommit).  Each announces itself once on transition
+(`interlock.activated`, `capacity_audit.paused`), and the per-candidate
+`ondemand.candidate_held` lines are per pod, partly DEBUG, and silent when nobody
+is waiting — so a pause could stand for days with nothing in the log saying so.
+
+`ondemand_gate_warning_loop` closes that: every 60 s
+(`ONDEMAND_GATE_WARNING_INTERVAL_S`, fixed — a knob to quieten it would be the
+wrong fix) it logs one `ondemand.gated` WARNING per gated class, whether or not a
+pod is currently waiting.  `ControllerState.plan_ondemand_gates` (pure bar its
+`ondemand_gate_since` bookkeeping) reads exactly the state the preflight reads,
+including guard 1b's fail-open and guard 4's best-effort exemption, so the warning
+cannot describe a gate the preflight is not applying.  The `detail` field is
+prose written for a sysadmin unfamiliar with the service (`main._ondemand_gate_detail`):
+what is paused, the cause, the `kubectl` checks, and when it clears.  To make it
+concrete, the audit now keeps its physical snapshot (`physical_gpu_capacity`, so a
+guard-4 line states both counts) and the queue tick keeps the stuck holders' names
+(`stuck_holder_pods`, so a guard-3 line names the pods to inspect).  Guard 5 is
+deliberately not reported (per-ask fragmentation, not a fault).  **RBAC / config**:
+none new; in-memory reads only; runs only when `ONDEMAND_LEASE_ENABLED`.
 
 ### Per-node capacity accounting
 
