@@ -124,3 +124,48 @@ def test_failed_inventory_leaves_prior_maps_intact(monkeypatch, caplog):
     assert state.class_node_counts == {"xtra": 1}
     assert state.node_free_by_class == {"xtra": 3}
     assert any("queue.snapshot_failed" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Guard 4 re-checked on the tick, not only by the hourly audit
+# ---------------------------------------------------------------------------
+
+
+def test_tick_lifts_an_overcommit_pause_once_capacity_returns(monkeypatch, caplog):
+    """A repaired node resumes admission within one tick, not up to an hour."""
+    state = ControllerState()
+    state.gpu_class_capacity = {"h100": 16}
+    state.overcommitted_gpu_classes = {"h100"}
+
+    with caplog.at_level(logging.INFO, logger="app.main"):
+        _tick_with_inventory(monkeypatch, {"h100": {"n1": 8, "n2": 8}}, state)
+
+    assert state.overcommitted_gpu_classes == set()
+    assert state.physical_gpu_capacity == {"h100": 16}
+    assert any("event=capacity_audit.resumed" in r.getMessage() for r in caplog.records)
+
+
+def test_tick_engages_a_pause_without_repeating_the_mismatch_warning(monkeypatch, caplog):
+    """The tick moves the pause set; the per-class mismatch WARNING stays hourly."""
+    state = ControllerState()
+    state.gpu_class_capacity = {"h100": 16}
+
+    with caplog.at_level(logging.INFO, logger="app.main"):
+        _tick_with_inventory(monkeypatch, {"h100": {"n1": 8}}, state)
+
+    assert state.overcommitted_gpu_classes == {"h100"}
+    assert state.physical_gpu_capacity == {"h100": 8}
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("event=capacity_audit.paused" in m for m in messages)
+    assert not any("event=capacity_audit.mismatch" in m for m in messages)
+
+
+def test_tick_inventory_failure_leaves_the_pause_set(monkeypatch):
+    """Fail-safe: never lift a pause on unknown physical state."""
+    state = ControllerState()
+    state.gpu_class_capacity = {"h100": 16}
+    state.overcommitted_gpu_classes = {"h100"}
+
+    _tick_with_inventory(monkeypatch, RuntimeError("api down"), state)
+
+    assert state.overcommitted_gpu_classes == {"h100"}

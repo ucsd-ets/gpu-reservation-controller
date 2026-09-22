@@ -174,7 +174,7 @@ class TestWarnOndemandGates:
         assert f"gpu-class={GPU_CLASS_LABEL}" in detail
         assert "16 GPUs" in detail and "only 8" in detail
         assert "kubectl" in detail
-        assert "CAPACITY_CHECK_INTERVAL" in detail
+        assert "QUEUE_PROCESSOR_INTERVAL" in detail
 
     def test_stuck_holder_warning_lists_pods(self, monkeypatch, caplog):
         m = _main_module(monkeypatch)

@@ -222,7 +222,7 @@ which does not apply to them), because the pause is in force either way and the
 one-shot transition lines (`capacity_audit.paused`, `interlock.activated`) are
 easy to scroll past.  `dur_s` is how long this controller has seen the gate
 (reset by a restart).  Guard 4 carries both sides of the mismatch
-(`app_gpus`, `phys_gpus`, the latter from the last audit); guard 3 carries the
+(`app_gpus`, `phys_gpus`, the latter from the last audit or queue tick); guard 3 carries the
 stuck holder pods in `pods`.  Guard 5 is deliberately not reported: it is
 per-ask fragmentation that clears as jobs finish, not a fault to act on.  Emitted
 only when `ONDEMAND_LEASE_ENABLED` is on.  `grep 'event=ondemand.gated'` empty is
@@ -285,7 +285,7 @@ were deliberately given different keys.
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
 | WARNING | `capacity_audit.mismatch` | `clabel app_gpus phys_gpus overcommitted` | **`overcommitted=true` is the direction that pauses admission**; `false` is under-provisioning, logged but harmless. |
-| INFO | `capacity_audit.paused` / `capacity_audit.resumed` | `clabels` | Classes entering/leaving the JIT pause set. |
+| INFO | `capacity_audit.paused` / `capacity_audit.resumed` | `clabels` | Classes entering/leaving the JIT pause set. Emitted by the hourly audit **and** by any queue-processor tick that moves the set (`trace=queue-…`), so a pause lifts within one `QUEUE_PROCESSOR_INTERVAL` of the counts agreeing. |
 | WARNING | `capacity_audit.snapshot_failed` | `target err` | Audit skipped; **the existing pause set is left unchanged** — a transient failure must never silently lift a pause. |
 | ERROR | `capacity_audit.failed` | `err` | |
 

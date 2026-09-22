@@ -165,6 +165,21 @@ def largest_node_free_by_class(
     }
 
 
+def gpu_capacity_by_class(
+    capacity_by_node_class: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    """Collapse a per-node inventory to total GPUs per class.
+
+    Identical to what ``k8s_client.snapshot_node_gpu_capacity`` returns for the
+    same inventory, so the queue tick can re-check guard 4 from the inventory it
+    already holds without a second node LIST.  Pure.
+    """
+    return {
+        gpu_class: sum(per_node.values())
+        for gpu_class, per_node in capacity_by_node_class.items()
+    }
+
+
 def node_counts_by_class(
     capacity_by_node_class: dict[str, dict[str, int]],
 ) -> dict[str, int]:
@@ -317,7 +332,7 @@ class OnDemandGate(NamedTuple):
     since: datetime
     waiting: int
     app_gpus: Optional[int] = None    # guard 4: the app's effective_gpus_today
-    phys_gpus: Optional[int] = None   # guard 4: last audited physical capacity
+    phys_gpus: Optional[int] = None   # guard 4: last observed physical capacity
     stuck_pods: tuple[str, ...] = ()  # guard 3: "ns.name" of the stuck holders
 
 
@@ -743,18 +758,19 @@ class ControllerState:
         # main._run_capacity_audit).
         self.gpu_class_capacity: dict[str, int] = {}
 
-        # GPU class labels the hourly audit found over-committed (app-side
-        # effective count > physical capacity).  New on-demand admissions are paused
-        # for any class in this set (mirrors stuck_holder_gpu_classes above);
-        # recomputed each audit tick, so a class clears automatically once the
+        # GPU class labels found over-committed (app-side effective count >
+        # physical capacity).  New on-demand admissions are paused for any class
+        # in this set (mirrors stuck_holder_gpu_classes above); recomputed by the
+        # hourly audit *and* every queue-processor tick (main.
+        # _refresh_overcommit_pause), so a class clears within one tick once the
         # deficiency is resolved.  Empty = no pause.
         self.overcommitted_gpu_classes: set[str] = set()
 
-        # Physical per-class GPU capacity as of the last *successful* capacity
-        # audit (label → allocatable GPUs), kept so the ondemand.gated warning
-        # can state both sides of a guard-4 overcommit, not just that one
-        # exists.  Written only alongside overcommitted_gpu_classes, so the two
-        # always describe the same audit.
+        # Physical per-class GPU capacity from the last *successful* snapshot
+        # that recomputed overcommitted_gpu_classes (label → allocatable GPUs),
+        # kept so the ondemand.gated warning can state both sides of a guard-4
+        # overcommit, not just that one exists.  Written only alongside
+        # overcommitted_gpu_classes, so the two always describe one snapshot.
         self.physical_gpu_capacity: dict[str, int] = {}
 
         # Name of the pod label naming the usage group to match (REQUIRED_GROUP_LABEL),

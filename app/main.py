@@ -50,6 +50,7 @@ from .log_fields import kv
 from .controller import (
     TOLERATION_KEY,
     BoundaryPreemptionNeed,
+    CapacityDiff,
     ControllerState,
     GuaranteeStatus,
     OnDemandCandidate,
@@ -62,6 +63,7 @@ from .controller import (
     build_preemption_plan,
     canceller_description,
     free_gpus_by_node_class,
+    gpu_capacity_by_class,
     largest_node_free_by_class,
     node_counts_by_class,
     reconcile_capacity,
@@ -2187,6 +2189,10 @@ async def _run_queue_tick(
             # left", and those want opposite treatment (grant and wait, versus
             # do not mint a lease at all).
             state.class_node_counts = node_counts_by_class(inventory)
+            # Guard 4: re-check the overcommit pause from the same inventory, so
+            # it lifts (or engages) on this tick's cadence instead of waiting
+            # for the hourly audit.
+            _refresh_overcommit_pause(state, gpu_capacity_by_class(inventory))
             for _cls, _free in sorted(state.node_free_by_class.items()):
                 log.debug("%s", kv(
                     event="queue.node_feasibility", clabel=_cls, node_free=_free,
@@ -3046,7 +3052,9 @@ async def _run_capacity_audit(
     Kubernetes node taints.  Any difference is logged at WARNING; any class the
     app believes is larger than it physically is (``app_side > physical``) is
     added to ``state.overcommitted_gpu_classes``, which pauses new on-demand
-    admissions for that class only.
+    admissions for that class only.  The pause set itself is also recomputed
+    every queue-processor tick (``_refresh_overcommit_pause``); this audit is
+    what reports the mismatches.
 
     Fail-safe: if the node snapshot fails, the audit is skipped and the current
     pause set is left unchanged — a transient LIST failure must never silently
@@ -3061,16 +3069,29 @@ async def _run_capacity_audit(
         ), exc_info=True)
         return
 
-    app_side = dict(state.gpu_class_capacity)
-    diffs, overcommitted = reconcile_capacity(app_side, physical)
-
-    for diff in diffs:
+    for diff in _refresh_overcommit_pause(state, physical):
         log.warning("%s", kv(
             event="capacity_audit.mismatch", clabel=diff.label,
             app_gpus=diff.app_side, phys_gpus=diff.physical,
             overcommitted=diff.overcommitted,
         ))
 
+
+def _refresh_overcommit_pause(
+    state: ControllerState, physical: dict[str, int]
+) -> list[CapacityDiff]:
+    """Recompute the guard-4 pause set from a fresh *physical* snapshot.
+
+    Shared by the hourly capacity audit and every queue-processor tick (which
+    already takes a node inventory for guards 1b and 5), so a pause is set or
+    lifted within one ``QUEUE_PROCESSOR_INTERVAL`` of the counts changing rather
+    than up to a full ``CAPACITY_CHECK_INTERVAL`` later.  Logs only the pause
+    set's transitions; the per-class ``capacity_audit.mismatch`` WARNING stays
+    the audit's, on its hourly cadence, via the returned diffs.  Callers must
+    pass a snapshot that succeeded — a failed one never reaches here, so the
+    pause set is left as it was (fail-safe).
+    """
+    diffs, overcommitted = reconcile_capacity(dict(state.gpu_class_capacity), physical)
     previous = state.overcommitted_gpu_classes
     newly_paused = overcommitted - previous
     resumed = previous - overcommitted
@@ -3084,6 +3105,7 @@ async def _run_capacity_audit(
         ))
     state.overcommitted_gpu_classes = overcommitted
     state.physical_gpu_capacity = dict(physical)
+    return diffs
 
 
 async def capacity_audit_loop(
@@ -3137,9 +3159,9 @@ def _ondemand_gate_detail(gate: OnDemandGate, config: Config) -> str:
             f"plugin (kubectl get nodes; kubectl describe node <node>), or, if the "
             f"hardware is really gone, lower the class's GPU count or add a capacity "
             f"override for today in the reservation app.{best_effort} Clears "
-            f"automatically at the next capacity audit once the counts agree (every "
-            f"{config.capacity_check_interval}s, CAPACITY_CHECK_INTERVAL; restarting "
-            f"the controller audits immediately)."
+            f"automatically within one queue tick (every "
+            f"{config.queue_processor_interval}s, QUEUE_PROCESSOR_INTERVAL) once the "
+            f"counts agree."
         )
     if gate.guard == 3:
         return (

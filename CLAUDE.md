@@ -1173,11 +1173,24 @@ startup):
 admission on `overcommitted_gpu_classes` as **guard 4** (mirroring the guard-3
 `stuck_holder_gpu_classes` interlock): a candidate whose `gpu-class` is
 over-committed is short-retried rather than granted, so it stays queued and
-resumes automatically once the class leaves the set on a later audit tick.  Only
+resumes automatically once the class leaves the set.  Only
 the JIT/on-demand path is gated; reserved-path admission under a real user
 booking is untouched (a booking already implies the app granted real calendar
 capacity).  **RBAC**: none new — the audit reuses the existing `nodes: list`
 permission.
+
+**The pause set is re-checked every queue-processor tick, not only hourly.**
+The tick already takes a node inventory for guards 1b and 5; it collapses that
+to per-class totals (`controller.gpu_capacity_by_class`, identical to
+`snapshot_node_gpu_capacity`) and calls the same `main._refresh_overcommit_pause`
+the audit does.  So a pause engages or lifts within one `QUEUE_PROCESSOR_INTERVAL`
+of the counts changing — an operator who fixes a node no longer waits up to an
+hour for admission to resume.  The split is deliberate: the tick only moves the
+pause set (logging `capacity_audit.paused` / `.resumed` on transitions, under a
+`queue-` trace), while the per-class `capacity_audit.mismatch` WARNING stays on
+the audit's hourly cadence rather than repeating every tick.  The fail-safe is
+unchanged: a failed pod or node snapshot skips the refresh, leaving the pause
+set as it was.
 
 ### Operator warning for paused on-demand admission
 
@@ -1579,7 +1592,7 @@ the claimed set and the grace re-arm path above applies.
 | `DEFAULT_USAGE_GROUP` | *(absent)* | Usage group assumed for a pod that names none — standing in for the `REQUIRED_GROUP_LABEL` label when that feature is on (and therefore for the reserved-path match too), else for the `galends/usage-group` annotation. Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
-| `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and pauses on-demand admission for classes the app over-counts (see **App-side vs physical capacity reconciliation**) |
+| `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and pauses on-demand admission for classes the app over-counts (the pause itself is also re-checked every queue-processor tick) (see **App-side vs physical capacity reconciliation**) |
 | `HEADROOM_TARGET_PERCENT` | `0` | Percentage of each GPU class's physical capacity to hold free for on-demand jobs that have not arrived yet, reclaimed from pods past their runtime guarantee (see **Anticipatory headroom preemption**). `0` disables the feature; a pod inside its guarantee is never a headroom victim |
 | `HEADROOM_NOTICE_MINUTES` | `15` | Notice a headroom victim gets before it becomes killable — it is stamped with a `galends/termination-warning-at` deadline first and only becomes eligible once that deadline elapses. `0` = no notice. Requires `TERMINATION_WARNING_ENABLED`; with warnings off the gate is bypassed |
 | `HEADROOM_CHECK_INTERVAL` | `600` | Seconds between headroom evaluations. Headroom rides the preemption sweep but is throttled to this slower cadence so an idle cluster is not LISTed on `PREEMPTION_CHECK_INTERVAL`. Kill latency is therefore `HEADROOM_NOTICE_MINUTES` to `HEADROOM_NOTICE_MINUTES + this` after a pod is warned |
