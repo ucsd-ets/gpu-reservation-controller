@@ -42,6 +42,7 @@ prefix says what kind:
 | `queue-` | one queue-processor tick (incl. the merge/adopt/lease work it fans out) |
 | `sweep-` | one preemption sweep |
 | `audit-` | one capacity audit |
+| `gate-` | one on-demand gate warning pass (§5) |
 | `jit-` | one JIT admission pass (a coalesced re-run gets its own id) |
 | `pod-` | one pod watch event |
 | `startup-` | the synchronous startup sequence |
@@ -172,6 +173,8 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | DEBUG | `ondemand.candidate_removed` | `ns pod poduid` | |
 | INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for something no lease can fix (`detail` carries the scheduler's verdict). |
 | DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free claimed nodes`) | **The guard number is the field** — see below. `claimed` (guard 5) is the GPUs already taken by earlier candidates in the same batch. |
+| WARNING | `ondemand.gated` | `clabel guard reason dur_s candidates detail` (+ `app_gpus phys_gpus` \| `pods`) | **Every 60 s, one line per GPU class whose on-demand admission is paused**, for as long as it stays paused — see below. |
+| ERROR | `ondemand.gate_warning_failed` | `err` | The warning pass raised; retried next minute. |
 | DEBUG | `ondemand.schedule_verdict` | `ns pod` | Scheduler verdict arrived; re-attempting immediately. |
 | INFO | `lease.denied` | `ns pod clabel gpus status detail` | App refused the ask as infeasible (409), or a transient network/5xx failure; cooldown 2–5 min. `detail` is the app's reason — absent when the app never answered. On a 409 it is also mirrored to the pod as an `OnDemandLeaseDenied` Event. |
 | WARNING | `lease.error` | `ns pod clabel gpus status fails retry_s` | **A fault waiting cannot fix** — a 4xx that is not 409 (read-only service key, schema mismatch, unknown group). Exponential backoff to 30 min; `grep 'event=lease.error'` is how a misconfigured deployment announces itself. |
@@ -207,6 +210,23 @@ resources, so that string never appears and every candidate used to sit at
 `guard=1 reason=schedule_verdict_pending` forever, at DEBUG, granting nothing.
 `grep 'event=ondemand.candidate_held guard=1'` should be a *transient*
 population; a candidate that stays there across ticks is worth a look.
+
+**`ondemand.gated` is the operator-facing summary of the guards above.**
+Every minute, for each GPU class on which a *class-wide* gate is holding JIT
+admission — guard 1 `no_class_nodes`, guard 3 `stuck_holder_interlock`, guard 4
+`class_overcommitted` — the controller logs a WARNING whose `detail` states in
+plain English what is paused, the cause, what to check (with `kubectl` commands)
+and what lifts it.  It repeats whether or not any pod is waiting (`candidates=`
+is how many are held right now, best-effort candidates excluded under guard 4,
+which does not apply to them), because the pause is in force either way and the
+one-shot transition lines (`capacity_audit.paused`, `interlock.activated`) are
+easy to scroll past.  `dur_s` is how long this controller has seen the gate
+(reset by a restart).  Guard 4 carries both sides of the mismatch
+(`app_gpus`, `phys_gpus`, the latter from the last audit or queue tick); guard 3 carries the
+stuck holder pods in `pods`.  Guard 5 is deliberately not reported: it is
+per-ask fragmentation that clears as jobs finish, not a fault to act on.  Emitted
+only when `ONDEMAND_LEASE_ENABLED` is on.  `grep 'event=ondemand.gated'` empty is
+the healthy state.
 
 `grep 'event=ondemand.candidate_held guard=4'` answers "how often is the capacity
 audit blocking admission" without matching on message text.
@@ -265,7 +285,7 @@ were deliberately given different keys.
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
 | WARNING | `capacity_audit.mismatch` | `clabel app_gpus phys_gpus overcommitted` | **`overcommitted=true` is the direction that pauses admission**; `false` is under-provisioning, logged but harmless. |
-| INFO | `capacity_audit.paused` / `capacity_audit.resumed` | `clabels` | Classes entering/leaving the JIT pause set. |
+| INFO | `capacity_audit.paused` / `capacity_audit.resumed` | `clabels` | Classes entering/leaving the JIT pause set. Emitted by the hourly audit **and** by any queue-processor tick that moves the set (`trace=queue-…`), so a pause lifts within one `QUEUE_PROCESSOR_INTERVAL` of the counts agreeing. |
 | WARNING | `capacity_audit.snapshot_failed` | `target err` | Audit skipped; **the existing pause set is left unchanged** — a transient failure must never silently lift a pause. |
 | ERROR | `capacity_audit.failed` | `err` | |
 
