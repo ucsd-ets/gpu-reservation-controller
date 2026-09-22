@@ -131,6 +131,23 @@ class TestNodeCountsByClass:
     def test_empty_inventory(self):
         assert node_counts_by_class({}) == {}
 
+    def test_a_known_class_missing_from_the_inventory_is_zero(self):
+        # The real snapshot never produces {"a100": {}}: a class whose nodes are
+        # all cordoned or gone is simply absent.  Without the known classes that
+        # absence read as "no data", and guard 1b could never hold anything.
+        assert node_counts_by_class({"h100": {"n1": 8}}, ["h100", "a100"]) == {
+            "h100": 1, "a100": 0,
+        }
+
+    def test_the_inventory_wins_over_the_zero(self):
+        assert node_counts_by_class({"h100": {"n1": 8, "n2": 8}}, ["h100"]) == {"h100": 2}
+
+    def test_an_unknown_label_stays_absent(self):
+        # A class the app does not know is not vouched for either way, so guard
+        # 1b keeps failing open on it.
+        assert node_counts_by_class({}, []) == {}
+        assert "xtra" not in node_counts_by_class({"h100": {"n1": 8}}, ["h100"])
+
 
 class TestFragmentationVsClassTotal:
     """Per-node reality can be strictly smaller than the class-global total."""

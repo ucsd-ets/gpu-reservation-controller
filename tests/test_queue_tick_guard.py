@@ -104,6 +104,20 @@ def test_tick_refreshes_class_node_counts(monkeypatch):
     assert state.node_free_by_class == {"xtra": 4, "h100": 8}
 
 
+def test_tick_records_a_known_class_with_no_nodes_as_zero(monkeypatch):
+    """The shape the real snapshot produces for a drained class: absent.
+
+    Only the app's class list can say the class *should* exist, which is what
+    turns that absence into the known zero guard 1b holds on.
+    """
+    state = ControllerState()
+    state.gpu_class_ids = {"h100": 10, "xtra": 7}
+
+    _tick_with_inventory(monkeypatch, {"h100": {"n1": 8, "n2": 8}}, state)
+
+    assert state.class_node_counts == {"h100": 2, "xtra": 0}
+
+
 def test_tick_records_a_drained_class_as_zero(monkeypatch):
     """Zero nodes and zero free GPUs are different facts; both are recorded."""
     state = _tick_with_inventory(monkeypatch, {"xtra": {}}, ControllerState())

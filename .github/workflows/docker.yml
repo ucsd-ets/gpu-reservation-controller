@@ -101,12 +101,14 @@ jobs:
             --set config.defaultUsageGroup=cse151b \
             --set config.podSchedulingGateName=gpu-reservation \
             --set config.timezone=America/Los_Angeles \
+            --set config.supportContact=gpu-help@example.edu \
             > /tmp/rendered-full.yaml
           grep -q 'imagePullSecrets:' /tmp/rendered-full.yaml
           grep -q 'name: ghcr-pull-secret' /tmp/rendered-full.yaml
           grep -q 'INBOUND_API_TOKEN' /tmp/rendered-full.yaml
           grep -q 'REQUIRED_GROUP_LABEL' /tmp/rendered-full.yaml
           grep -q 'DEFAULT_USAGE_GROUP' /tmp/rendered-full.yaml
+          grep -q 'SUPPORT_CONTACT' /tmp/rendered-full.yaml
 
       # The chart's one `required` guard. Asserting it fires keeps it from
       # decaying into a default that silently deploys a controller pointed at

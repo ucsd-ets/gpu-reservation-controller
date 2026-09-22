@@ -114,6 +114,12 @@ spec:
               value: {{ .Values.config.ondemandDenialEventEnabled | quote }}
             - name: ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES
               value: {{ .Values.config.ondemandDenialEventRepeatMinutes | quote }}
+            - name: ONDEMAND_PAUSE_EVENT_ENABLED
+              value: {{ .Values.config.ondemandPauseEventEnabled | quote }}
+            {{- if .Values.config.supportContact }}
+            - name: SUPPORT_CONTACT
+              value: {{ .Values.config.supportContact | quote }}
+            {{- end }}
             - name: TERMINATION_WARNING_ENABLED
               value: {{ .Values.config.terminationWarningEnabled | quote }}
             - name: TERMINATION_WARNING_LEAD_MINUTES

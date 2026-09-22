@@ -182,17 +182,28 @@ def gpu_capacity_by_class(
 
 def node_counts_by_class(
     capacity_by_node_class: dict[str, dict[str, int]],
+    known_classes: Iterable[str] = (),
 ) -> dict[str, int]:
     """Collapse a per-node inventory to the number of nodes backing each class.
 
-    ``{gpu_class: node count}``.  ``snapshot_node_gpu_inventory`` already
-    excludes cordoned and terminating nodes, so a count of ``0`` — or a class
-    absent from the map entirely — means no schedulable node currently carries
-    that class's reservation taint.  Guard 1 reads this: a lease minted for a
+    ``{gpu_class: node count}``.  Guard 1b reads this: a lease minted for a
     class with nowhere to run is an SU charge against a pod that cannot start.
-    Pure.
+
+    ``snapshot_node_gpu_inventory`` excludes cordoned and terminating nodes and
+    lists a class only when at least one node survives that, so a class whose
+    nodes are all cordoned or gone is not ``0`` in the inventory — it is
+    *absent*.  Read as-is, that is indistinguishable from "no data", which guard
+    1b fails open on, so the guard could never fire.  Every class in
+    *known_classes* (the labels the reservation app knows) is therefore recorded
+    explicitly, as ``0`` when the inventory has no node for it.  A label outside
+    it stays absent — unknown, never blocking — as does everything before the
+    first successful snapshot.  Pure.
     """
-    return {gpu_class: len(nodes) for gpu_class, nodes in capacity_by_node_class.items()}
+    counts = dict.fromkeys(known_classes, 0)
+    counts.update(
+        (gpu_class, len(nodes)) for gpu_class, nodes in capacity_by_node_class.items()
+    )
+    return counts
 
 
 class LockContractError(RuntimeError):
@@ -404,13 +415,18 @@ class OnDemandCandidate:
     # the flat 2-5 min denial cadence forever.  Reset on any grant or routine
     # denial.  See main._grant_and_admit and _error_retry_at.
     lease_error_count: int = 0
-    # What the last denial Event on this pod said, and when it was emitted, so a
-    # reason that has not changed is not restated every 2-5 min.  In-memory like
-    # the rest of the candidate: after a restart the pod is re-warned once, which
-    # is the right side to err on -- Events expire, so a fresh one restores a
-    # signal that would otherwise have aged out.  See main._emit_lease_denial_event.
-    denial_event_detail: Optional[str] = None
-    denial_event_at: Optional[datetime] = None
+    # The last pending-status Event put on this pod -- its reason plus the text
+    # that varies with it (the app's denial detail, or the rendered pause
+    # message) -- and when it was emitted, so a status that has not changed is
+    # not restated on every retry.  One pair shared by OnDemandLeaseDenied and
+    # OnDemandAdmissionPaused, so the pod's Events tell a single story: moving
+    # from one to the other is a change and is reported at once, and whichever
+    # holds repeats on the one cadence.  In-memory like the rest of the
+    # candidate: after a restart the pod is re-told once, which is the right
+    # side to err on -- Events expire, so a fresh one restores a signal that
+    # would otherwise have aged out.  See main._post_pending_status.
+    status_event_key: Optional[tuple[str, str]] = None
+    status_event_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)

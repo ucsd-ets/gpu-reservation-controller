@@ -358,7 +358,12 @@ What that buys, and what it costs:
 - **It still has to fit.** Group membership, GPU-class access, per-reservation
   GPU caps and group validity dates all apply exactly as for a lease, and the
   controller will not admit the pod unless a node physically has the GPUs free.
-  A refusal arrives as an `OnDemandLeaseDenied` Event (§5.1), same as any other.
+  A refusal arrives as an `OnDemandLeaseDenied` Event (§5.1), same as any other,
+  and a paused class as `OnDemandAdmissionPaused` (§5.2) — except the
+  short-of-hardware pause, which does not hold a best-effort pod. It books no
+  capacity in the reservation service, so a gap between that service's count
+  and the hardware does not apply to it; a class with no node available at all
+  still does.
 
 `galends/minimum-runtime-seconds` is not required, and is ignored for sizing if
 present — there is nothing to size. The two compose without conflict: a pod may
@@ -475,8 +480,10 @@ pod spec sets, typically 30 s. §6 covers how to do that for a PyTorch job.
 
 The controller also emits Kubernetes **Events** against the pod
 (`RuntimeGuaranteed` at admission, `OverstayRelinked` when a pod is re-linked to
-a new reservation, `Preempted` immediately before deletion, and
-`OnDemandLeaseDenied` when a lease request is refused — §5.1). These are richer
+a new reservation, `Preempted` immediately before deletion,
+`OnDemandLeaseDenied` when a lease request is refused — §5.1 — and
+`OnDemandAdmissionPaused` when on-demand admission for the pod's GPU class is
+on hold — §5.2). These are richer
 than the annotations but need Kubernetes API access to read, so they are for
 whoever runs `kubectl` — the pod's owner, an operator, a dashboard — rather than
 for in-pod consumers. Being addressed to a person, their messages state times in
@@ -519,6 +526,51 @@ Three things worth knowing about it:
 - **Only the app's own denial is reported.** A network failure or a controller
   misconfiguration (a read-only service key, say) is not the pod owner's problem
   and produces no Event; those go to the controller's log for an operator.
+
+### 5.2 When on-demand admission is paused: `OnDemandAdmissionPaused`
+
+Sometimes the controller does not ask for a lease at all, because on-demand
+admission for the pod's whole GPU class is on hold. Three situations do that:
+
+- **No node of the class is available.** Every node of this GPU class is out of
+  service — typically down for maintenance — so there is nowhere for the job to
+  run. Admission resumes as soon as one is back.
+- **The class is short of hardware.** The reservation service expects more GPUs
+  of this class than are currently online — a node is down, say. Leases sold
+  against GPUs that do not exist could never run, so on-demand admission for the
+  class stops until the two agree again.
+- **Reserved jobs are waiting.** A pod that already holds a *reservation* for
+  this GPU class has been admitted but the cluster cannot place it. Reserved
+  jobs go first, so no new on-demand jobs start on the class until the waiting
+  ones are running.
+
+Neither is anything the pod's owner did or can fix, so each pod held this way
+gets a `Warning` Event saying so:
+
+```console
+$ kubectl describe pod my-training-job
+...
+Events:
+  Type     Reason                   Age   From                        Message
+  ----     ------                   ----  ----                        -------
+  Warning  FailedScheduling         6m3s  default-scheduler           0/41 nodes are available: ...
+  Warning  OnDemandAdmissionPaused  6m1s  gpu-reservation-controller  On-demand GPU admission for gpu-class a100 is paused: the reservation service expects more a100 GPUs than are currently online in the cluster (for example, a GPU node is down or under maintenance), so no new on-demand jobs are started on this GPU class until that is resolved. Nothing about this pod needs to change; it stays Pending and the controller keeps retrying on its own. If this persists, contact support.
+```
+
+- **Leave the pod where it is.** It is not rejected: the controller keeps
+  retrying, and requests the lease itself as soon as the pause lifts.
+  Deleting and recreating the pod gains nothing, and sends it to the back of
+  the on-demand queue, which is ordered by pod creation time.
+- **It repeats on the same schedule as §5.1** — at most once per
+  `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30) while nothing changes,
+  immediately when something does. The two Events share that schedule, so a pod
+  that goes from paused to denied and back is told each time, and the newest
+  Event always says what is holding it now.
+- **"If this persists"** means the notice keeps coming back. The deployment may
+  name its support contact at the end of the message (`SUPPORT_CONTACT`); if it
+  does not, use your cluster's usual support channel. Mention the GPU class and
+  the Event's reason — that is enough for an operator to find the cause, which
+  the controller logs in full.
 
 ---
 
