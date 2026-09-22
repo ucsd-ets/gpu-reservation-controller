@@ -300,6 +300,6 @@ class Config:
             # prose; the explicit variable is for keeping logs on UTC while
             # events read local.
             display_timezone=_env_tz("EVENT_DISPLAY_TIMEZONE"),
-            log_level=os.environ.get("LOG_LEVEL", "INFO"),
+            log_level=_env_log_level("LOG_LEVEL", "INFO"),
             library_log_level=_env_log_level("LIBRARY_LOG_LEVEL", "WARNING"),
         )

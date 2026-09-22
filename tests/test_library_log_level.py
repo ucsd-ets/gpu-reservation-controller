@@ -56,6 +56,24 @@ class TestEnvLogLevel:
         assert fields["reason"] == "unknown_log_level"
 
 
+class TestRootLogLevel:
+    """LOG_LEVEL takes the same checks; junk used to crash ``setLevel`` at startup."""
+
+    def test_default_when_unset(self, env):
+        assert Config.from_env().log_level == "INFO"
+
+    def test_lower_case_is_accepted(self, env):
+        env.setenv("LOG_LEVEL", "debug")
+        assert Config.from_env().log_level == "DEBUG"
+
+    def test_unknown_level_falls_back_and_configures(self, env, restore_levels):
+        env.setenv("LOG_LEVEL", "verbose")
+        config = Config.from_env()
+        assert config.log_level == "INFO"
+        _configure_logging(config)  # must not raise
+        assert logging.getLogger().level == logging.INFO
+
+
 class TestConfigureLogging:
     def _levels(self):
         return {n: logging.getLogger(n).getEffectiveLevel() for n in _LIBRARY_LOGGERS}

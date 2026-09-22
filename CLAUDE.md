@@ -1568,7 +1568,7 @@ the claimed set and the grace re-arm path above applies.
 | `K8S_TLS_STRICT_VERIFY` | `true` | OpenSSL strict X.509 verification on the Kubernetes API connection. `false` clears `VERIFY_X509_STRICT`, which Python 3.13 enables by default, for clusters whose certificates lack an Authority Key Identifier (see **Strict TLS verification against the API server**). Not `verify_ssl: false` — chain, validity and hostname are still checked |
 | `POD_NAME` | *(hostname)* | This pod's name (downward API) — the Lease holder identity; falls back to `HOSTNAME`, then the system hostname |
 | `POD_NAMESPACE` | *(SA namespace)* | Namespace the Lease lives in (downward API); falls back to the service-account namespace file, then `default` |
-| `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
+| `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`). Unknown level ⇒ `config.invalid`, default used |
 | `LIBRARY_LOG_LEVEL` | `WARNING` | Level for the HTTP/Kubernetes client libraries (`httpx`, `httpcore`, `urllib3`, `kubernetes`), whose verbose output is raw API traces, so `LOG_LEVEL=DEBUG` shows the controller's own DEBUG events without them. The effective level is the stricter of this and `LOG_LEVEL`; set both to `DEBUG` for the raw traces. Unknown level ⇒ `config.invalid`, default used |
 
 ---
