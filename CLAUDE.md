@@ -161,7 +161,7 @@ free (one patch, no extra API call):
 
 | Annotation | Value |
 |------------|-------|
-| `galends/reservation-kind` | `booking` \| `on_demand` — whether the user reserved this window or the controller minted a JIT lease for them |
+| `galends/reservation-kind` | `booking` \| `on_demand` \| `best_effort` — whether the user reserved this window, the controller minted a JIT lease for them, or the pod asked for no guarantee (see **Best-effort admission**) |
 | `galends/reservation-start` / `-end` | The reservation's **own** window (UTC ISO-8601), which is *not* `guaranteed-until` — that is the end of the back-to-back chain |
 | `galends/reservation-gpu-count` | GPUs the reservation holds; against the pod's own request this yields "using 1 of the 4 you booked" |
 | `galends/gpu-class-name` | The class's display name (`gpu_class.name`), as opposed to the `label_value` used for matching |
@@ -285,8 +285,10 @@ in `main.py`), which on every tick:
    back to local **uniform-random** selection (`select_victims_locally`) so
    preemption still works — this is the same greedy random pick the controller
    did before delegation existed.  A shortfall the returned victims do not cover
-   is logged as an "unmet" warning (priority ranking within the app's random
-   policy is deferred future design; the controller's own fallback is uniform).
+   is logged as an "unmet" warning.  The app's policy orders by reservation
+   kind — `best_effort`, then `on_demand`, then `booking` — and is random
+   within a kind (see **Best-effort admission**); the controller's own
+   fallback is uniform across the pool.
 6. Selected victims are deleted (`_preempt_pod`: emit a `Normal` Event with
    `reason: Preempted`, `action: PreemptPod`, then delete and release
    occupancy — all best-effort, mirroring the cancellation-eviction shape in
@@ -733,7 +735,8 @@ localised.
 
 The zone comes from `EVENT_DISPLAY_TIMEZONE` (an IANA name) when set, and
 otherwise from the process's local zone — i.e. `TZ`, which the chart already
-wires.  So `TZ` alone localises both the logs and the prose; the explicit
+wires.  Both ship empty in the chart, so an unconfigured install renders the
+prose in UTC (`… 17:30:16 UTC`), zone still named.  So `TZ` alone localises both the logs and the prose; the explicit
 variable exists for keeping logs on UTC while events read local.  It is
 resolved to a `ZoneInfo`, **not** to a fixed offset captured at startup: this
 daemon runs across DST transitions, and a frozen offset would render every
@@ -993,9 +996,14 @@ Three consequences worth knowing, each pinned by a test:
   already has, so `plan_pod_adoptions` picks it up on the same tick and re-links
   it onto a booking its user has since made — the free upgrade from unguaranteed
   to guaranteed.
-- **`guarantee-status` reads `overstay` for the pod's whole life**, which is
-  literally true and deliberately not given a third literal (that would risk the
-  diff-and-skip drift `plan_guarantee_status` warns about).
+- **`guarantee-status` reads `overstay` for the rest of the pod's life** once
+  the first queue tick after admission flips it — the admission write stamps
+  `guaranteed`, as every `annotate_runtime_guarantee` call does, so for up to
+  one `QUEUE_PROCESSOR_INTERVAL` it reads `guaranteed` (and
+  `pod-runtime-limit-seconds` is `0`: `_record_guarantee` skips the `max(1, …)`
+  floor for a stub).  `overstay` is literally true and deliberately not given a
+  third literal (that would risk the diff-and-skip drift
+  `plan_guarantee_status` warns about).
   `galends/reservation-kind: best_effort` is what disambiguates it for a consumer.
   Admission emits **`BestEffortAdmitted`**, not `RuntimeGuaranteed` — whose
   message would read "guaranteed for 0m00s, until *the instant the pod started*".
@@ -1910,7 +1918,7 @@ the claimed set and the grace re-arm path above applies.
 | `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), or one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**). Throttled with the denial Event, on its cadence; `false` disables |
 | `RESERVATION_WAIT_EVENT_ENABLED` | `true` | Put an Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`WaitingForReservation`, `Normal`), the owner's other pods hold its GPUs (`ReservationFull`, naming them) or it holds fewer GPUs than the pod requests (`ReservationTooSmall`) (see **Telling the pod's owner what its reservation is waiting on**). Throttled with the denial Event, on its cadence; `false` disables |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
-| `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
+| `NOSHOW_GRACE_MINUTES` | `30` | Grace period before a booking whose window is already open is declared a no-show: one mid-window when the controller starts, or one vacated mid-window when its last holder pod ends (re-armed by `update_noshow_tracking` on the next refresh — see **In-memory state only**) |
 | `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |
 | `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
 | `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**), and a pod without the label is never JIT-eligible either. Unset = disabled |

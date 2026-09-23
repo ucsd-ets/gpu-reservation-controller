@@ -1,37 +1,71 @@
 ---
-title: Reservation-block lifecycle
+title: Pod lifecycle under the GPU reservation controller
 ---
 stateDiagram-v2
-    state "Scheduled" as S
-    state "Awaiting Claim" as AC
-    state "Reserved In Use" as RIU
-    state "On-Demand Available" as ODA
-    state "On-Demand In Use" as ODIU
-    state "Window Ended" as WE
+    %% One pod carrying a gpu-class label, from creation to its end.
+    %% Event names in parentheses are the Kubernetes Events the controller
+    %% writes on the pod; docs/POD-ANNOTATIONS.md explains each one.
+    %% "30 min" is ONDEMAND_HORIZON_MINUTES; the resync is the pod watch's
+    %% periodic re-LIST (about every 10 min).
 
-    [*] --> S   : reservation fetched
-    [*] --> ODA : reclaim hold enters directly
+    state "Routing" as R
+    state "Waiting for a booking" as Q
+    state "Awaiting an on-demand lease" as J
+    state "Left Pending" as L
+    state "Guaranteed" as G
+    state "Overstay" as O
+    state "At risk (termination warning)" as W
+    state "Preempted" as X
+    state "Evicted" as E
+    state "Ended" as F
 
-    S    --> AC   : window opens
-    AC   --> RIU  : holder pod matched, toleration applied, runtime capped
-    AC   --> ODA  : no-show after 15 min, irrevocable
-    RIU  --> ODA  : idle-cull, 30-min re-arm, irrevocable if holder does not return
-    RIU  --> ODA  : mid-window cancellation, pod evicted, immediately irrevocable
-    ODA  --> ODIU : eligible pending pod placed, runtime capped to block end
-    ODIU --> ODA  : pod finishes or is culled, block recycled
+    [*] --> R : pod created with a gpu-class label
 
-    S    --> WE
-    AC   --> WE
-    RIU  --> WE
-    ODA  --> WE
-    ODIU --> WE   : window closes
+    %% Not yet admitted (no toleration)
+    R --> Q : own booking open or opening within 30 min with room, or any later booking if not on-demand eligible (WaitingForReservation, ReservationFull, ReservationTooSmall)
+    R --> J : on-demand eligible and no booking can take it within 30 min
+    R --> L : nothing matches and not on-demand eligible (NoReservation, UnknownGpuClass)
+    J --> J : lease denied or class paused, retried (OnDemandLeaseDenied, OnDemandAdmissionPaused)
+    J --> Q : a booking with room comes within 30 min
+    Q --> R : booking ended, cancelled or no longer able to take it, re-routed at the next resync
+    L --> R : re-routed at the next resync, e.g. after the owner books
 
-    WE --> [*]
+    %% Admission (toleration and galends/booking-reference patched)
+    Q --> G : window open and GPUs free (RuntimeGuaranteed)
+    J --> G : lease granted (RuntimeGuaranteed)
+    J --> O : best-effort stub granted (BestEffortAdmitted)
 
-    classDef blue  fill:#4472C4,color:#fff,stroke:#2F5496
-    classDef green fill:#70AD47,color:#fff,stroke:#375623
-    classDef grey  fill:#767171,color:#fff,stroke:#595959
+    %% Admitted
+    G --> G : abutting booking extends the guarantee, lease merged into a booking as it opens, or reservation replaced by Extend (ReservationRelinked)
+    G --> O : guarantee ends, pod keeps running
+    G --> W : guarantee ends before a booking that needs its GPUs
+    O --> G : re-linked to an open booking with room (OverstayRelinked)
+    O --> W : a booking starting soon, or the headroom goal, needs its GPUs
+    W --> O : risk clears, warning removed
+    W --> G : guarantee extended or pod re-linked in time
+    W --> X : preemption sweep deletes it (Preempted)
 
-    class S,AC,RIU blue
-    class ODA,ODIU green
-    class WE grey
+    G --> E
+    O --> E
+    W --> E : reservation cancelled or reassigned mid-window, nowhere to move (ReservationCancelled, ReservationReassigned)
+
+    G --> F
+    O --> F
+    W --> F : pod finishes or is deleted, and a JIT lease is cancelled with it
+
+    Q --> [*]
+    J --> [*]
+    L --> [*] : deleted before admission
+    X --> [*]
+    E --> [*]
+    F --> [*]
+
+    classDef pending  fill:#767171,color:#fff,stroke:#595959
+    classDef admitted fill:#4472C4,color:#fff,stroke:#2F5496
+    classDef risk     fill:#ED7D31,color:#fff,stroke:#C55A11
+    classDef ended    fill:#3B3838,color:#fff,stroke:#262626
+
+    class R,Q,J,L pending
+    class G,O admitted
+    class W risk
+    class X,E,F ended
