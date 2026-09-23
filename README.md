@@ -1019,7 +1019,7 @@ gpu-reservation-controller/
 │   ├── SCHEDULING.md         Reservation-app scheduling behaviour reference (shared copy)
 │   ├── POD-ANNOTATIONS.md    Pod-annotation reference for in-pod consumers
 │   │                         (Jupyter/VS Code widgets) reading them via downwardAPI
-│   └── lifecycle.mmd         Pod lifecycle state diagram (Mermaid source)
+│   └── lifecycle.mmd/.png    Pod lifecycle state diagram (Mermaid + rendered)
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── pytest.ini
