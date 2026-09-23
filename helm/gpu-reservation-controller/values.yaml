@@ -97,10 +97,11 @@ config:
   # Honour a pod's galends/runtime-guarantee: "none" annotation by admitting it
   # under a zero-length, zero-SU kind="best_effort" reservation instead of a
   # guaranteed lease: no runtime guarantee, no Service Units, and preemptible
-  # from the first second (sacrificed ahead of leases and bookings when capacity
-  # is reclaimed). Requires a reservation app serving the best-effort create
-  # shape -- against one that does not, every such pod backs off on a
-  # non-retryable 4xx. false ignores the annotation entirely.
+  # from the first second (the reservation app's victim policy sacrifices it
+  # ahead of leases and bookings when capacity is reclaimed). Requires a
+  # reservation app serving the best-effort create shape -- against one that
+  # does not, every such pod backs off on a non-retryable 4xx. false ignores
+  # the annotation entirely.
   bestEffortEnabled: false
 
   # Minutes after a reservation window opens before the holder is declared a
@@ -108,8 +109,10 @@ config:
   # window for re-booking.
   noshowTimeoutMinutes: 15
 
-  # Grace period (minutes) after controller startup before no-shows are
-  # declared for windows already in progress.
+  # Grace period (minutes) before a booking whose window is already open is
+  # declared a no-show and cancelled: one already in progress when the
+  # controller starts, or one vacated mid-window after its last pod ends
+  # (finished, deleted or idle-culled).
   noshowGraceMinutes: 30
 
   # IANA timezone for log timestamps, and — unless eventDisplayTimezone
@@ -166,14 +169,17 @@ config:
   # pods so the incoming reservation has room when its window opens).
   preemptionLeadMinutes: 15
 
-  # Seconds between preemption sweeps (checks whether any upcoming boundary
-  # needs capacity freed, and whether any just-expired blocks need cleanup).
+  # Seconds between preemption sweeps (checks whether any upcoming booking
+  # boundary needs capacity freed from pods past their runtime guarantee, and
+  # refreshes the termination-warning annotations).
   preemptionCheckInterval: 60
 
   # Seconds between app-side vs physical GPU capacity audits (default hourly).
-  # Each audit compares the reservation app's per-class total_gpus against the
-  # GPUs physically present in the cluster, logs any difference as a WARNING,
-  # and pauses new on-demand admissions for any class the app over-counts.
+  # Each audit compares the reservation app's per-class effective_gpus_today
+  # (its configured count after any capacity override covering today) against
+  # the GPUs physically present in the cluster, logs any difference as a
+  # WARNING, and pauses new on-demand admissions for any class the app
+  # over-counts (that pause is also re-checked every queue-processor tick).
   capacityCheckInterval: 3600
 
   # Re-link an overstay pod (one running past its runtime guarantee) to a
