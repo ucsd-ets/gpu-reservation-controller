@@ -36,7 +36,9 @@ stateDiagram-v2
     J --> O : best-effort stub granted (BestEffortAdmitted)
 
     %% Admitted
-    G --> G : abutting booking extends the guarantee, lease merged into a booking as it opens, or reservation replaced by Extend (ReservationRelinked)
+    %% An abutting booking (same class, GPU count and group) extends the
+    %% guarantee silently: no re-link and no Event.
+    G --> G : moved to another booking (ReservationRelinked)
     G --> O : guarantee ends, pod keeps running
     G --> W : guarantee ends before a booking that needs its GPUs
     O --> G : re-linked to an open booking with room (OverstayRelinked)
