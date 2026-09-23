@@ -754,6 +754,12 @@ class TerminationWarning:
     view: PodRuntimeView
     terminate_at: datetime   # projected kill instant at the soonest at-risk boundary
     risk: float              # (0, 1] at that boundary
+    # The booking boundary the pod is at risk at, or None for a headroom notice
+    # (no booking involved: capacity held free for on-demand jobs).  Carried so
+    # the message can say which, rather than implying a reservation starts at
+    # ``terminate_at`` -- true only for a pod whose guarantee ends exactly at
+    # the boundary.
+    boundary: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -983,6 +989,17 @@ class ControllerState:
         # Deliberately *not* used to throttle headroom *warnings*: those are
         # recomputed on every sweep (see main._run_preemption_sweep).
         self.headroom_last_eval: Optional[datetime] = None
+
+        # Whether some pod may still carry a ``galends/termination-warning-*``
+        # annotation.  The preemption sweep skips its cluster snapshots on a tick
+        # with nothing in scope -- and, before this existed, skipped the warning
+        # reconcile with them, so a warning whose boundary was cancelled or had
+        # passed stayed on the pod until some other booking came within range
+        # (hours, on a quiet night).  While this is set, the sweep runs anyway so
+        # the reconcile can clear what is stale.  ``True`` at startup: the pods'
+        # own annotations are the state, and a previous lifetime may have left
+        # some behind.
+        self.termination_warnings_outstanding: bool = True
 
         # Serialises reservation-state reconciliation between the fetch loop and
         # the inbound push endpoint.  Both mutate ``reservations`` and evict pods
@@ -2907,7 +2924,7 @@ class ControllerState:
                     if ge is not None and ge > kill_start:
                         kill_start = ge
                     warnings[p.uid] = TerminationWarning(
-                        view=p, terminate_at=kill_start, risk=risk
+                        view=p, terminate_at=kill_start, risk=risk, boundary=boundary,
                     )
         return warnings
 

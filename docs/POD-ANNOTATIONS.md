@@ -231,7 +231,7 @@ Four things about that loop:
 | `galends/admitted-at` | at first admission only | absolute UTC instant, same format | Written once and never rewritten — a re-link is not a new admission. Never removed while the pod lives. |
 | `galends/termination-warning-at` | while at risk | absolute UTC instant, same format | **Appears and disappears.** Present only while the pod is in the at-risk pool; all three warning keys are removed together when the risk clears. |
 | `galends/termination-warning-risk` | while at risk | decimal string in `(0, 1]`, 2 dp, e.g. `0.33` | Same lifecycle. |
-| `galends/termination-warning-message` | while at risk | human-readable English sentence | Same lifecycle. Rendered deterministically from the other two; safe to display verbatim. **The one value here that is not UTC**: its instant reads in the deployment's local zone (e.g. `2026-08-21 10:30:16 PDT`), because it is prose for a person rather than a value to parse. Parse `-at` instead. |
+| `galends/termination-warning-message` | while at risk | human-readable English sentence | Same lifecycle. Rendered deterministically from the other two plus the cause — the start of the booking that needs the GPUs (which is later than `-at` for a proactive kill), or holding GPUs free for on-demand jobs, where no booking is involved; safe to display verbatim. **The one value here that is not UTC**: its instant reads in the deployment's local zone (e.g. `2026-08-21 10:30:16 PDT`), because it is prose for a person rather than a value to parse. Parse `-at` instead. |
 
 ### What each one means
 
@@ -319,18 +319,18 @@ them. Worth surfacing read-only in a UI, since they explain admission behaviour:
 |-----|---------|
 | `galends/minimum-runtime-seconds` | **Positive** integer. Required for a pod to be eligible for a just-in-time on-demand lease when no reservation is open; also sizes that lease. A pod without it simply waits for a matching reservation. `0` is **not** a way to ask for no guarantee — it is rejected with a `pod.annotation_invalid` warning; use `galends/runtime-guarantee` below. |
 | `galends/runtime-guarantee` | `none` — "admit me with no runtime guarantee at all". See §3.1. Any other value is ignored with a warning, as is `none` itself on a cluster without best-effort admission. |
+| `galends/usage-group` | The usage group a JIT lease is created under. Required for JIT eligibility unless the deployment identifies the group through a pod *label* instead (`REQUIRED_GROUP_LABEL`). |
 
 A value the controller has to ignore is reported on the pod itself, not only in
 the controller's log, wherever ignoring it changes what happens to the pod — see
 `AnnotationIgnored` and `NoReservation` in §5.3.
-| `galends/usage-group` | The usage group a JIT lease is created under. Required for JIT eligibility unless the deployment identifies the group through a pod *label* instead (`REQUIRED_GROUP_LABEL`). |
 
 The pod's `gpu-class` **label** (not an annotation, so it is not in this file
 unless you also project `metadata.labels`) names the GPU class.
 
-A deployment may configure cluster-wide stand-ins for both of the above
-(`DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP`), in which case a pod
-carrying neither annotation is still JIT-eligible. Neither default is written
+A deployment may configure cluster-wide stand-ins for the minimum runtime and
+the usage group (`DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP`), in
+which case a pod carrying neither annotation is still JIT-eligible. Neither default is written
 back to the pod, so a UI cannot tell from the annotations alone whether a value
 came from the pod or from the deployment — read the absence of an annotation as
 "whatever the cluster defaults to", not as "unset".
@@ -483,8 +483,13 @@ should do it on the warning, not on `SIGTERM` — the grace period is whatever t
 pod spec sets, typically 30 s. §6 covers how to do that for a PyTorch job.
 
 The controller also emits Kubernetes **Events** against the pod
-(`RuntimeGuaranteed` at admission, `OverstayRelinked` when a pod is re-linked to
-a new reservation, `Preempted` immediately before deletion,
+(`RuntimeGuaranteed` at admission, `OverstayRelinked` when a pod running past its
+guarantee is re-linked to a reservation you have since booked,
+`ReservationRelinked` when a pod is moved to another of your reservations for
+any other reason — its on-demand lease merged into your booking as that booking
+opened, or its reservation replaced by Extend — `Preempted` immediately before
+deletion, `ReservationCancelled` and `ReservationReassigned` immediately before
+a deletion no warning announces (below),
 `OnDemandLeaseDenied` when a lease request is refused — §5.1 —
 `OnDemandAdmissionPaused` when on-demand admission for the pod's GPU class is
 on hold — §5.2 — `OnDemandLeaseRejected`, `UnknownGpuClass`,
@@ -497,6 +502,21 @@ whoever runs `kubectl` — the pod's owner, an operator, a dashboard — rather 
 for in-pod consumers. Being addressed to a person, their messages state times in
 the deployment's local zone (`2026-08-21 10:30:16 PDT`) rather than the UTC the
 annotations carry.
+
+Two deletions are **not** preceded by a termination warning, because nothing
+predicts them — they follow a person's action on the reservation, and the pod
+is deleted in the same step:
+
+| Event | When | Message |
+|---|---|---|
+| `ReservationCancelled` | The reservation the pod runs under is cancelled while its window is open — by you, a group manager or an administrator — and you hold no other open reservation with room for the pod to move to | `Pod evicted: GPU reservation cancelled by user.` (`by another user` when someone else cancelled it; a machine reason such as `(reason: no-show)` is appended when there is one) |
+| `ReservationReassigned` | The reservation is handed to a teammate (Team Mode) while its window is open, so its GPUs go to the new owner's pods | `Pod evicted: GPU reservation reassigned to <username>.` |
+
+Both are ordinary graceful deletions (`SIGTERM`, then the grace period) with no
+warning beforehand — one more reason the periodic checkpoint in §6.1 is the one
+that is not optional. A reservation that is *replaced* rather than simply
+cancelled — Extend supersedes it with a new one — does not evict: the pod is
+moved onto the replacement and gets `ReservationRelinked` instead.
 
 ### 5.1 Why a pod is still Pending: `OnDemandLeaseDenied`
 
@@ -523,9 +543,25 @@ Events:
 
 Three things worth knowing about it:
 
-- **It is not a terminal state.** The controller keeps retrying on its own
-  cadence (2–5 minutes); the Event is a report, not a rejection. A pod denied
-  for capacity usually gets in once someone else's job ends.
+- **Whether waiting helps depends on why.** Most denials are about *load* —
+  capacity, a budget window — and the controller keeps retrying on its own
+  cadence (2–5 minutes); a pod denied for capacity usually gets in once someone
+  else's job ends. When the reservation service knows when the denial clears (a
+  budget window's end, a group's start date) the Event says so, and the
+  controller waits for that rather than polling toward it. Some denials are
+  *structural* — more GPUs than the class allows per reservation, a group the
+  user is not a member of, a group whose term has ended — and the same request
+  will be refused on every retry. Those Events say **waiting will not change
+  this** instead of promising a retry, and end by suggesting you contact support
+  if the reason looks wrong:
+
+  ```text
+  On-demand GPU lease for 8 x a100 was denied by the reservation service: Requested 8 GPU(s) but this class allows at most 4 per reservation. Waiting will not change this: the pod stays Pending until its request changes or an administrator changes what refused it. If the reason looks wrong, contact support.
+  ```
+
+  The controller still rechecks a structural denial, but backs off to at most
+  once every 30 minutes — an administrator can change the answer, and the pod
+  then gets in without being recreated.
 - **It repeats, but not every retry.** An unchanged reason is restated at most
   once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30) — often enough
   that the Event does not silently age out of `kubectl describe` on a pod that

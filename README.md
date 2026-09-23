@@ -185,10 +185,13 @@ dark.  For each granted pod it then calls `POST /api/reservations` with
 pod's Kubernetes UID**: a retry after a prior grant returns the same
 reservation rather than creating a duplicate.
 
-- **Denied** (409/error): the candidate cools down 2–5 min and retries.  On a
-  **409** — the app's documented "infeasible right now", which carries a reason
-  such as `Only 1 GPU(s) available for this group at 2026-08-21 14:00 (group
-  ceiling: 4)` — that reason is also mirrored onto the pod as a `Warning`
+- **Denied** (409/error): the candidate cools down 2–5 min and retries.  A
+  **409** carries the app's reason, such as `Only 1 GPU(s) available for this
+  group at 2026-08-21 14:00 (group ceiling: 4)`, and its verdict on whether
+  waiting can help: a **structural** denial (`retryable: false` — over the
+  class's per-reservation GPU cap, not a member, the group's term over) backs off
+  to at most one retry per 30 min instead, and one that names when it clears
+  (`not_before`) waits for that.  The reason is also mirrored onto the pod as a `Warning`
   Kubernetes Event (`reason=OnDemandLeaseDenied`), so the pod's **owner** can see
   why their job is still Pending with `kubectl describe pod` rather than needing
   the controller's logs.  An unchanged reason is restated at most once per
@@ -480,7 +483,9 @@ the new reservation and moves the pod's occupancy accordingly, so it is
 credited against the new reservation. This runs before each preemption sweep
 plans any kills (so a just-re-booked pod is never a victim) and once per
 queue-processor tick. Re-linked pods get a Kubernetes Event with reason
-`OverstayRelinked`.
+`OverstayRelinked` — or `ReservationRelinked` when the pod was never
+overstaying (a JIT lease merged into a booking as it opened, or a reservation
+replaced mid-window by Extend).
 
 ---
 
@@ -542,7 +547,7 @@ All settings are supplied via environment variables.
 | `ONDEMAND_LEASE_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
-| `ONDEMAND_DENIAL_EVENT_ENABLED` | no | `true` | Mirror the reservation app's refusal of a JIT lease onto the waiting pod as a `Warning` Kubernetes Event, so its owner can see why it is still Pending without access to the controller's logs: a **409** denial (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class the app does not recognise (`reason=OnDemandLeaseRejected`) — every one of which came off the pod. Informational only — the controller retries either way. A network failure or any other non-409 fault (a read-only service key, a schema mismatch) stays in the log. Set to `false` to disable |
+| `ONDEMAND_DENIAL_EVENT_ENABLED` | no | `true` | Mirror the reservation app's refusal of a JIT lease onto the waiting pod as a `Warning` Kubernetes Event, so its owner can see why it is still Pending without access to the controller's logs: a **409** denial (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class the app does not recognise (`reason=OnDemandLeaseRejected`) — every one of which came off the pod. Informational only — the controller retries either way (rarely, for a denial the app marks `retryable: false`, which the Event says waiting will not fix). A network failure or any other non-409 fault (a read-only service key, a schema mismatch) stays in the log. Set to `false` to disable |
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | no | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause (`ONDEMAND_PAUSE_EVENT_ENABLED`), a pod-problem Event (`POD_PROBLEM_EVENT_ENABLED`) or a reservation-wait Event (`RESERVATION_WAIT_EVENT_ENABLED`); the name predates all but the first. The retry cadence is 2–5 min, so without this a blocked pod would accumulate a new Event every few minutes; the repeat still fires because Events expire, and a pod that is still stuck should still say so. A status that **changes** — including a switch between any two of them — is emitted immediately regardless. `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event (`reason=OnDemandAdmissionPaused`) on every pod held by a class-wide on-demand pause — no schedulable node in the class (guard 1b), a stuck reservation holder (guard 3) or an app-side capacity overcommit (guard 4) — saying why it is still Pending and suggesting its owner contact support if it persists. Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
 | `SUPPORT_CONTACT` | no | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of that suggestion (`If this persists, contact support: <value>`), and of the pod-problem Events below. Keep it short: it is part of every such Event. Unset, the suggestion names no one |

@@ -289,6 +289,7 @@ class TestFactsFollowARelink:
         monkeypatch.setattr(m, "read_pod", _read)
         monkeypatch.setattr(m, "apply_toleration", _noop)
         monkeypatch.setattr(m, "emit_overstay_relinked_event", _noop)
+        monkeypatch.setattr(m, "emit_reservation_relinked_event", _noop)
 
         from app.controller import ControllerState, PodRuntimeView
         from tests.conftest import make_config

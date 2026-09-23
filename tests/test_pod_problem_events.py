@@ -993,7 +993,7 @@ class TestAnnotationIgnored:
         problems = [AnnotationProblem(MIN_RUNTIME, "4h", "not_an_integer")]
         notes, denials = _ProblemRecorder(), []
 
-        async def deny(uid, name, namespace, detail, *, gpu_class, gpu_count):
+        async def deny(uid, name, namespace, detail, *, gpu_class, gpu_count, **_kw):
             denials.append(detail)
 
         monkeypatch.setattr(m, "emit_pending_pod_event", notes)

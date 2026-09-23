@@ -190,6 +190,8 @@ follow this grammar and are not expected to.
 `reason` enums by event: `auth.login_failed` → `no_such_user`, `inactive`,
 `wrong_provider`, `account_locked`, `bad_password`, `deactivated` ·
 `auth.oauth_state_rejected` → `state_mismatch` ·
+`auth.oauth_userinfo_failed` → `fetch_failed`, `missing_claim` ·
+`auth.saml_acs_failed` → `missing_nameid`, else python3-saml's own free-text reason ·
 `auth.csrf_rejected` → `missing_trace`, `invalid_trace` ·
 `auth.session_revoked` → `self`, `admin`, `password_change` ·
 `user.impersonation_ended` → `ended`, `target_invalid`, `revoked` ·
@@ -198,7 +200,7 @@ follow this grammar and are not expected to.
 `reservation.cancelled` → `no-show`, `controller-revoked`, `pod-terminated`,
 `superseded` · `overstay.recorded` → `pod-terminated`, `preempted`, `deleted` ·
 `k8s.event` → `RuntimeGuaranteed`, `Preempted`, `ReservationCancelled`,
-`ReservationReassigned`, `OverstayRelinked`.
+`ReservationReassigned`, `OverstayRelinked`, `ReservationRelinked`.
 
 ### Time
 

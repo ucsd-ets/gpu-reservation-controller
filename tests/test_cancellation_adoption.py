@@ -97,8 +97,14 @@ def _install_stubs(monkeypatch, m, snapshot):
     async def _record_guarantee(name, ns, pod, guaranteed_until, now, reservation, **kw):
         return None
 
-    async def _emit_relinked(pod, name, ns, res_id, guaranteed_until):
-        return None
+    async def _emit_overstay(pod, name, ns, res_id, guaranteed_until):
+        RELINK_EVENTS.append(("OverstayRelinked", res_id, None))
+
+    async def _emit_relinked(pod, name, ns, res_id, guaranteed_until, *,
+                             previous_reservation_id, cause):
+        RELINK_EVENTS.append(("ReservationRelinked", res_id, cause))
+
+    RELINK_EVENTS.clear()
 
     monkeypatch.setattr(m, "snapshot_tolerated_pods", _snapshot)
     monkeypatch.setattr(m, "delete_pod", _delete)
@@ -106,8 +112,13 @@ def _install_stubs(monkeypatch, m, snapshot):
     monkeypatch.setattr(m, "emit_reservation_cancelled_event", _emit_cancelled)
     monkeypatch.setattr(m, "apply_toleration", _apply_toleration)
     monkeypatch.setattr(m, "_record_guarantee", _record_guarantee)
-    monkeypatch.setattr(m, "emit_overstay_relinked_event", _emit_relinked)
+    monkeypatch.setattr(m, "emit_overstay_relinked_event", _emit_overstay)
+    monkeypatch.setattr(m, "emit_reservation_relinked_event", _emit_relinked)
     return deleted, cancelled_events, patched_refs
+
+
+# (reason, reservation id, cause) of every re-link Event the stubs saw.
+RELINK_EVENTS: list[tuple] = []
 
 
 def _run_cancellations(m, state, config, cancelled, now):
@@ -143,6 +154,8 @@ class TestAdoptBeforeEvict:
         assert cancelled_events == []
         assert state.occupancy.get(2, {}).get("uid-1") == 1  # occupancy re-homed
         assert state.occupancy.get(1, {}) == {}
+        # Its reservation was replaced mid-window; it was never overstaying.
+        assert RELINK_EVENTS == [("ReservationRelinked", 2, "replaced")]
 
     def test_evicts_when_adoption_disabled(self, monkeypatch):
         m = _main_module(monkeypatch)

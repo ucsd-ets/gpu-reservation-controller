@@ -129,7 +129,7 @@ class _DenialRecorder:
     def __init__(self):
         self.calls: list = []
 
-    async def __call__(self, uid, name, namespace, detail, *, gpu_class, gpu_count):
+    async def __call__(self, uid, name, namespace, detail, *, gpu_class, gpu_count, **_kw):
         self.calls.append(detail)
 
 

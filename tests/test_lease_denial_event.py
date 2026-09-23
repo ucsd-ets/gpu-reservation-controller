@@ -69,6 +69,7 @@ def _config(**overrides):
     base = dict(
         ondemand_denial_event_enabled=True,
         ondemand_denial_event_repeat_minutes=30,
+        support_contact=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -252,12 +253,14 @@ class TestEmitLeaseDeniedEvent:
 class _Recorder:
     def __init__(self, raises=None):
         self.calls: list = []
+        self.kwargs: list[dict] = []
         self._raises = raises
 
-    async def __call__(self, uid, name, namespace, detail, *, gpu_class, gpu_count):
+    async def __call__(self, uid, name, namespace, detail, *, gpu_class, gpu_count, **kw):
         if self._raises is not None:
             raise self._raises
         self.calls.append((uid, name, namespace, detail, gpu_class, gpu_count))
+        self.kwargs.append(kw)
 
 
 def _run(m, monkeypatch, config, candidate, detail, now, recorder=None, state=None):
@@ -399,17 +402,18 @@ class TestDenialEventThrottle:
 class _DenyingClient:
     """A client whose lease request always fails with *status* / *detail*."""
 
-    def __init__(self, status, detail):
-        self._attempt = LeaseAttempt(status=status, detail=detail)
+    def __init__(self, status, detail, **envelope):
+        self._attempt = LeaseAttempt(status=status, detail=detail, **envelope)
 
     async def create_ondemand_reservation(self, req):
         return self._attempt
 
 
-def _grant_and_admit(m, monkeypatch, status, detail, config=None):
+def _grant_and_admit(m, monkeypatch, status, detail, config=None, candidate=None,
+                     **envelope):
     rec = _Recorder()
     monkeypatch.setattr(m, "emit_lease_denied_event", rec)
-    candidate = _candidate()
+    candidate = candidate or _candidate()
     ask = OnDemandAdmissionCandidate(
         pod_uid="uid-1",
         pod_created_at=datetime.now(timezone.utc),
@@ -421,7 +425,7 @@ def _grant_and_admit(m, monkeypatch, status, detail, config=None):
     )
     done = asyncio.run(
         m._grant_and_admit(
-            ControllerState(), _DenyingClient(status, detail),
+            ControllerState(), _DenyingClient(status, detail, **envelope),
             config or _config(), "uid-1", candidate, ask,
         )
     )
@@ -486,3 +490,190 @@ class TestEmptyBodyCarriesNoReason:
         m = _main_module(monkeypatch)
         rec, _c = _grant_and_admit(m, monkeypatch, 409, None)
         assert rec.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The admission-denial envelope: retryable / not_before are honoured
+# ---------------------------------------------------------------------------
+
+STRUCTURAL = "Requested 8 GPU(s) but this class allows at most 4 per reservation."
+
+
+class TestDenialEnvelopeIsRead:
+    def test_structural_denial_is_not_retryable(self):
+        client = _client_answering(409, {
+            "detail": STRUCTURAL, "code": "gpu_count_over_class_cap", "retryable": False,
+        })
+        attempt = asyncio.run(client.create_ondemand_reservation(_ask()))
+        assert (attempt.code, attempt.app_retryable) == ("gpu_count_over_class_cap", False)
+        assert attempt.structural is True
+        assert attempt.retryable is False
+
+    def test_contended_denial_carries_not_before(self):
+        client = _client_answering(409, {
+            "detail": DETAIL, "code": "su_budget_member", "retryable": True,
+            "not_before": "2024-01-16T00:00:00Z",
+        })
+        attempt = asyncio.run(client.create_ondemand_reservation(_ask()))
+        assert attempt.structural is False
+        assert attempt.retryable is True
+        assert attempt.not_before == datetime(2024, 1, 16, tzinfo=timezone.utc)
+
+    def test_absent_envelope_is_read_as_retryable(self):
+        # An older app, or a 409 outside the admission gates: the contract says
+        # read an absent flag as retryable -- the behaviour before it existed.
+        client = _client_answering(409, {"detail": DETAIL})
+        attempt = asyncio.run(client.create_ondemand_reservation(_ask()))
+        assert (attempt.code, attempt.app_retryable, attempt.not_before) == (None, None, None)
+        assert attempt.retryable is True
+
+    @pytest.mark.parametrize("body", [
+        {"detail": DETAIL, "retryable": "false"},       # string, not bool
+        {"detail": DETAIL, "not_before": "next tuesday"},
+        {"detail": DETAIL, "code": 7},
+    ])
+    def test_a_malformed_envelope_degrades_to_status_only(self, body):
+        client = _client_answering(409, body)
+        attempt = asyncio.run(client.create_ondemand_reservation(_ask()))
+        assert attempt.retryable is True
+        assert attempt.not_before is None
+
+    def test_the_code_and_verdict_are_logged(self, caplog):
+        client = _client_answering(409, {
+            "detail": STRUCTURAL, "code": "gpu_count_over_class_cap", "retryable": False,
+        })
+        with caplog.at_level(logging.INFO, logger="app.reservation_client"):
+            asyncio.run(client.create_ondemand_reservation(_ask()))
+        denied = [r for r in caplog.records if "api.lease_denied" in r.getMessage()]
+        fields = kv_fields(denied[0].getMessage())
+        assert (fields["reason"], fields["retryable"]) == ("gpu_count_over_class_cap", "false")
+
+
+class TestStructuralDenialIsNotRetriedForever:
+    def test_it_backs_off_instead_of_the_ordinary_cadence(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        candidate = _candidate()
+        for expected in (1, 2, 3):
+            _grant_and_admit(
+                m, monkeypatch, 409, STRUCTURAL, candidate=candidate,
+                code="gpu_count_over_class_cap", app_retryable=False,
+            )
+            assert candidate.lease_error_count == expected
+        # Third consecutive structural denial: at least 4x the 2-min floor.
+        delay = candidate.next_attempt_at - datetime.now(timezone.utc)
+        assert delay >= timedelta(minutes=7)
+
+    def test_it_is_still_told_to_the_pod_as_structural(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        rec, _c = _grant_and_admit(
+            m, monkeypatch, 409, STRUCTURAL,
+            code="gpu_count_over_class_cap", app_retryable=False,
+        )
+        assert len(rec.calls) == 1
+        assert rec.kwargs[0]["structural"] is True
+
+    def test_it_logs_at_info_with_the_verdict(self, monkeypatch, caplog):
+        # The pod's owner, not the operator, can act on it: it must not trip the
+        # lease.error WARNING that announces a misconfigured deployment.
+        m = _main_module(monkeypatch)
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            _grant_and_admit(
+                m, monkeypatch, 409, STRUCTURAL,
+                code="gpu_count_over_class_cap", app_retryable=False,
+            )
+        assert not [r for r in caplog.records if "event=lease.error" in r.getMessage()]
+        denied = [r for r in caplog.records if "event=lease.denied" in r.getMessage()]
+        fields = kv_fields(denied[0].getMessage())
+        assert fields["reason"] == "gpu_count_over_class_cap"
+        assert fields["retryable"] == "false"
+        assert int(fields["retry_s"]) >= 120
+
+    def test_a_contended_denial_resets_the_backoff(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        candidate = _candidate()
+        _grant_and_admit(m, monkeypatch, 409, STRUCTURAL, candidate=candidate,
+                         app_retryable=False)
+        _grant_and_admit(m, monkeypatch, 409, DETAIL, candidate=candidate,
+                         app_retryable=True)
+        assert candidate.lease_error_count == 0
+
+
+class TestNotBeforeIsWaitedFor:
+    def test_the_retry_waits_for_a_near_not_before(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        not_before = datetime.now(timezone.utc) + timedelta(minutes=20)
+        _rec, candidate = _grant_and_admit(
+            m, monkeypatch, 409, DETAIL, app_retryable=True, not_before=not_before,
+        )
+        assert candidate.next_attempt_at == not_before
+
+    def test_a_distant_not_before_is_capped(self, monkeypatch):
+        # Advisory: it can clear sooner, so the pod is rechecked at the cap
+        # rather than left a week behind a stale estimate.
+        m = _main_module(monkeypatch)
+        before = datetime.now(timezone.utc)
+        _rec, candidate = _grant_and_admit(
+            m, monkeypatch, 409, DETAIL, app_retryable=True,
+            not_before=before + timedelta(days=7),
+        )
+        assert candidate.next_attempt_at - before <= timedelta(
+            seconds=m.ERROR_RETRY_CAP_SECONDS + 5
+        )
+
+    def test_a_past_not_before_keeps_the_ordinary_cadence(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        before = datetime.now(timezone.utc)
+        _rec, candidate = _grant_and_admit(
+            m, monkeypatch, 409, DETAIL, app_retryable=True,
+            not_before=before - timedelta(hours=1),
+        )
+        assert timedelta(minutes=2) <= candidate.next_attempt_at - before <= timedelta(
+            minutes=5, seconds=5
+        )
+
+
+class TestDenialMessage:
+    def _message(self, monkeypatch, detail, **kw):
+        core = _CapturingCore()
+        monkeypatch.setattr(k8s_client, "_core_v1", core)
+        asyncio.run(emit_lease_denied_event(
+            "uid-1", "pod-1", USERNAME, detail,
+            gpu_class=GPU_CLASS_LABEL, gpu_count=2, **kw,
+        ))
+        return core.events[0][1].message
+
+    def test_a_detail_ending_in_a_full_stop_is_not_doubled(self, monkeypatch):
+        msg = self._message(monkeypatch, "User 'jsmith' has only 20 of 200 SU remaining.")
+        assert "remaining. The pod stays Pending" in msg
+        assert ".." not in msg
+
+    def test_a_structural_denial_does_not_promise_a_retry(self, monkeypatch):
+        msg = self._message(
+            monkeypatch, STRUCTURAL, structural=True, support="contact support: help@x",
+        )
+        assert "keep retrying" not in msg
+        assert "Waiting will not change this" in msg
+        assert msg.endswith("contact support: help@x")
+
+    def test_a_contended_denial_names_when_it_clears(self, monkeypatch):
+        msg = self._message(
+            monkeypatch, DETAIL, not_before=datetime(2024, 1, 16, tzinfo=timezone.utc),
+        )
+        assert "keep retrying" in msg
+        assert "expects this to clear by" in msg
+
+
+class TestStructuralFlipIsNews:
+    def test_the_same_reason_turning_structural_emits_at_once(self, monkeypatch):
+        # "Retrying" and "waiting will not help" ask different things of the
+        # owner, so the same detail changing verdict is not a restatement.
+        m = _main_module(monkeypatch)
+        candidate = _candidate()
+        rec = _Recorder()
+        monkeypatch.setattr(m, "emit_lease_denied_event", rec)
+        for structural in (False, True):
+            asyncio.run(m._emit_lease_denial_event(
+                _config(), _STATE, candidate.pod_uid, candidate, DETAIL,
+                NOW + timedelta(minutes=1), structural=structural,
+            ))
+        assert [kw["structural"] for kw in rec.kwargs] == [False, True]

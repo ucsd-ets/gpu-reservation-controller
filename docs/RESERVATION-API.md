@@ -652,7 +652,7 @@ reservation, so the job keeps running with no relaunch. Callable by the source's
 
 | Field | Meaning |
 |-------|---------|
-| `duration_seconds` | Length of the new guaranteed window from now (60 … 31 622 400; previously capped at 604 800 — see the contract note under on-demand creation). Required. Also bounded by the group's `max_reservation_hours`, which is enforced in the handler and returned as **400**. |
+| `duration_seconds` | Length of the new guaranteed window from now (60 … 31 622 400; previously capped at 604 800 — see the contract note under on-demand creation). Required. Also bounded by the group's `max_reservation_hours`, which is enforced in the handler and returned as **400**. When the source still holds future time, the new window must also end **no earlier than the source's `end_dt`**: a continue lengthens a running reservation and never shortens it, so a shorter one is refused with **400** and the source is left untouched. |
 | `gpu_count` | GPUs for the new reservation; defaults to the source's count. Optional. |
 | `notes` | Stored on the new reservation; defaults to the source's notes. Optional. |
 
@@ -690,7 +690,7 @@ Semantics:
 | Code | Condition |
 |------|-----------|
 | 201 | Created — the new [ReservationResponse](#reservationresponse), `kind="booking"`, `continued_from_id` set |
-| 400 | Source not active / not an eligible kind or phase, or the window can't be admitted on budget |
+| 400 | Source not active / not an eligible kind or phase, the new window would end before the source's, or the window can't be admitted on budget |
 | 403 | Caller is not the owner, an admin, or a manager of the group |
 | 404 | Reservation, group, or GPU class not found / inactive |
 | 409 | Capacity would be exceeded |
@@ -698,9 +698,10 @@ Semantics:
 The admission gates on this path carry the
 [admission-denial envelope](#admission-denial-envelope) — that is, the 409 and
 the *"can't be admitted"* half of the 400. The other half of the 400 (the source
-reservation is not active, not an eligible kind, or in the wrong phase) is a
-precondition on the row being continued rather than an admission gate, and
-returns a bare `detail` like the 404s. Note also that this path signals a budget
+reservation is not active, not an eligible kind, or in the wrong phase, or the
+new window would end before it does) is a precondition on the row being
+continued rather than an admission gate, and returns a bare `detail` like the
+404s. Note also that this path signals a budget
 denial as **400** where the on-demand create signals it as 409 — another reason
 to branch on `code`/`retryable` rather than on the status.
 

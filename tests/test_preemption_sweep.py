@@ -38,7 +38,8 @@ def _config(**overrides) -> Config:
 def _pod(uid: str, *, booking_reference: str, reservation_id: int, gpu_count: int = 1,
           phase: str = "Running", scheduled_false: bool = False, deletion_timestamp=None,
           namespace: str = USERNAME, termination_warning_at=None,
-          termination_warning_risk=None) -> ToleratedPodInfo:
+          termination_warning_risk=None,
+          termination_warning_message=None) -> ToleratedPodInfo:
     return ToleratedPodInfo(
         namespace=namespace,
         name=f"pod-{uid}",
@@ -52,6 +53,7 @@ def _pod(uid: str, *, booking_reference: str, reservation_id: int, gpu_count: in
         deletion_timestamp=deletion_timestamp,
         termination_warning_at=termination_warning_at,
         termination_warning_risk=termination_warning_risk,
+        termination_warning_message=termination_warning_message,
     )
 
 
@@ -116,6 +118,8 @@ class TestNoBoundariesInScope:
     def test_no_reservations_skips_both_snapshots(self, monkeypatch):
         m = _main_module(monkeypatch)
         state = _state()
+        # Nothing warned either (a startup sweep has already reconciled).
+        state.termination_warnings_outstanding = False
         config = _config()
 
         called = []
@@ -562,6 +566,7 @@ class TestTerminationWarnings:
         pod = _pod(
             "v1", booking_reference="res-2", reservation_id=2, gpu_count=1,
             termination_warning_at=S_ISO, termination_warning_risk="1.00",
+            termination_warning_message=m._termination_warning_message(S, "1.00", S),
         )
         deleted, _events = _patch_snapshots(
             monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
@@ -573,6 +578,29 @@ class TestTerminationWarnings:
         assert deleted == []
         assert writes == []
         assert clears == []
+
+    def test_a_changed_cause_is_repatched(self, monkeypatch):
+        """Same instant and risk, different cause: the message is rewritten.
+
+        A headroom notice reuses the deadline a boundary warning wrote, and risk
+        clamps to 1.00, so (at, risk) alone cannot tell the two apart.
+        """
+        m = _main_module(monkeypatch)
+        state = _state(_victim_ending_at_boundary(), _boundary_reservation(1, gpu_count=1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod(
+            "v1", booking_reference="res-2", reservation_id=2, gpu_count=1,
+            termination_warning_at=S_ISO, termination_warning_risk="1.00",
+            termination_warning_message=m._termination_warning_message(S, "1.00"),
+        )
+        _patch_snapshots(monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1})
+        writes, _clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
+
+        assert len(writes) == 1
+        assert "reservation starting at" in writes[0][4]
 
     def test_disabled_flag_skips_warning_reconcile(self, monkeypatch):
         """With TERMINATION_WARNING_ENABLED off, neither write nor clear runs."""
@@ -680,3 +708,96 @@ class TestTerminationWarnings:
         assert deleted == []          # protected — guarantee now outlasts the boundary
         assert writes == []
         assert clears == [(USERNAME, "pod-v1")]
+
+
+class TestStaleWarningsClearedOnQuietTicks:
+    """A warning must not outlive its cause just because nothing is in scope.
+
+    The sweep skips its snapshots on a tick with no boundary to kill at or warn
+    about.  It used to skip the warning reconcile with them, so a warning whose
+    booking was cancelled -- or whose boundary had passed without the pod being
+    killed -- stayed on the pod until some other booking came within range.
+    """
+
+    def _stale_pod(self):
+        return _pod(
+            "v1", booking_reference="res-2", reservation_id=2,
+            termination_warning_at=S_ISO, termination_warning_risk="1.00",
+        )
+
+    def test_a_warning_with_nothing_in_scope_is_cleared(self, monkeypatch):
+        # The booking that caused it is gone: no boundary anywhere in range.
+        m = _main_module(monkeypatch)
+        state = _state()
+        config = _config(preemption_lead_minutes=15)
+        _patch_snapshots(monkeypatch, m, pods=[self._stale_pod()],
+                         capacity={GPU_CLASS_LABEL: 4})
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S + timedelta(hours=1)))
+
+        assert writes == []
+        assert clears == [(USERNAME, "pod-v1")]
+        assert state.termination_warnings_outstanding is False
+
+    def test_once_reconciled_quiet_ticks_skip_the_snapshots_again(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state()
+        config = _config()
+        _patch_snapshots(monkeypatch, m, pods=[], capacity={GPU_CLASS_LABEL: 4})
+        _patch_warnings(monkeypatch, m)
+        asyncio.run(m._run_preemption_sweep(state, config, now=S + timedelta(hours=1)))
+        assert state.termination_warnings_outstanding is False
+
+        called = []
+
+        async def _boom(*args):
+            called.append(args)
+            raise AssertionError("should not be called")
+
+        monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)
+        monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _boom)
+        asyncio.run(m._run_preemption_sweep(state, config, now=S + timedelta(hours=2)))
+        assert called == []
+
+    def test_a_failed_clear_is_retried_next_tick(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state()
+        config = _config()
+        _patch_snapshots(monkeypatch, m, pods=[self._stale_pod()],
+                         capacity={GPU_CLASS_LABEL: 4})
+
+        async def _failing_clear(name, namespace):
+            raise RuntimeError("apiserver hiccup")
+
+        monkeypatch.setattr(m, "clear_termination_warning", _failing_clear)
+        asyncio.run(m._run_preemption_sweep(state, config, now=S + timedelta(hours=1)))
+        assert state.termination_warnings_outstanding is True
+
+    def test_a_standing_warning_keeps_the_sweep_running(self, monkeypatch):
+        # A pod still at risk at an in-scope boundary keeps its warning, and the
+        # flag stays set so the tick after the boundary leaves scope clears it.
+        m = _main_module(monkeypatch)
+        state = _state(_victim_ending_at_boundary(), _boundary_reservation(1, gpu_count=1))
+        config = _config(preemption_lead_minutes=15)
+        _patch_snapshots(monkeypatch, m, pods=[self._stale_pod()],
+                         capacity={GPU_CLASS_LABEL: 1})
+        _writes, clears = _patch_warnings(monkeypatch, m)
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
+        assert clears == []
+        assert state.termination_warnings_outstanding is True
+
+    def test_disabled_warnings_never_force_a_sweep(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state()
+        config = _config(termination_warning_enabled=False)
+        called = []
+
+        async def _boom(*args):
+            called.append(args)
+            raise AssertionError("should not be called")
+
+        monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)
+        monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _boom)
+        asyncio.run(m._run_preemption_sweep(state, config, now=S + timedelta(hours=1)))
+        assert called == []

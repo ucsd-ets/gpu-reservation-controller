@@ -281,6 +281,28 @@ class TestRuntimeGuaranteedMessage:
         assert kv_fields(record.getMessage())["until"] == "2026-08-21T17:30:16Z"
 
 
+class TestReservationRelinkedMessage:
+    def test_a_merge_does_not_call_the_pod_an_overstay(self, core):
+        asyncio.run(k8s_client.emit_reservation_relinked_event(
+            POD, "pod-1", "alice", 42, SUMMER,
+            previous_reservation_id=41, cause="merge",
+        ))
+        _ns, event = core.events[0]
+        assert event.reason == "ReservationRelinked"
+        assert "overstay" not in event.message.lower()
+        assert "lease #41" in event.message
+        assert "guaranteed until 2026-08-21 10:30:16 PDT." in event.message
+
+    def test_a_replaced_reservation_says_so(self, core):
+        asyncio.run(k8s_client.emit_reservation_relinked_event(
+            POD, "pod-1", "alice", 42, SUMMER,
+            previous_reservation_id=41, cause="replaced",
+        ))
+        _ns, event = core.events[0]
+        assert "reservation #41 was cancelled or replaced" in event.message
+        assert "overstay" not in event.message.lower()
+
+
 class TestOverstayRelinkedMessage:
     def test_the_event_reads_local(self, core):
         asyncio.run(
@@ -320,9 +342,27 @@ class TestTerminationWarningMessage:
     def test_the_projected_instant_reads_local(self, main, display_tz):
         display_tz(LA)
         message = main._termination_warning_message(SUMMER, "0.50")
-        assert "as early as 2026-08-21 10:30:16 PDT to free" in message
+        assert "as early as 2026-08-21 10:30:16 PDT to keep" in message
         assert "(risk 0.50)" in message
         assert "17:30:16Z" not in message
+
+    def test_a_boundary_warning_names_the_booking_start_not_the_kill(
+        self, main, display_tz
+    ):
+        # A proactive kill lands PREEMPTION_LEAD_MINUTES before the booking
+        # starts, so the two instants differ and both must read correctly.
+        display_tz(LA)
+        boundary = SUMMER + timedelta(minutes=15)
+        message = main._termination_warning_message(SUMMER, "0.50", boundary)
+        assert "as early as 2026-08-21 10:30:16 PDT" in message
+        assert "reservation starting at 2026-08-21 10:45:16 PDT" in message
+        assert "starting then" not in message
+
+    def test_a_headroom_warning_names_no_reservation(self, main, display_tz):
+        display_tz(LA)
+        message = main._termination_warning_message(SUMMER, "0.50")
+        assert "reservation starting" not in message
+        assert "on-demand jobs" in message
 
     def test_the_companion_annotation_stays_utc(self, main, core, display_tz):
         # -message is prose for a person; -at is a value a widget parses and a

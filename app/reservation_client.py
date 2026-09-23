@@ -72,21 +72,44 @@ class LeaseAttempt:
     # available for this group at ...", "SU budget exceeded"), and the caller
     # surfaces it to the pod's owner as a Kubernetes Event.
     detail: Optional[str] = None
+    # The admission-denial envelope (RESERVATION-API.md, "Admission-denial
+    # envelope"), read off a 409: which gate refused (``code``), whether waiting
+    # can ever admit this same ask (``app_retryable``), and the instant the
+    # denial is known to clear (``not_before``).  Each is None when the app sent
+    # none -- an older app, or a denial outside the admission gates.
+    code: Optional[str] = None
+    app_retryable: Optional[bool] = None
+    not_before: Optional[datetime] = None
 
     @property
     def granted(self) -> bool:
         return self.reservation is not None
 
     @property
+    def structural(self) -> bool:
+        """The app refused this ask and said waiting will never change the answer.
+
+        A 409 carrying ``retryable: false`` -- more GPUs than the class allows,
+        a group the user is not in, a group whose validity has ended.  Only an
+        administrator, or a different ask, gets past it.  An absent flag is
+        read as retryable, as the contract requires: a wrong "retryable" costs
+        one wasted attempt, a wrong "permanent" strands a job that would run.
+        """
+        return self.status == LEASE_DENIED_STATUS and self.app_retryable is False
+
+    @property
     def retryable(self) -> bool:
         """Whether waiting is a plausible fix.
 
-        A 409 is the app saying "not right now"; a network error or a 5xx may be
-        transient.  A 4xx that is not 409 is a fault in the request or the
-        credential, so backing off hard beats hammering the app every 2–5 min.
+        A 409 is the app saying "not right now" -- unless its envelope says
+        otherwise (``structural``); a network error or a 5xx may be transient.
+        A 4xx that is not 409 is a fault in the request or the credential, so
+        backing off hard beats hammering the app every 2–5 min.
         """
         if self.status is None:
             return True
+        if self.structural:
+            return False
         return self.status == LEASE_DENIED_STATUS or self.status >= 500
 
 
@@ -117,6 +140,41 @@ def _response_detail(response: httpx.Response) -> str:
     if len(text) > _DETAIL_MAX_CHARS:
         text = text[:_DETAIL_MAX_CHARS] + "…"
     return text or _NO_RESPONSE_BODY
+
+
+def _denial_envelope(
+    response: httpx.Response,
+) -> tuple[Optional[str], Optional[bool], Optional[datetime]]:
+    """Read ``(code, retryable, not_before)`` off an admission-denial body.
+
+    Tolerant by design: every field is optional, and a value of the wrong type
+    is dropped rather than trusted, so a malformed envelope degrades to exactly
+    the pre-envelope behaviour (status-only classification) instead of raising.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, None, None
+    if not isinstance(payload, dict):
+        return None, None, None
+    code = payload.get("code")
+    code = code if isinstance(code, str) and code else None
+    retryable = payload.get("retryable")
+    retryable = retryable if isinstance(retryable, bool) else None
+    not_before: Optional[datetime] = None
+    raw = payload.get("not_before")
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            not_before = (
+                parsed.replace(tzinfo=timezone.utc)
+                if parsed.tzinfo is None
+                else parsed.astimezone(timezone.utc)
+            )
+    return code, retryable, not_before
 
 
 async def _attach_trace(request: httpx.Request) -> None:
@@ -311,15 +369,23 @@ class ReservationClient:
             status = exc.response.status_code
             detail = _response_detail(exc.response)
             if status == LEASE_DENIED_STATUS:
+                code, app_retryable, not_before = _denial_envelope(exc.response)
                 log.info("%s", kv(
                     event="api.lease_denied", poduid=req.idempotency_key,
-                    status=status, detail=detail,
+                    status=status, reason=code, retryable=app_retryable,
+                    detail=detail,
                 ))
-            else:
-                log.warning("%s", kv(
-                    event="api.lease_error", poduid=req.idempotency_key,
-                    status=status, detail=detail,
-                ))
+                return LeaseAttempt(
+                    status=status,
+                    detail=None if detail == _NO_RESPONSE_BODY else detail,
+                    code=code,
+                    app_retryable=app_retryable,
+                    not_before=not_before,
+                )
+            log.warning("%s", kv(
+                event="api.lease_error", poduid=req.idempotency_key,
+                status=status, detail=detail,
+            ))
             return LeaseAttempt(
                 status=status,
                 detail=None if detail == _NO_RESPONSE_BODY else detail,

@@ -223,6 +223,7 @@ def test_push_supersede_relinks_instead_of_evicting(monkeypatch):
     monkeypatch.setattr(main, "read_pod", _read)
     monkeypatch.setattr(main, "emit_reservation_cancelled_event", _emit)
     monkeypatch.setattr(main, "emit_overstay_relinked_event", _emit)
+    monkeypatch.setattr(main, "emit_reservation_relinked_event", _emit)
     monkeypatch.setattr(main, "apply_toleration", _apply_toleration)
     monkeypatch.setattr(main, "_record_guarantee", _record_guarantee)
 
