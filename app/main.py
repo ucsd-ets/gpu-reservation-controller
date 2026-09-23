@@ -102,6 +102,7 @@ from .k8s_client import (
     emit_admission_paused_event,
     emit_lease_denied_event,
     emit_overstay_relinked_event,
+    emit_reservation_relinked_event,
     emit_pending_pod_event,
     emit_preempted_event,
     emit_reservation_cancelled_event,
@@ -251,6 +252,23 @@ def _error_retry_at(now: datetime, failures: int) -> datetime:
     base = random.randint(*RETRY_JITTER_RANGE)
     delay = min(base * (2 ** max(0, failures - 1)), ERROR_RETRY_CAP_SECONDS)
     return now + timedelta(seconds=delay)
+
+
+def _denial_retry_at(now: datetime, not_before: Optional[datetime]) -> datetime:
+    """Return when to retry a contended lease denial.
+
+    The ordinary 2–5 min jittered delay -- unless the app said when the denial
+    clears (the envelope's ``not_before``: a budget window's end, a group's
+    ``valid_from``), in which case polling toward that instant is wasted, so the
+    retry waits for it.  Capped at ``ERROR_RETRY_CAP_SECONDS`` rather than
+    sleeping days: the instant is advisory and can clear sooner (a cancellation
+    frees budget), and a pod should not sit a week behind a stale estimate.
+    """
+    retry_at = _jittered_retry_at(now)
+    if not_before is not None:
+        capped = min(not_before, now + timedelta(seconds=ERROR_RETRY_CAP_SECONDS))
+        retry_at = max(retry_at, capped)
+    return retry_at
 
 
 def _short_retry_at(now: datetime) -> datetime:
@@ -656,7 +674,7 @@ async def _plan_cancelled_reservations(
 
         if pods_for_res and config.pod_adoption_enabled:
             views = [_pod_view(p) for p in pods_for_res]
-            await _adopt_pods(state, config, views, now)
+            await _adopt_pods(state, config, views, now, cause="replaced")
             adopted_uids = {
                 v.uid for v in views if v.reservation_id != cancelled_res.id
             }
@@ -1411,6 +1429,9 @@ async def _emit_lease_denial_event(
     candidate: OnDemandCandidate,
     detail: Optional[str],
     now: datetime,
+    *,
+    structural: bool = False,
+    not_before: Optional[datetime] = None,
 ) -> None:
     """Tell the pod's owner why its JIT lease was refused, via a Kubernetes Event.
 
@@ -1420,13 +1441,16 @@ async def _emit_lease_denial_event(
     operator fault the pod's owner can neither read usefully nor act on -- it
     already gets a WARNING log line.  The one exception, a 404 for a name the
     pod itself supplied, has an Event of its own (``_emit_lease_rejected_event``).
-    Throttled by ``_post_pending_status``, keyed on the app's reason.
+    Throttled by ``_post_pending_status``, keyed on the app's reason and on
+    whether it is *structural* -- the same reason moving between "retrying" and
+    "waiting will not help" changes what the owner should do, so it is news.
     """
     if not config.ondemand_denial_event_enabled or not detail:
         return
+    key_text = f"structural: {detail}" if structural else detail
     await _post_pending_status(
         config, state, uid, candidate.pod_name, candidate.pod_namespace,
-        ("OnDemandLeaseDenied", detail), now,
+        ("OnDemandLeaseDenied", key_text), now,
         lambda: emit_lease_denied_event(
             uid,
             candidate.pod_name,
@@ -1434,6 +1458,9 @@ async def _emit_lease_denial_event(
             detail,
             gpu_class=candidate.gpu_class_label,
             gpu_count=candidate.gpu_requested,
+            structural=structural,
+            not_before=not_before,
+            support=_support_phrase(config) if structural else None,
         ),
     )
 
@@ -2142,10 +2169,41 @@ async def _grant_and_admit(
             )
         )
     if not attempt.granted:
-        if attempt.retryable:
-            # The app's routine "infeasible right now" (409), or a transient
-            # network/5xx failure: capacity may free up, so keep the ordinary
-            # cadence and the ordinary INFO line.
+        if attempt.status == LEASE_DENIED_STATUS:
+            # The app refused the ask (409), and its envelope says whether waiting
+            # can ever change that.  Contended: capacity or a budget window may
+            # free up, so keep the ordinary cadence -- or wait for ``not_before``
+            # when the app knows when it clears.  Structural (``retryable: false``,
+            # e.g. more GPUs than the class allows): every retry is refused alike,
+            # so back off like a fault rather than asking every 2-5 min forever,
+            # but keep checking -- an administrator can change the answer.  Both
+            # stay INFO: the pod's owner, not the operator, is the one to act.
+            if attempt.structural:
+                candidate.lease_error_count += 1
+                candidate.next_attempt_at = _error_retry_at(
+                    now, candidate.lease_error_count
+                )
+            else:
+                candidate.lease_error_count = 0
+                candidate.next_attempt_at = _denial_retry_at(now, attempt.not_before)
+            log.info("%s", kv(
+                event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
+                clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+                status=attempt.status, reason=attempt.code,
+                retryable=attempt.app_retryable, detail=attempt.detail,
+                retry_s=int((candidate.next_attempt_at - now).total_seconds()),
+            ))
+            # Surface the app's reason on the pod itself: the retry cadence is
+            # invisible to its owner, who otherwise sees only a pod that stays
+            # Pending with nothing saying why.
+            await _emit_lease_denial_event(
+                config, state, uid, candidate, attempt.detail, now,
+                structural=attempt.structural, not_before=attempt.not_before,
+            )
+        elif attempt.retryable:
+            # A transient network/5xx failure: it says nothing about the ask, so
+            # keep the ordinary cadence and the ordinary INFO line, and tell the
+            # pod nothing.
             candidate.lease_error_count = 0
             log.info("%s", kv(
                 event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
@@ -2153,13 +2211,6 @@ async def _grant_and_admit(
                 status=attempt.status, detail=attempt.detail,
             ))
             candidate.next_attempt_at = _jittered_retry_at(now)
-            if attempt.status == LEASE_DENIED_STATUS:
-                # Surface the app's reason on the pod itself: the retry cadence
-                # below is invisible to its owner, who otherwise sees only a pod
-                # that stays Pending with nothing saying why.
-                await _emit_lease_denial_event(
-                    config, state, uid, candidate, attempt.detail, now
-                )
         else:
             # A fault waiting will not fix — a read-only service key, a schema
             # mismatch after an app upgrade, an unknown group name.  WARNING so
@@ -3370,23 +3421,38 @@ async def _preempt_pod(
         log.warning("%s", kv(event="pod.delete_failed", ns=namespace, pod=name, err=exc))
 
 
-def _termination_warning_message(terminate_at: datetime, risk_str: str) -> str:
+def _termination_warning_message(
+    terminate_at: datetime, risk_str: str, boundary: Optional[datetime] = None
+) -> str:
     """Build the human-readable ``galends/termination-warning-message`` value.
 
-    Rendered deterministically from the projected instant and risk so it only
-    changes when they do (keeping the no-op-skip comparison stable).
+    Rendered deterministically from the projected instant, risk and cause, so
+    it only changes when they do (keeping the no-op-skip comparison stable).
 
-    The instant reads in local time here, while the sibling
+    The cause is *boundary* -- the start of the booking whose demand puts the
+    pod at risk -- or ``None`` for a headroom notice, where no booking is
+    involved.  Neither is ``terminate_at`` in general: a proactive (phase-A)
+    kill lands ``PREEMPTION_LEAD_MINUTES`` before the booking starts, and a
+    headroom kill has no booking at all, so the old "a reservation starting
+    then" was true only for a pod whose guarantee ends exactly at the boundary.
+
+    The instants read in local time here, while the sibling
     ``galends/termination-warning-at`` annotation keeps the UTC wire format —
     this is prose for a person, that is a value a widget parses.  Taking the
     ``datetime`` rather than the caller's already-rendered UTC string is what
     keeps the two from being confused for one another.
     """
+    if boundary is None:
+        why = "to keep GPUs free for on-demand jobs"
+    else:
+        why = (
+            f"to free GPUs for a reservation starting at "
+            f"{local_display(boundary)}"
+        )
     return (
         f"At risk of preemption: this pod is at or nearing the end of its GPU "
         f"runtime guarantee and may be terminated as early as "
-        f"{local_display(terminate_at)} to free "
-        f"capacity for a reservation starting then (risk {risk_str}). Extend or "
+        f"{local_display(terminate_at)} {why} (risk {risk_str}). Extend or "
         f"re-book the reservation to retain capacity."
     )
 
@@ -3395,7 +3461,7 @@ async def _apply_termination_warnings(
     snapshot: "list",
     warn_plan: dict[str, TerminationWarning],
     doomed: set[str],
-) -> None:
+) -> bool:
     """Reconcile termination-warning annotations against *warn_plan*.
 
     *snapshot* is the same ``snapshot_tolerated_pods`` list the sweep planned
@@ -3403,7 +3469,8 @@ async def _apply_termination_warnings(
     is ``ControllerState.plan_termination_warnings`` output keyed by uid.  For
     every snapshot pod not being preempted this tick (``uid not in doomed``):
 
-    - in *warn_plan* and its (at, risk) differ from what the pod carries → write
+    - in *warn_plan* and its (at, risk, message) differ from what the pod
+      carries → write
       (``annotate_termination_warning``);
     - not in *warn_plan* but currently carrying a warning → clear
       (``clear_termination_warning``) — the pod left the at-risk pool;
@@ -3412,18 +3479,31 @@ async def _apply_termination_warnings(
 
     Each pod is independently best-effort: a failure logs a warning and never
     affects preemption.  Mirrors ``_record_guarantee``'s failure handling.
+
+    Returns whether any pod may still carry a warning afterwards -- one it was
+    just given, one a failed patch left behind, or one on a pod being deleted
+    this tick (whose delete could itself fail).  The sweep keeps running on
+    otherwise-quiet ticks until this comes back ``False``
+    (``ControllerState.termination_warnings_outstanding``).
     """
+    outstanding = bool(warn_plan)
     for p in snapshot:
         if p.uid in doomed:
+            if p.termination_warning_at is not None or p.termination_warning_risk is not None:
+                outstanding = True
             continue  # being deleted this tick; the delete removes any annotation
         desired = warn_plan.get(p.uid)
         try:
             if desired is not None:
                 risk_str = f"{desired.risk:.2f}"
                 at_str = utc_iso(desired.terminate_at)
+                message = _termination_warning_message(
+                    desired.terminate_at, risk_str, desired.boundary
+                )
                 if (
                     p.termination_warning_at == at_str
                     and p.termination_warning_risk == risk_str
+                    and p.termination_warning_message == message
                 ):
                     continue  # unchanged — do not re-patch
                 await annotate_termination_warning(
@@ -3431,7 +3511,7 @@ async def _apply_termination_warnings(
                     p.namespace,
                     desired.terminate_at,
                     risk_str,
-                    _termination_warning_message(desired.terminate_at, risk_str),
+                    message,
                 )
             elif (
                 p.termination_warning_at is not None
@@ -3439,9 +3519,11 @@ async def _apply_termination_warnings(
             ):
                 await clear_termination_warning(p.name, p.namespace)
         except Exception as exc:  # noqa: BLE001
+            outstanding = True  # whatever the pod carried, it may still carry it
             log.warning("%s", kv(
                 event="pod.termination_warning_failed", ns=p.namespace, pod=p.name, err=exc,
             ))
+    return outstanding
 
 
 async def _apply_guarantee_status(
@@ -3558,6 +3640,8 @@ async def _adopt_pods(
     config: Config,
     pods: list[PodRuntimeView],
     now: datetime,
+    *,
+    cause: str = "overstay",
 ) -> None:
     """Re-link overstay pods to a reservation their user has since booked.
 
@@ -3572,11 +3656,19 @@ async def _adopt_pods(
     binding.  Each pod is independently best-effort: a failure logs a warning
     and never deletes the pod.  *pods* is mutated in place — an adopted entry
     is replaced with a view carrying the new reservation id.
+
+    *cause* is what the pod's owner is told.  ``"overstay"`` (the sweep and
+    queue-tick tidy-up) means the pod really had run past its guarantee, and
+    emits ``OverstayRelinked``.  ``"replaced"`` is the cancellation path: the
+    pod counts as past guarantee there only because its reservation was just
+    cancelled mid-window (typically superseded by Extend), so it emits
+    ``ReservationRelinked`` rather than calling a running job an overstay.
     """
     state.require_reservation_lock("_adopt_pods")
     if not config.pod_adoption_enabled:
         return
     for view, res_new in state.plan_pod_adoptions(pods, now):
+        previous_reservation_id = view.reservation_id
         booking_reference = make_booking_reference(res_new.id)
         try:
             fresh_pod = await read_pod(view.name, view.namespace)
@@ -3611,14 +3703,21 @@ async def _adopt_pods(
         await _record_guarantee(
             view.name, view.namespace, fresh_pod, guaranteed_until, now, res_new
         )
+        event_reason = "OverstayRelinked" if cause == "overstay" else "ReservationRelinked"
         try:
-            await emit_overstay_relinked_event(
-                fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
-            )
+            if cause == "overstay":
+                await emit_overstay_relinked_event(
+                    fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
+                )
+            else:
+                await emit_reservation_relinked_event(
+                    fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until,
+                    previous_reservation_id=previous_reservation_id, cause=cause,
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning("%s", kv(
                 event="k8s.event_failed", ns=view.namespace, pod=view.name,
-                reason="OverstayRelinked", err=exc,
+                reason=event_reason, err=exc,
             ))
 
 
@@ -3691,13 +3790,16 @@ async def _merge_ondemand_into_bookings(
             view.name, view.namespace, fresh_pod, guaranteed_until, now, res_new
         )
         try:
-            await emit_overstay_relinked_event(
-                fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
+            # Not OverstayRelinked: a merge does not wait for the lease guarantee
+            # to lapse, so the pod was never overstaying.
+            await emit_reservation_relinked_event(
+                fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until,
+                previous_reservation_id=lease_id, cause="merge",
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("%s", kv(
                 event="k8s.event_failed", ns=view.namespace, pod=view.name,
-                reason="OverstayRelinked", err=exc,
+                reason="ReservationRelinked", err=exc,
             ))
 
         # Retire the now-superfluous lease (penalty-exempt: its future time is
@@ -3883,7 +3985,18 @@ async def _run_preemption_sweep(
         or now - state.headroom_last_eval
         >= timedelta(seconds=config.headroom_check_interval)
     )
-    if not boundaries and not warn_boundaries and not headroom_due:
+    # A tick with nothing to kill, warn about or re-check skips its snapshots --
+    # unless a warning may still be standing on some pod, in which case it runs
+    # so the reconcile below can clear it.  Without that, a warning whose
+    # booking was cancelled, or whose boundary passed without killing the pod,
+    # outlived its cause until another boundary happened to come into range.
+    warnings_to_reconcile = (
+        config.termination_warning_enabled and state.termination_warnings_outstanding
+    )
+    if (
+        not boundaries and not warn_boundaries and not headroom_due
+        and not warnings_to_reconcile
+    ):
         return
 
     try:
@@ -4029,7 +4142,9 @@ async def _run_preemption_sweep(
     # patching that mutates no controller state.  Pods preempted this tick
     # (``doomed``) are skipped; the delete removes any annotation they carried.
     if config.termination_warning_enabled:
-        await _apply_termination_warnings(snapshot, warn_plan, doomed)
+        state.termination_warnings_outstanding = await _apply_termination_warnings(
+            snapshot, warn_plan, doomed
+        )
 
 
 async def preemption_loop(

@@ -406,7 +406,8 @@ best-effort heads-up so a job can checkpoint, extend, or re-book.
   absolute UTC ISO-8601), `galends/termination-warning-risk`
   (`min(1, shortfall/pool_gpus)` at that boundary, rounded to 2 decimals), and
   `galends/termination-warning-message` (human-readable, rendered deterministically
-  from the two).  A pod killed proactively at a boundary (a **phase-A** victim,
+  from the two plus the cause: the booking's start, or headroom — the kill
+  instant is not when a reservation starts, so the message names both).  A pod killed proactively at a boundary (a **phase-A** victim,
   already past its guarantee) therefore reports the earlier `boundary − lead`
   kill time, not the boundary; a **phase-B** victim whose guarantee ends at the
   boundary degrades to the boundary itself.
@@ -441,6 +442,17 @@ best-effort heads-up so a job can checkpoint, extend, or re-book.
   demand evaporated, or it was adopted), and skips an unchanged one to avoid
   per-tick API churn.  This is restart-safe: the pod's own annotations are the
   state, so nothing leaks across a restart.
+- **A quiet tick still reconciles.**  The sweep skips its snapshots when no
+  boundary is in range and headroom is not due — and used to skip this
+  reconcile with them, so a warning whose booking was cancelled, or whose
+  boundary passed without killing the pod, stood until some other booking
+  happened to come within range (hours, overnight).
+  `ControllerState.termination_warnings_outstanding` (what
+  `_apply_termination_warnings` returns: anything written, left behind by a
+  failed patch, or on a pod being deleted) keeps the sweep running until
+  nothing is left to clear.  It starts `True`, so the first sweep after a
+  restart clears what the last lifetime left; an idle cluster with nothing
+  warned still takes no snapshots.
 - **RBAC / config**: none new — the write/clear reuses the existing `pods: patch`
   permission.  `TERMINATION_WARNING_ENABLED=false` disables the feature;
   `TERMINATION_WARNING_LEAD_MINUTES` (default 30) sets how far ahead warnings
@@ -549,7 +561,10 @@ there is nothing to "upgrade" — only overstay pods are ever rescued.
 to `res-<new id>` (the toleration is already present, so this patch only
 rewrites the annotation) and, **only on patch success**, re-homes occupancy
 (`relink_occupancy`) and refreshes the in-memory `PodRuntimeView`.  It emits an
-`OverstayRelinked` event and re-records the runtime guarantee.
+`OverstayRelinked` event and re-records the runtime guarantee — except on the
+cancellation path (`cause="replaced"`), where the pod reads as past guarantee
+only because its reservation was just cancelled mid-window (typically
+superseded by Extend); that emits `ReservationRelinked` instead.
 
 Adoption runs in two places, both under `reservation_lock`: inside
 `_run_preemption_sweep` **before** victims are planned — so a pod the user has
@@ -591,7 +606,9 @@ correctly — until the booking opens).
 `_adopt_pods`: re-annotate the pod's `galends/booking-reference` to the booking
 (annotation-only patch), and **only on patch success** re-home occupancy
 (`relink_occupancy`), refresh the in-memory view, re-record the guarantee
-(now the booking's — up to its chain end), and emit an `OverstayRelinked` event.
+(now the booking's — up to its chain end), and emit a `ReservationRelinked`
+event (`cause="merge"`) — not `OverstayRelinked`, whose "no longer overstay"
+would misdescribe a pod that is usually well inside its lease guarantee.
 **Then** it retires the now-superfluous lease: cancels it **penalty-exempt**
 (`POST /api/reservations/{id}/cancel`, `reason="superseded"` — the app charges
 only already-consumed time, never a penalty on the unused tail, since the booking
@@ -704,13 +721,15 @@ sides are UTC.
 `utc_iso`, never a replacement: the two formats differ visibly (`2026-08-21
 10:30:16 PDT` vs `2026-08-21T17:30:16Z`) so neither is mistaken for the other in
 a bug report.  The zone is always named, because a bare local timestamp is
-ambiguous and one labelled `Z` would be wrong.  Four messages carry an absolute
-instant and all four are localised: the `RuntimeGuaranteed` and
-`OverstayRelinked` Events, the boundary `Preempted` Event, and
-`galends/termination-warning-message`.  The `OnDemandLeaseDenied` Event is
-**not** — it carries the app's 409 `detail` verbatim (which may embed a
+ambiguous and one labelled `Z` would be wrong.  Five messages carry an absolute
+instant and all of them are localised: the `RuntimeGuaranteed`,
+`OverstayRelinked` and `ReservationRelinked` Events, the boundary `Preempted`
+Event, and `galends/termination-warning-message`.  The `OnDemandLeaseDenied` Event's
+`detail` is **not** — it is the app's 409 text verbatim (which may embed a
 timestamp of the app's own), and rewriting a timestamp out of someone else's
-prose is how "carried, not re-derived" gets broken.
+prose is how "carried, not re-derived" gets broken.  Only the `not_before`
+instant the controller appends itself ("expects this to clear by …") is
+localised.
 
 The zone comes from `EVENT_DISPLAY_TIMEZONE` (an IANA name) when set, and
 otherwise from the process's local zone — i.e. `TZ`, which the chart already
@@ -857,8 +876,8 @@ two-step **preflight → delegate → grant** pipeline.
   duration — never physical calendar capacity), **idempotent by the pod's UID**
   (`idempotency_key`).  The client returns a `LeaseAttempt` carrying the HTTP
   status, because the two non-grant cases need different handling: a **409**
-  (the app's documented "infeasible right now") or a network/5xx failure is
-  routine, logs `lease.denied` at INFO, and cools the candidate down 2–5 min;
+  (the app's refusal of the ask) or a network/5xx failure is routine, logs
+  `lease.denied` at INFO, and cools the candidate down 2–5 min;
   any **other 4xx** — a `read_only` service key, a schema mismatch after an app
   upgrade, an unknown `group_name` — is a fault waiting cannot fix, so it logs
   `lease.error` at **WARNING** with the response body and backs off
@@ -866,6 +885,19 @@ two-step **preflight → delegate → grant** pipeline.
   `OnDemandCandidate.lease_error_count`, reset on any grant or routine denial.
   A **404** among them is also told to the pod (`OnDemandLeaseRejected`): every
   user, group and class it can name came off the pod.
+  A 409 is **not** always "infeasible right now": the app's admission-denial
+  envelope (`code`, `retryable`, `not_before`; RESERVATION-API.md) says whether
+  waiting can ever admit the same ask, and `LeaseAttempt` carries it
+  (`_denial_envelope`).  A **structural** denial (`retryable: false` — over the
+  class's per-reservation GPU cap, not a member, the group's term over) takes
+  the same exponential backoff as a fault, but stays an INFO `lease.denied`
+  (`reason=<code> retryable=false`), because it is the pod owner's to act on,
+  not the operator's.  A **contended** one waits for `not_before` when the app
+  sends one (`_denial_retry_at`, capped at 30 min since the instant is
+  advisory).  An absent flag reads as retryable, as the contract requires.
+  Reading the status alone is how a pod asking for more GPUs than its class
+  allows was refused every 2–5 min indefinitely, under an Event promising it
+  would "keep retrying".
   Collapsing the two was how a misconfigured deployment retried every 2–5 min
   per pending pod indefinitely while logging only below WARNING.
   On **grant** the lease is upserted into `state.reservations`
@@ -1034,7 +1066,11 @@ Four properties are load-bearing:
 - **The detail is carried, not re-derived.**  `LeaseAttempt.detail` (already
   truncated to 200 chars by `_response_detail`, so a proxy's HTML error page
   cannot become a 5 KB Event message) is the single value both the `lease.denied`
-  log line and the Event render.
+  log line and the Event render.  What the Event *promises* follows the app's
+  verdict: a structural denial says waiting will not change it and ends with
+  the "contact support" phrase, a contended one says it will keep retrying and
+  names `not_before` when there is one.  The verdict is part of the throttle
+  key, so the same reason turning structural is told at once.
 - **Throttled by content first, clock second.**  A *changed* reason is new
   information and emits immediately; an *unchanged* one waits out
   `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30).  The retry cadence is

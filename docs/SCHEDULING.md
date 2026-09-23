@@ -37,8 +37,9 @@ exist:
   - Non-privileged members are subject to a **48-hour server-side cap** (the API
     returns 400 for requests exceeding 48 h). Admins and group managers are exempt
     and may create reservations longer than 48 h, typically via the admin
-    reservation interface. The frontend booking wizard also enforces a 48-hour
-    ceiling for non-privileged users.
+    reservation interface — up to the group's `max_reservation_hours` (default
+    168 h), which binds every caller. The frontend booking wizard also enforces a
+    48-hour ceiling for non-privileged users.
 - **On-demand leases** (`kind='on_demand'`, requested by the Kubernetes
   controller for pending on-demand pods) are anchored at the app's "now" with an
   arbitrary **second-granularity** duration — no grid, no lead time, no 48-hour
@@ -215,7 +216,7 @@ to compute; switching methods is a localised change in
   an amber indicator on cancelled rows with a non-zero penalty.
 
 The waiver scope differs by privilege level:
-- **Manager waive** — zeroes `su_cost_user` only (the member's personal budget is freed); `su_cost_group` is retained (the group pool still carries the penalty).
+- **Manager waive** — zeroes `su_cost_user` only (the member's personal budget is freed); `su_cost_group` is retained (the group pool still carries the penalty). A manager's waive of a row whose user share is already zero — only the pool share remains, as after a manager's own waive-at-cancel — changes nothing and is refused with **403** rather than reported as a success.
 - **Admin waive** — zeroes both `su_cost_user` and `su_cost_group` (full pardon).
 
 ## 4. Access scoping & shares (who can book what)
@@ -367,7 +368,8 @@ inflate the ceiling of every future window a member can reach.
   `su_budget`; get a **±90-day grace window** around `valid_from`/`valid_until`.
   **Group membership is not bypassed**: admins and group managers must still be
   members of a group to book under it or query its availability. They still face
-  hardware capacity and per-reservation GPU limits. Additionally:
+  hardware capacity, per-reservation GPU limits and the group's
+  `max_reservation_hours`. Additionally:
   - **Penalty waiver** — can waive late-cancellation SU penalties at cancel
     time or after the fact via `POST /api/reservations/{id}/waive-penalty`.
 
@@ -447,8 +449,11 @@ Consequences for the scheduling model:
 - Concurrency limits are on **peak instantaneous GPU count** and **SU budget**
   (renewable or windowed depending on `su_anchor_mode`), not on throughput over
   time or fairness of access to scarce peak-hour windows.
-- Duration cap is **48 hours for non-privileged members** (server-side 400);
-  admins and group managers have no server-side upper bound.
+- Duration cap is **48 hours for non-privileged members** (server-side 400).
+  Admins and group managers are exempt from that cap but not from the group's
+  `max_reservation_hours` (default 168 h, admin-set per group), which bounds a
+  single reservation for **every** caller on every creation path — so a
+  non-privileged member's effective cap is `min(48, max_reservation_hours)`.
 
 ## 9. Configuration levers an operator actually turns
 

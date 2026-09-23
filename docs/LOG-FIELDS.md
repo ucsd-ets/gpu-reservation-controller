@@ -198,7 +198,7 @@ follow this grammar and are not expected to.
 `reservation.cancelled` → `no-show`, `controller-revoked`, `pod-terminated`,
 `superseded` · `overstay.recorded` → `pod-terminated`, `preempted`, `deleted` ·
 `k8s.event` → `RuntimeGuaranteed`, `Preempted`, `ReservationCancelled`,
-`ReservationReassigned`, `OverstayRelinked`.
+`ReservationReassigned`, `OverstayRelinked`, `ReservationRelinked`.
 
 ### Time
 

@@ -323,9 +323,11 @@ class TestNoticeGate:
 
         # The pods now carry what tick one wrote.
         stamped = utc_iso(H + timedelta(minutes=15))
+        message = m._termination_warning_message(H + timedelta(minutes=15), "0.10")
         pods[:] = [
             _pod(f"p{i}", booking_reference="res-1", reservation_id=1,
-                 termination_warning_at=stamped, termination_warning_risk="0.10")
+                 termination_warning_at=stamped, termination_warning_risk="0.10",
+                 termination_warning_message=message)
             for i in range(10)
         ]
         asyncio.run(
@@ -416,13 +418,15 @@ class TestWarningReconcileInteraction:
         the annotation as stale and the notice could never ripen into a kill.
         """
         stamped_at = H + timedelta(minutes=15)
+        m = _main_module(monkeypatch)
         pods = [
             _pod(f"p{i}", booking_reference="res-1", reservation_id=1,
                  termination_warning_at=utc_iso(stamped_at),
-                 termination_warning_risk="0.10")
+                 termination_warning_risk="0.10",
+                 termination_warning_message=m._termination_warning_message(
+                     stamped_at, "0.10"))
             for i in range(10)
         ]
-        m = _main_module(monkeypatch)
         # A boundary in a *different* GPU class: it forces the sweep to run
         # without generating any demand — or any boundary warning — for the
         # h100 pods, so the only thing that can keep their annotation alive is
@@ -450,6 +454,38 @@ class TestWarningReconcileInteraction:
         assert deleted == []
         assert clears == [], "a headroom notice was cleared by a boundary-only tick"
         assert writes == [], "the unchanged notice should not be re-patched either"
+
+    def test_a_headroom_warning_survives_a_quiet_tick(self, monkeypatch):
+        """The same guard on a tick with *nothing* in scope.
+
+        A standing warning keeps the sweep running on otherwise-quiet ticks so
+        stale ones can be cleared (``termination_warnings_outstanding``).  That
+        reconcile must still recompute headroom warnings, or it would clear a
+        live notice every minute and it could never ripen into a kill.
+        """
+        stamped_at = H + timedelta(minutes=15)
+        m = _main_module(monkeypatch)
+        pods = [
+            _pod(f"p{i}", booking_reference="res-1", reservation_id=1,
+                 termination_warning_at=utc_iso(stamped_at),
+                 termination_warning_risk="0.10",
+                 termination_warning_message=m._termination_warning_message(
+                     stamped_at, "0.10"))
+            for i in range(10)
+        ]
+        state = _state(_ended_booking(1))
+        deleted, _ = _patch_snapshots(monkeypatch, m, pods=pods, capacity=CAPACITY)
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        state.headroom_last_eval = H  # not due: nothing but the flag runs this tick
+        asyncio.run(
+            m._run_preemption_sweep(state, _config(), now=H + timedelta(seconds=30))
+        )
+
+        assert deleted == []
+        assert clears == [], "a headroom notice was cleared by a quiet tick"
+        assert writes == []
+        assert state.termination_warnings_outstanding is True
 
     def test_the_sooner_of_two_deadlines_wins(self, monkeypatch):
         """A pod at risk from both sources is told the earlier instant."""
@@ -584,6 +620,7 @@ class TestExtensionAbortsTermination:
         monkeypatch.setattr(m, "apply_toleration", _apply_toleration)
         monkeypatch.setattr(m, "annotate_runtime_guarantee", _annotate_guarantee)
         monkeypatch.setattr(m, "emit_overstay_relinked_event", _emit_relinked)
+        monkeypatch.setattr(m, "emit_reservation_relinked_event", _emit_relinked)
         monkeypatch.setattr(m, "is_terminal_phase", lambda _pod: False)
 
         asyncio.run(m._run_preemption_sweep(state, _config(), now=H))

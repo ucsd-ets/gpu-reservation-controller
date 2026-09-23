@@ -70,14 +70,24 @@ def _install_merge_stubs(monkeypatch, m):
     async def _record_guarantee(name, ns, pod, guaranteed_until, now, reservation, **kw):
         return None
 
-    async def _emit_relinked(pod, name, ns, res_id, guaranteed_until):
-        return None
+    async def _emit_overstay(pod, name, ns, res_id, guaranteed_until):
+        RELINK_EVENTS.append(("OverstayRelinked", res_id, None))
 
+    async def _emit_relinked(pod, name, ns, res_id, guaranteed_until, *,
+                             previous_reservation_id, cause):
+        RELINK_EVENTS.append(("ReservationRelinked", res_id, cause))
+
+    RELINK_EVENTS.clear()
     monkeypatch.setattr(m, "read_pod", _read)
     monkeypatch.setattr(m, "apply_toleration", _apply_toleration)
     monkeypatch.setattr(m, "_record_guarantee", _record_guarantee)
-    monkeypatch.setattr(m, "emit_overstay_relinked_event", _emit_relinked)
+    monkeypatch.setattr(m, "emit_overstay_relinked_event", _emit_overstay)
+    monkeypatch.setattr(m, "emit_reservation_relinked_event", _emit_relinked)
     return patched
+
+
+# (reason, reservation id, cause) of every re-link Event the stubs saw.
+RELINK_EVENTS: list[tuple] = []
 
 # 15:15 UTC — "now".
 NOW = datetime(2024, 1, 15, 15, 15, tzinfo=timezone.utc)
@@ -254,6 +264,9 @@ class TestMergeOrchestrator:
         assert state.occupancy.get(100, {}) == {}
         assert all(r.id != 100 for r in state.reservations)  # lease dropped locally
         assert not state.pending_ondemand_merge_cancels
+        # A merge does not wait for the lease guarantee to lapse, so the pod was
+        # never overstaying and must not be told it was.
+        assert RELINK_EVENTS == [("ReservationRelinked", 200, "merge")]
 
     def test_failed_cancel_parks_for_retry(self, monkeypatch):
         m = _main_module(monkeypatch)

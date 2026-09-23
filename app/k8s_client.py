@@ -828,6 +828,11 @@ class ToleratedPodInfo:
     # detect a stale warning to clear when the pod leaves the at-risk pool.
     termination_warning_at: Optional[str] = None
     termination_warning_risk: Optional[str] = None
+    # The rendered message, compared too: it names the warning's *cause* (a
+    # booking boundary, or headroom), which can change while the instant and
+    # risk do not -- a headroom notice reuses the deadline a boundary warning
+    # wrote, and risk clamps to 1.00.
+    termination_warning_message: Optional[str] = None
     # Current values of the live guarantee-status annotations (raw strings), or
     # None when absent.  Carried so the per-tick reconcile can diff the status it
     # wants against what the pod already has and skip a no-op re-patch.
@@ -902,6 +907,9 @@ async def snapshot_tolerated_pods(
                 node_name=getattr(pod.spec, "node_name", None) if pod.spec else None,
                 termination_warning_at=warning_at,
                 termination_warning_risk=warning_risk,
+                termination_warning_message=(pod.metadata.annotations or {}).get(
+                    TERMINATION_WARNING_MESSAGE
+                ),
                 guarantee_status=guarantee_status,
                 guaranteed_until=guaranteed_until,
                 reservation_kind=res_kind,
@@ -1464,6 +1472,9 @@ async def emit_lease_denied_event(
     *,
     gpu_class: str,
     gpu_count: int,
+    structural: bool = False,
+    not_before: Optional[datetime] = None,
+    support: Optional[str] = None,
 ) -> None:
     """Create a ``Warning`` Event linked to a pod whose JIT lease was refused.
 
@@ -1478,9 +1489,33 @@ async def emit_lease_denied_event(
 
     ``Warning`` rather than ``Normal`` — the pod is not running and will not
     until something changes — which also matches how kube-scheduler reports the
-    neighbouring condition, ``FailedScheduling``.  Informational only: the
-    controller keeps retrying on its own cadence either way.
+    neighbouring condition, ``FailedScheduling``.
+
+    What the message promises follows the app's own verdict on the ask.  A
+    *structural* denial (the envelope's ``retryable: false`` — more GPUs than
+    the class allows, a group the user is not in) will be refused identically
+    on every retry, so the message says waiting will not help instead of
+    promising a retry that cannot succeed, and ends with *support* (the
+    caller's "contact support" phrase).  A contended one says it will keep
+    retrying, and names *not_before* when the app knows when it clears.
     """
+    # The app's detail is usually a sentence of its own; strip its full stop
+    # so the one this message adds does not double it.
+    reason_text = detail.rstrip(". ")
+    if structural:
+        tail = (
+            "Waiting will not change this: the pod stays Pending until its "
+            "request changes or an administrator changes what refused it."
+        )
+        if support:
+            tail += f" If the reason looks wrong, {support}"
+    else:
+        tail = "The pod stays Pending; the controller will keep retrying"
+        tail += (
+            f", and the reservation service expects this to clear by "
+            f"{local_display(not_before)}."
+            if not_before is not None else "."
+        )
     await _emit_pod_event(
         pod_uid,
         pod_name,
@@ -1491,8 +1526,7 @@ async def emit_lease_denied_event(
         event_type="Warning",
         message=(
             f"On-demand GPU lease for {gpu_count} x {gpu_class} was denied by the "
-            f"reservation service: {detail}. The pod stays Pending; the controller "
-            f"will keep retrying."
+            f"reservation service: {reason_text}. {tail}"
         ),
     )
     log.info("%s", kv(
@@ -1736,6 +1770,8 @@ async def emit_overstay_relinked_event(
     to a reservation the same user has since booked, so it is no longer treated as
     overstay.  Distinct from ReservationReassigned (which evicts a pod on an
     owner change) — here the *same* pod keeps running under a new reservation id.
+    A re-link of a pod that was never overstaying uses
+    ``emit_reservation_relinked_event`` instead.
     """
     until_str = utc_iso(guaranteed_until)
     await _emit_pod_event(
@@ -1754,6 +1790,56 @@ async def emit_overstay_relinked_event(
     log.info("%s", kv(
         event="k8s.event_emitted", ns=namespace, pod=pod_name,
         reason="OverstayRelinked", rid=reservation_id, until=until_str,
+    ))
+
+
+async def emit_reservation_relinked_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    reservation_id: int,
+    guaranteed_until: datetime,
+    *,
+    previous_reservation_id: Optional[int],
+    cause: str,
+) -> None:
+    """Create an Event with reason='ReservationRelinked' on a pod moved between reservations.
+
+    The sibling of ``OverstayRelinked`` for a re-link of a pod that was never
+    running past its guarantee, which that Event's "no longer overstay" would
+    misdescribe.  *cause* is one of:
+
+    - ``"merge"`` -- the pod's JIT on-demand lease was folded into its owner's
+      booking the moment that booking opened, and the lease released.  The pod
+      is typically well inside its lease guarantee when this happens.
+    - ``"replaced"`` -- the pod's reservation was cancelled mid-window (most
+      often superseded by Extend, ``POST /api/reservations/{id}/continue``) and
+      the pod carried onto another open booking its owner holds.
+    """
+    until_str = utc_iso(guaranteed_until)
+    previous = f" #{previous_reservation_id}" if previous_reservation_id is not None else ""
+    if cause == "merge":
+        why = (
+            f"the on-demand lease{previous} it started under was merged into it "
+            f"now that the reservation's window has opened, and the lease released"
+        )
+    else:
+        why = f"its previous reservation{previous} was cancelled or replaced"
+    await _emit_pod_event(
+        pod.metadata.uid,
+        pod_name,
+        namespace,
+        name_prefix="gpu-relink-",
+        reason="ReservationRelinked",
+        action="RelinkPod",
+        message=(
+            f"Pod re-linked to GPU reservation #{reservation_id}: {why}. GPU "
+            f"access guaranteed until {local_display(guaranteed_until)}."
+        ),
+    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name,
+        reason="ReservationRelinked", rid=reservation_id, until=until_str,
     ))
 
 
