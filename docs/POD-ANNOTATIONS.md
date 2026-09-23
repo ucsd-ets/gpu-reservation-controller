@@ -318,7 +318,11 @@ them. Worth surfacing read-only in a UI, since they explain admission behaviour:
 | Key | Purpose |
 |-----|---------|
 | `galends/minimum-runtime-seconds` | **Positive** integer. Required for a pod to be eligible for a just-in-time on-demand lease when no reservation is open; also sizes that lease. A pod without it simply waits for a matching reservation. `0` is **not** a way to ask for no guarantee — it is rejected with a `pod.annotation_invalid` warning; use `galends/runtime-guarantee` below. |
-| `galends/runtime-guarantee` | `none` — "admit me with no runtime guarantee at all". See §3.1. Any other value is ignored with a warning. |
+| `galends/runtime-guarantee` | `none` — "admit me with no runtime guarantee at all". See §3.1. Any other value is ignored with a warning, as is `none` itself on a cluster without best-effort admission. |
+
+A value the controller has to ignore is reported on the pod itself, not only in
+the controller's log, wherever ignoring it changes what happens to the pod — see
+`AnnotationIgnored` and `NoReservation` in §5.3.
 | `galends/usage-group` | The usage group a JIT lease is created under. Required for JIT eligibility unless the deployment identifies the group through a pod *label* instead (`REQUIRED_GROUP_LABEL`). |
 
 The pod's `gpu-class` **label** (not an annotation, so it is not in this file
@@ -481,9 +485,11 @@ pod spec sets, typically 30 s. §6 covers how to do that for a PyTorch job.
 The controller also emits Kubernetes **Events** against the pod
 (`RuntimeGuaranteed` at admission, `OverstayRelinked` when a pod is re-linked to
 a new reservation, `Preempted` immediately before deletion,
-`OnDemandLeaseDenied` when a lease request is refused — §5.1 — and
+`OnDemandLeaseDenied` when a lease request is refused — §5.1 —
 `OnDemandAdmissionPaused` when on-demand admission for the pod's GPU class is
-on hold — §5.2). These are richer
+on hold — §5.2 — and `OnDemandLeaseRejected`, `UnknownGpuClass`,
+`NoReservation` and `AnnotationIgnored` when something about the pod itself
+needs fixing — §5.3). These are richer
 than the annotations but need Kubernetes API access to read, so they are for
 whoever runs `kubectl` — the pod's owner, an operator, a dashboard — rather than
 for in-pod consumers. Being addressed to a person, their messages state times in
@@ -523,9 +529,12 @@ Three things worth knowing about it:
   that the Event does not silently age out of `kubectl describe` on a pod that
   is still stuck, rarely enough that it does not bury the pod's other Events. A
   reason that *changes* is reported immediately, because it is new information.
-- **Only the app's own denial is reported.** A network failure or a controller
-  misconfiguration (a read-only service key, say) is not the pod owner's problem
-  and produces no Event; those go to the controller's log for an operator.
+- **Only the app's own answers are reported.** A network failure or a
+  controller misconfiguration (a read-only service key, say) is not the pod
+  owner's problem and produces no Event; those go to the controller's log for an
+  operator.  A request the app rejects because it does not recognise something
+  the pod named — its usage group, most often — is reported too, as
+  `OnDemandLeaseRejected` (§5.3), because that one *is* the owner's to fix.
 
 ### 5.2 When on-demand admission is paused: `OnDemandAdmissionPaused`
 
@@ -573,6 +582,44 @@ Events:
   the controller logs in full.
 
 ---
+
+### 5.3 When the pod itself needs fixing
+
+§5.1 and §5.2 report things outside the pod.  These four report the pod: the
+controller cannot act on it *as written*, and waiting will not change that —
+the pod has to be corrected (usually: fix it and recreate it) or, if it looks
+right, reported to support.
+
+| Event | What it means |
+|---|---|
+| `OnDemandLeaseRejected` | The reservation service did not recognise something the pod's on-demand request named: its **usage group** (the usual cause — a mistyped group label or `galends/usage-group` annotation), its user (the pod's namespace) or its GPU class. The Event quotes the service's reason, the user and group that were sent, and where the group came from — the pod's label, its annotation, or the cluster's default when the pod named none. If you hold a booking of this class under a *different* usage group, it says so. |
+| `UnknownGpuClass` | The pod's `gpu-class` label is not a GPU class the reservation service knows, so no reservation can match it and it cannot be admitted on demand. The Event lists the classes that do exist. |
+| `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
+| `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis, or it waits for its reservation instead of being admitted now. |
+
+```console
+$ kubectl describe pod my-training-job
+...
+Events:
+  Type     Reason                 Age   From                        Message
+  ----     ------                 ----  ----                        -------
+  Warning  FailedScheduling       2m5s  default-scheduler           0/41 nodes are available: ...
+  Warning  OnDemandLeaseRejected  2m3s  gpu-reservation-controller  On-demand GPU lease for 1 x a100 was rejected by the reservation service: Usage group 'cse999' not found. The request named user jsmith (this pod's namespace) and usage group 'cse999' (from the pod's dsmlp/course label). You do have a gpu-class a100 reservation under usage group cse151b, but this pod's usage group is 'cse999'; set its dsmlp/course label to that group to use it. Waiting will not fix this: if the usage group is wrong, correct it and recreate the pod; if these look right, contact support.
+```
+
+- **They repeat on the schedule of §5.1** — a changed status at once, an
+  unchanged one at most once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default
+  30) — and share its throttle, so the newest of §5.1–§5.3 on a pod is always
+  what is holding it now.  `AnnotationIgnored` keeps its own schedule beside
+  them: it stays true whatever else holds the pod.
+- **Fix, then recreate.**  The controller reads a pod's labels and annotations
+  when it first sees the pod; editing them on a running pod (`kubectl label`,
+  `kubectl annotate`) is not reliably picked up.  Change the spec the pod was
+  created from and create it again.
+- **Nothing is claimed that the controller cannot see.**  `UnknownGpuClass` and
+  `NoReservation` are only reported once the controller has the reservation
+  service's full class list and reservation list — so a pod created while the
+  service is unreachable is told nothing rather than something false.
 
 ## 6. Acting on the warning: checkpointing a PyTorch job
 

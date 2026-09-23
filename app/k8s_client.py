@@ -9,6 +9,7 @@ init_k8s(kubeconfig_path, strict_tls_verify)  — load credentials once at start
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
 get_pod_booking_reference(pod)               — read galends/booking-reference annotation
 get_pod_usage_group(pod)                     — read galends/usage-group annotation (JIT lease group)
+get_pod_annotation_problems(pod, ...)        — job-input annotations the controller will ignore, and why
 get_pod_galends_annotations(pod)             — every galends/* annotation, bounded (JIT admission ask)
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
@@ -34,7 +35,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
-from typing import AsyncIterator, Callable, Optional, TypeVar
+from typing import AsyncIterator, Callable, NamedTuple, Optional, TypeVar
 
 from kubernetes import client as k8s_client, config as k8s_config, watch
 from kubernetes.client.rest import ApiException
@@ -164,10 +165,65 @@ def get_unschedulable_message(pod) -> str:
     return (scheduled.message or "")[:120]
 
 
+# The galends/* job-input annotations a pod author writes and this module reads
+# (see docs/POD-ANNOTATIONS.md §3).
+MIN_RUNTIME_ANNOTATION = "galends/minimum-runtime-seconds"
+RUNTIME_GUARANTEE_ANNOTATION = "galends/runtime-guarantee"
+USAGE_GROUP_ANNOTATION = "galends/usage-group"
+
 # Recognised values of the galends/runtime-guarantee pod annotation. A set
 # rather than a bare literal so an added posture (say a future "soft") is one
 # entry plus its handling, not a new parse path.
 RUNTIME_GUARANTEE_VALUES = frozenset({"none"})
+
+
+class AnnotationProblem(NamedTuple):
+    """One job-input annotation on a pod that the controller had to ignore.
+
+    ``reason`` is the same vocabulary ``pod.annotation_invalid`` logs --
+    ``not_an_integer``, ``not_positive``, ``unrecognised_value`` -- plus
+    ``not_enabled``: a well-formed request for something this deployment does
+    not offer (``galends/runtime-guarantee`` while best-effort admission is
+    off).  ``value`` is the annotation's value exactly as written.
+    """
+
+    annotation: str
+    value: str
+    reason: str
+
+
+def _parse_min_runtime(raw) -> tuple[Optional[int], Optional[str]]:
+    """``(seconds, None)`` for a positive integer, ``(None, reason)`` for any
+    other value, ``(None, None)`` when the annotation is absent.
+
+    The single definition of what ``galends/minimum-runtime-seconds`` accepts,
+    shared by the logging getter and :func:`get_pod_annotation_problems` so the
+    log line and the pod's Event can never disagree about a value.
+    """
+    if raw is None:
+        return None, None
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        return None, "not_an_integer"
+    if value <= 0:
+        return None, "not_positive"
+    return value, None
+
+
+def _parse_runtime_guarantee(raw) -> tuple[Optional[str], Optional[str]]:
+    """``(value, None)`` for a recognised value, ``(None, "unrecognised_value")``
+    for any other, ``(None, None)`` when the annotation is absent.
+
+    Case and surrounding whitespace are forgiven.  Shared like
+    :func:`_parse_min_runtime`, for the same reason.
+    """
+    if raw is None:
+        return None, None
+    value = raw.strip().lower() if isinstance(raw, str) else raw
+    if value in RUNTIME_GUARANTEE_VALUES:
+        return value, None
+    return None, "unrecognised_value"
 
 
 def get_pod_min_runtime_seconds(pod) -> Optional[int]:
@@ -186,28 +242,23 @@ def get_pod_min_runtime_seconds(pod) -> Optional[int]:
     admission with nothing logged at any level, and it sat Pending forever.
     """
     annotations: dict = pod.metadata.annotations or {}
-    raw = annotations.get("galends/minimum-runtime-seconds")
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except (ValueError, TypeError):
+    raw = annotations.get(MIN_RUNTIME_ANNOTATION)
+    value, reason = _parse_min_runtime(raw)
+    if reason == "not_an_integer":
         log.warning("%s", kv(
             event="pod.annotation_invalid",
             ns=pod.metadata.namespace, pod=pod.metadata.name,
-            annotation="galends/minimum-runtime-seconds", value=raw,
+            annotation=MIN_RUNTIME_ANNOTATION, value=raw,
             reason="not_an_integer",
         ))
-        return None
-    if value <= 0:
+    elif reason == "not_positive":
         log.warning("%s", kv(
             event="pod.annotation_invalid",
             ns=pod.metadata.namespace, pod=pod.metadata.name,
-            annotation="galends/minimum-runtime-seconds", value=raw,
+            annotation=MIN_RUNTIME_ANNOTATION, value=raw,
             reason="not_positive",
             detail="use galends/runtime-guarantee=none to request no guarantee",
         ))
-        return None
     return value
 
 
@@ -232,20 +283,53 @@ def get_pod_runtime_guarantee_request(pod) -> Optional[str]:
     to carry a sentinel value for the other's sake.
     """
     annotations: dict = getattr(pod.metadata, "annotations", None) or {}
-    raw = annotations.get("galends/runtime-guarantee")
-    if raw is None:
-        return None
-    value = raw.strip().lower() if isinstance(raw, str) else raw
-    if value in RUNTIME_GUARANTEE_VALUES:
-        return value
-    log.warning("%s", kv(
-        event="pod.annotation_invalid",
-        ns=pod.metadata.namespace, pod=pod.metadata.name,
-        annotation="galends/runtime-guarantee", value=raw,
-        reason="unrecognised_value",
-        detail="expected: " + ", ".join(sorted(RUNTIME_GUARANTEE_VALUES)),
-    ))
-    return None
+    raw = annotations.get(RUNTIME_GUARANTEE_ANNOTATION)
+    value, reason = _parse_runtime_guarantee(raw)
+    if reason is not None:
+        log.warning("%s", kv(
+            event="pod.annotation_invalid",
+            ns=pod.metadata.namespace, pod=pod.metadata.name,
+            annotation=RUNTIME_GUARANTEE_ANNOTATION, value=raw,
+            reason=reason,
+            detail="expected: " + ", ".join(sorted(RUNTIME_GUARANTEE_VALUES)),
+        ))
+    return value
+
+
+def get_pod_annotation_problems(
+    pod, *, best_effort_enabled: bool
+) -> list[AnnotationProblem]:
+    """Every job-input annotation on *pod* that the controller will ignore.
+
+    The pod-facing counterpart of the ``pod.annotation_invalid`` log line: the
+    same verdicts (the parse is shared), gathered so the pod's owner can be told
+    in an Event rather than only an operator in the log.  Pure -- no logging;
+    the getters above already log each rejection.
+
+    ``galends/runtime-guarantee`` is reported as ``not_enabled`` whatever it
+    says while *best_effort_enabled* is off, because then no value of it is
+    honoured, and telling someone their value is merely misspelled would send
+    them round a second time.  ``galends/usage-group`` is never reported: it is
+    free text the app judges (an unknown group is the app's 404 to relay).
+    """
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
+    problems: list[AnnotationProblem] = []
+
+    raw = annotations.get(MIN_RUNTIME_ANNOTATION)
+    _value, reason = _parse_min_runtime(raw)
+    if reason is not None:
+        problems.append(AnnotationProblem(MIN_RUNTIME_ANNOTATION, str(raw), reason))
+
+    raw = annotations.get(RUNTIME_GUARANTEE_ANNOTATION)
+    if raw is not None:
+        _value, reason = _parse_runtime_guarantee(raw)
+        if not best_effort_enabled:
+            reason = "not_enabled"
+        if reason is not None:
+            problems.append(
+                AnnotationProblem(RUNTIME_GUARANTEE_ANNOTATION, str(raw), reason)
+            )
+    return problems
 
 
 def get_pod_usage_group(pod) -> Optional[str]:
@@ -260,7 +344,7 @@ def get_pod_usage_group(pod) -> Optional[str]:
     the annotation is absent or empty.
     """
     annotations: dict = getattr(pod.metadata, "annotations", None) or {}
-    return annotations.get("galends/usage-group") or None
+    return annotations.get(USAGE_GROUP_ANNOTATION) or None
 
 
 def get_pod_gpu_count(pod) -> int:
@@ -1453,6 +1537,80 @@ async def emit_admission_paused_event(
     log.info("%s", kv(
         event="k8s.event_emitted", ns=namespace, pod=pod_name,
         reason="OnDemandAdmissionPaused", clabel=gpu_class, guard=guard,
+    ))
+
+
+# Warning Events telling a pending pod's owner that something *about the pod*
+# stops the controller admitting it -- the siblings of OnDemandLeaseDenied and
+# OnDemandAdmissionPaused, which report the app refusing or a class being
+# paused.  Each reason maps to the Event's ``action`` (what the controller was
+# attempting) and its ``generateName`` prefix.
+LEASE_REJECTED_REASON = "OnDemandLeaseRejected"
+UNKNOWN_GPU_CLASS_REASON = "UnknownGpuClass"
+NO_RESERVATION_REASON = "NoReservation"
+ANNOTATION_IGNORED_REASON = "AnnotationIgnored"
+
+_POD_PROBLEM_EVENTS: dict[str, tuple[str, str]] = {
+    LEASE_REJECTED_REASON: ("RequestOnDemandLease", "gpu-lease-rejected-"),
+    UNKNOWN_GPU_CLASS_REASON: ("AdmitPod", "gpu-unknown-class-"),
+    NO_RESERVATION_REASON: ("AdmitPod", "gpu-no-reservation-"),
+    ANNOTATION_IGNORED_REASON: ("ReadAnnotations", "gpu-annotation-ignored-"),
+}
+
+# events.k8s.io/v1's limit on an Event's note; the core/v1 API this module
+# writes through does not enforce one, but tooling reading the newer API does.
+_EVENT_MESSAGE_MAX_CHARS = 1024
+
+
+async def emit_pod_problem_event(
+    pod_uid: str,
+    pod_name: str,
+    namespace: str,
+    message: str,
+    *,
+    reason: str,
+    gpu_class: Optional[str] = None,
+    gpu_count: Optional[int] = None,
+) -> None:
+    """Create a ``Warning`` Event on a pod the controller cannot admit as written.
+
+    *reason* is one of the four above:
+
+    - ``OnDemandLeaseRejected`` -- the reservation app answered the pod's lease
+      ask with a 404: it does not recognise the user, usage group or GPU class
+      the ask named, all of which come from the pod (its namespace, its group
+      label or annotation, its ``gpu-class`` label).
+    - ``UnknownGpuClass`` -- the pod's ``gpu-class`` label names no class the
+      reservation app knows, so no path can admit it.
+    - ``NoReservation`` -- no reservation matches the pod and it does not
+      qualify for on-demand admission either.
+    - ``AnnotationIgnored`` -- one of its ``galends/*`` job-input annotations
+      was invalid, or asks for something this deployment does not offer.
+
+    *message* is rendered by the caller (``main``), which knows what each means
+    to the pod's owner; this only writes it -- capped at the 1024 characters
+    ``events.k8s.io/v1`` allows a note, since it quotes the app's reason and
+    the pod's own labels and annotations, whose lengths nothing here controls.
+    ``Warning`` for the same reason as ``OnDemandLeaseDenied``: the pod is not
+    running, and will not until something changes -- here, usually the pod
+    itself.
+    """
+    action, name_prefix = _POD_PROBLEM_EVENTS[reason]
+    if len(message) > _EVENT_MESSAGE_MAX_CHARS:
+        message = message[: _EVENT_MESSAGE_MAX_CHARS - 1] + "…"
+    await _emit_pod_event(
+        pod_uid,
+        pod_name,
+        namespace,
+        name_prefix=name_prefix,
+        reason=reason,
+        action=action,
+        event_type="Warning",
+        message=message,
+    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name, reason=reason,
+        clabel=gpu_class, gpus=gpu_count,
     ))
 
 

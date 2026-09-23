@@ -348,6 +348,46 @@ class OnDemandGate(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
+# What a still-pending pod's owner has been told
+# ---------------------------------------------------------------------------
+
+# The two independent things a pending pod's owner is told about, each with its
+# own throttle (see ControllerState.pending_status).  "hold" is what is keeping
+# the pod Pending right now -- one current answer, so moving from one cause to
+# another is news and is reported at once.  "annotations" is a galends/*
+# annotation the controller had to ignore: true for as long as the pod exists,
+# whatever holds it, so it must not share the hold's key -- two alternating
+# statuses would each read as a change and be restated on every retry.
+PENDING_TOPIC_HOLD = "hold"
+PENDING_TOPIC_ANNOTATIONS = "annotations"
+
+
+@dataclass(frozen=True)
+class PendingStatus:
+    """One status Event put on a still-pending pod: what it said, and when.
+
+    ``key`` is the Event's reason plus the text that varies with it; see
+    ``main._post_pending_status``, the only writer.
+    """
+
+    key: tuple[str, str]
+    at: datetime
+
+
+class NearMiss(NamedTuple):
+    """A user's live bookings that one of their pods narrowly failed to match.
+
+    What a pod left without a reservation is told when the user *does* hold
+    one -- for the right class under another usage group, or for another class
+    -- because "you have no reservation" is the wrong thing to tell someone
+    looking at one.  Produced by :meth:`ControllerState.near_miss_bookings`.
+    """
+
+    other_groups: tuple[str, ...] = ()   # same GPU class, a different usage group
+    other_classes: tuple[str, ...] = ()  # a different GPU class altogether
+
+
+# ---------------------------------------------------------------------------
 # Task queue entry
 # ---------------------------------------------------------------------------
 
@@ -392,6 +432,12 @@ class OnDemandCandidate:
     # galends/usage-group annotation.  JIT eligibility requires it, so it is only
     # Optional to keep dataclass field ordering.
     usage_group: Optional[str] = None
+    # Where usage_group came from -- "label" (the REQUIRED_GROUP_LABEL pod
+    # label), "annotation" (galends/usage-group) or "default"
+    # (DEFAULT_USAGE_GROUP) -- so a pod whose group the app does not recognise
+    # can be told what to fix: its own label or annotation, or nothing it
+    # controls at all.  None when the candidate was not built by routing.
+    usage_group_source: Optional[str] = None
     # Set True only while the candidate is parked on an indeterminate guard-1
     # result (the scheduler has not yet recorded a PodScheduled verdict).  A
     # MODIFIED watch event carrying that verdict re-attempts immediately instead
@@ -415,18 +461,10 @@ class OnDemandCandidate:
     # the flat 2-5 min denial cadence forever.  Reset on any grant or routine
     # denial.  See main._grant_and_admit and _error_retry_at.
     lease_error_count: int = 0
-    # The last pending-status Event put on this pod -- its reason plus the text
-    # that varies with it (the app's denial detail, or the rendered pause
-    # message) -- and when it was emitted, so a status that has not changed is
-    # not restated on every retry.  One pair shared by OnDemandLeaseDenied and
-    # OnDemandAdmissionPaused, so the pod's Events tell a single story: moving
-    # from one to the other is a change and is reported at once, and whichever
-    # holds repeats on the one cadence.  In-memory like the rest of the
-    # candidate: after a restart the pod is re-told once, which is the right
-    # side to err on -- Events expire, so a fresh one restores a signal that
-    # would otherwise have aged out.  See main._post_pending_status.
-    status_event_key: Optional[tuple[str, str]] = None
-    status_event_at: Optional[datetime] = None
+    # What this pod's owner has already been told is *not* kept here: it lives
+    # in ControllerState.pending_status, keyed by pod uid, so the story survives
+    # the pod moving off the candidate list (onto the reserved queue, or onto no
+    # path at all) and back.
 
 
 @dataclass(frozen=True)
@@ -764,6 +802,17 @@ class ControllerState:
         # against.  Refreshed alongside gpu_class_labels.
         self.gpu_class_ids: dict[str, int] = {}
 
+        # Whether the controller has the whole picture a pod's owner may be
+        # told is wrong with *their pod*: every class the app has (a successful
+        # bulk class fetch, not just the classes some reservation named), and
+        # the full reservation list (a successful fetch, not merely an empty
+        # list or a pushed delta).  Until then "your gpu-class is unknown" and
+        # "no reservation matches" could be the controller's gap rather than
+        # the pod's fault, so neither is said.  Set by the reconcile; never
+        # reset, because a later failed fetch keeps the last good data.
+        self.gpu_classes_known: bool = False
+        self.reservations_known: bool = False
+
         # App-side per-class GPU capacity: label → effective_gpus_today (the
         # count the reservation app actually admits against, i.e. total_gpus
         # after any date-span override covering today), refreshed alongside the
@@ -802,6 +851,20 @@ class ControllerState:
         # These have the galends/minimum-runtime-seconds annotation and are
         # Pending, but do not match any user reservation.
         self.ondemand_candidates: dict[str, OnDemandCandidate] = {}
+
+        # What each still-pending pod's owner has been told: pod uid → topic
+        # (PENDING_TOPIC_HOLD / PENDING_TOPIC_ANNOTATIONS) → the last status
+        # Event and when it went out.  The throttle behind
+        # main._post_pending_status, which is every status Event addressed to
+        # the owner of a pod that is not running.  Keyed by uid rather than
+        # carried on an OnDemandCandidate so the pod tells one story whichever
+        # path holds it -- a candidate, the reserved queue, or no path at all --
+        # and a move between them is not mistaken for news.  In-memory: after a
+        # restart each pod is re-told once, the right side to err on, because
+        # Events expire.  Dropped when the pod is admitted, finishes or is
+        # deleted; prune_pending_status catches a pod whose DELETED event was
+        # never seen (a watch re-LIST replays only the pods that still exist).
+        self.pending_status: dict[str, dict[str, PendingStatus]] = {}
 
         # Unified occupancy map for ALL admitted pods (reserved, on-demand, and
         # no-show alike): reservation id → { pod_uid: gpu_count }.  Available
@@ -1274,6 +1337,45 @@ class ControllerState:
             return None
         return max(candidates, key=lambda r: (slot_end(r), _spare(r), r.id))
 
+    def near_miss_bookings(
+        self,
+        namespace: str,
+        gpu_class_label: str,
+        group_label: Optional[str],
+        now: datetime,
+    ) -> NearMiss:
+        """*namespace*'s live bookings that a pod of *gpu_class_label* /
+        *group_label* does not match, by the axis it misses on.
+
+        Considers the bookings ``find_best_reservation`` would -- this user's,
+        with time left, not a declared no-show -- and reports each that fails
+        one of the two axes the pod itself supplies: the same class under a
+        different usage group (only while REQUIRED_GROUP_LABEL is on), or a
+        different class.  A booking whose class label cannot be resolved is
+        skipped, since it cannot be described in terms the user could set.
+        Names are de-duplicated and sorted, so the result -- which ends up in
+        a throttled Event message -- does not flap between calls.  Pure.
+        """
+        other_groups: set[str] = set()
+        other_classes: set[str] = set()
+        for r in self.reservations:
+            if (
+                r.kind != "booking"
+                or r.user is None
+                or r.user.username != namespace
+                or slot_end(r) <= now
+                or r.id in self.noshow_reservation_ids
+            ):
+                continue
+            label = self._effective_label(r)
+            if label is None:
+                continue
+            if label != gpu_class_label:
+                other_classes.add(label)
+            elif not self._group_ok(r, group_label) and r.group is not None:
+                other_groups.add(r.group.name)
+        return NearMiss(tuple(sorted(other_groups)), tuple(sorted(other_classes)))
+
     # ------------------------------------------------------------------
     # Queue management
     # ------------------------------------------------------------------
@@ -1549,13 +1651,15 @@ class ControllerState:
         group_label: Optional[str] = None,
         usage_group: Optional[str] = None,
         best_effort: bool = False,
+        usage_group_source: Optional[str] = None,
     ) -> None:
         """Register a pod as a JIT on-demand candidate (idempotent).
 
         If the pod is already registered with the same parameters this is a
         no-op.  A pod already tracked in ``occupancy`` (already placed) is also
         left untouched.  *usage_group* is the group name the ask will carry
-        (see ``OnDemandCandidate.usage_group``).
+        (see ``OnDemandCandidate.usage_group``), and *usage_group_source* where
+        it came from (see ``OnDemandCandidate.usage_group_source``).
 
         *best_effort* marks a pod that declared ``galends/runtime-guarantee:
         none``: it is admitted under a zero-length, zero-SU stub rather than a
@@ -1580,6 +1684,7 @@ class ControllerState:
             next_attempt_at=datetime.now(timezone.utc),
             group_label=group_label,
             usage_group=usage_group,
+            usage_group_source=usage_group_source,
             best_effort=best_effort,
         )
         self.ondemand_candidates[pod_uid] = candidate
@@ -1653,6 +1758,58 @@ class ControllerState:
             if key not in live:
                 del self.ondemand_gate_since[key]
         return sorted(gates, key=lambda g: (g.label, g.guard))
+
+    # ------------------------------------------------------------------
+    # What a still-pending pod's owner has been told
+    # ------------------------------------------------------------------
+
+    def pending_status_due(
+        self,
+        pod_uid: str,
+        topic: str,
+        key: tuple[str, str],
+        now: datetime,
+        repeat: timedelta,
+    ) -> bool:
+        """Whether telling *pod_uid*'s owner *key* on *topic* would be news.
+
+        True when nothing has been told on that topic yet, when the last thing
+        told differs from *key* (a changed status is always reported), or when
+        it was told at least *repeat* ago -- Events expire, so a pod still held
+        for the same reason must say so again.  A zero *repeat* is always due.
+        """
+        told = self.pending_status.get(pod_uid, {}).get(topic)
+        return told is None or told.key != key or now - told.at >= repeat
+
+    def record_pending_status(
+        self, pod_uid: str, topic: str, key: tuple[str, str], now: datetime
+    ) -> None:
+        """Remember that *key* was told to *pod_uid*'s owner on *topic* at *now*.
+
+        Called only once the Event write has succeeded, so a failed write is
+        retried on the next attempt instead of being suppressed as a repeat.
+        """
+        self.pending_status.setdefault(pod_uid, {})[topic] = PendingStatus(key, now)
+
+    def forget_pending_status(self, pod_uid: str) -> None:
+        """Drop everything told to *pod_uid*'s owner (the pod is admitted or gone)."""
+        self.pending_status.pop(pod_uid, None)
+
+    def prune_pending_status(self, cutoff: datetime) -> None:
+        """Forget pods last told anything before *cutoff* that no path tracks.
+
+        A pod deleted while the watch was down never produces a DELETED event
+        (a re-LIST replays only the pods that still exist), so its entry would
+        otherwise be kept forever.  A pod that *is* still pending re-reports on
+        every repeat interval, which keeps its newest ``at`` recent; one on the
+        candidate list or the reserved queue is kept regardless.  Pruning a live
+        pod by mistake costs one early restatement, never a missed one.
+        """
+        for uid in list(self.pending_status):
+            if uid in self.ondemand_candidates or uid in self.task_queue:
+                continue
+            if all(told.at < cutoff for told in self.pending_status[uid].values()):
+                del self.pending_status[uid]
 
     # ------------------------------------------------------------------
     # Occupancy: availability, placement, release, reconciliation

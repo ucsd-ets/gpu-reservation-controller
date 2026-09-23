@@ -46,13 +46,16 @@ from fastapi.responses import JSONResponse
 
 from . import trace
 from .config import Config, timezone_label
-from .log_fields import kv
+from .log_fields import kv, scrub
 from .controller import (
+    PENDING_TOPIC_ANNOTATIONS,
+    PENDING_TOPIC_HOLD,
     TOLERATION_KEY,
     BoundaryPreemptionNeed,
     CapacityDiff,
     ControllerState,
     GuaranteeStatus,
+    NearMiss,
     OnDemandCandidate,
     OnDemandGate,
     PodRuntimeView,
@@ -72,8 +75,17 @@ from .controller import (
     slot_start,
 )
 from .k8s_client import (
+    ANNOTATION_IGNORED_REASON,
     LEASE_NAME,
+    LEASE_REJECTED_REASON,
+    MIN_RUNTIME_ANNOTATION,
+    NO_RESERVATION_REASON,
+    RUNTIME_GUARANTEE_ANNOTATION,
+    RUNTIME_GUARANTEE_VALUES,
     TERMINAL_PHASES,
+    UNKNOWN_GPU_CLASS_REASON,
+    USAGE_GROUP_ANNOTATION,
+    AnnotationProblem,
     PodWatcher,
     ReservationFacts,
     acquire_singleton_lease,
@@ -87,11 +99,13 @@ from .k8s_client import (
     emit_admission_paused_event,
     emit_lease_denied_event,
     emit_overstay_relinked_event,
+    emit_pod_problem_event,
     emit_preempted_event,
     emit_reservation_cancelled_event,
     emit_reservation_reassigned_event,
     emit_best_effort_admitted_event,
     emit_runtime_guaranteed_event,
+    get_pod_annotation_problems,
     get_pod_booking_reference,
     get_pod_creation_timestamp,
     get_pod_galends_annotations,
@@ -118,7 +132,11 @@ from .k8s_client import (
     snapshot_tolerated_pods,
     utc_iso,
 )
-from .reservation_client import LEASE_DENIED_STATUS, ReservationClient
+from .reservation_client import (
+    LEASE_DENIED_STATUS,
+    LEASE_NOT_FOUND_STATUS,
+    ReservationClient,
+)
 from .schemas import (
     ForecastBucket,
     ForecastClassSummary,
@@ -346,6 +364,11 @@ class GpuClassMaps(NamedTuple):
     labels: dict[int, str]   # gpu_class_id → label_value
     ids: dict[str, int]      # label_value → gpu_class_id
     capacity: dict[str, int]  # label_value → app-side GPU count (audit input)
+    # Whether ``ids`` is the app's whole class list: built from a successful
+    # bulk GET /api/gpu-classes, now or on an earlier cycle.  A map resolved
+    # only through the per-id fallback holds just the classes some reservation
+    # happened to name, which cannot say a label is *unknown* to the app.
+    complete: bool = False
 
 
 async def _resolve_gpu_class_maps(
@@ -386,6 +409,7 @@ async def _resolve_gpu_class_maps(
         new_labels = dict(prior.labels)
         new_ids = dict(prior.ids)
         new_capacity = dict(prior.capacity)
+    complete = gpu_classes is not None or prior.complete
 
     # Fallback: resolve any class the bulk list didn't cover (e.g. one created
     # since the last successful fetch, or referenced by a pushed reservation
@@ -405,7 +429,7 @@ async def _resolve_gpu_class_maps(
                 event="class.unresolvable", cid=cid, reason="no_label_value",
             ))
 
-    return GpuClassMaps(new_labels, new_ids, new_capacity)
+    return GpuClassMaps(new_labels, new_ids, new_capacity, complete)
 
 
 async def _reconcile_after_reservation_change(
@@ -443,6 +467,7 @@ async def _reconcile_after_reservation_change(
     state.gpu_class_labels = gpu_class_maps.labels
     state.gpu_class_ids = gpu_class_maps.ids
     state.gpu_class_capacity = gpu_class_maps.capacity
+    state.gpu_classes_known = gpu_class_maps.complete
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
@@ -500,6 +525,7 @@ async def _refresh_reservations(
             dict(state.gpu_class_labels),
             dict(state.gpu_class_ids),
             dict(state.gpu_class_capacity),
+            state.gpu_classes_known,
         ),
     )
 
@@ -531,6 +557,9 @@ async def _refresh_reservations(
             now,
             gpu_class_maps,
         )
+        # Only a full fetch can vouch for the whole reservation list: a push
+        # is a delta, and before the first fetch lands the list is merely empty.
+        state.reservations_known = True
 
     # Deleting pods is per-pod Kubernetes I/O over shared-state-free data, so it
     # runs with the lock released.
@@ -969,16 +998,19 @@ async def _preflight_ondemand_candidate(
     2. Re-run the reserved-path routing check: a matching reservation may have
        appeared since the candidate was queued (a new booking, or simply time
        passing into the horizon) — route there instead of requesting a lease.
-    3. Guard 1 (Pending for a reason a lease can fix, and the class has nodes).
-    4. Guard 3 (stuck reservation-holder safety interlock).
-    5. Guard 4 (over-committed gpu-class admission pause) — not applied to a
+    3. Resolve the pod's gpu-class label to the app's numeric class id; a label
+       the app does not know holds the candidate, and its owner is told with an
+       ``UnknownGpuClass`` Event (``_emit_unknown_class_event``).
+    4. Guard 1 (Pending for a reason a lease can fix, and the class has nodes).
+    5. Guard 3 (stuck reservation-holder safety interlock).
+    6. Guard 4 (over-committed gpu-class admission pause) — not applied to a
        best-effort candidate, which consumes no app-side capacity to overcommit.
        A pod held by guard 1b, 3 or 4 is told so with an
        ``OnDemandAdmissionPaused`` Event (``_emit_admission_paused_event``).
-    6. Guard 5 (per-node feasibility: no single node can host the ask) — applied
+    7. Guard 5 (per-node feasibility: no single node can host the ask) — applied
        to a multi-GPU ask, and to **every** best-effort ask regardless of count,
        since nothing app-side bounds how many of those are admitted.
-    7. Resolve the pod's gpu-class label to a numeric id and size the ask.
+    8. Size the ask.
 
     *claimed_by_class* is the GPUs already granted earlier in the current
     admission batch, so guard 5 measures each candidate against what is left
@@ -1046,6 +1078,25 @@ async def _preflight_ondemand_candidate(
                     state.dequeue_pod(uid)
         return _PREFLIGHT_REMOVE, None
 
+    # A gpu-class label the app does not know can never be granted anything,
+    # whatever the scheduler or the guards below would say, so it is settled
+    # first: that way the owner hears about a mistyped label straight away,
+    # rather than only once the scheduler has ruled and every guard has passed
+    # (and never, if guard 1a drops the pod first).
+    gpu_class_id = state.gpu_class_ids.get(candidate.gpu_class_label)
+    if gpu_class_id is None:
+        log.warning("%s", kv(
+            event="ondemand.candidate_held", ns=candidate.pod_namespace,
+            pod=candidate.pod_name, clabel=candidate.gpu_class_label,
+            reason="class_id_unknown",
+        ))
+        candidate.next_attempt_at = _jittered_retry_at(now)
+        await _emit_unknown_class_event(
+            config, state, uid, candidate.pod_name, candidate.pod_namespace,
+            candidate.gpu_class_label, now,
+        )
+        return _PREFLIGHT_RETRY, None
+
     # Guard 1a: is the pod Pending for something a lease could fix?  The
     # scheduler's verdict is read for the blockers it can still name — it
     # cannot name a GPU shortage on this pod's own class, whose nodes it
@@ -1091,7 +1142,7 @@ async def _preflight_ondemand_candidate(
             clabel=candidate.gpu_class_label, nodes=0,
         ))
         candidate.next_attempt_at = _short_retry_at(now)
-        await _emit_admission_paused_event(config, uid, candidate, 1, now)
+        await _emit_admission_paused_event(config, state, uid, candidate, 1, now)
         return _PREFLIGHT_RETRY, None
 
     # Guard 3: safety interlock — hold JIT requests for any GPU class that has
@@ -1103,7 +1154,7 @@ async def _preflight_ondemand_candidate(
             clabel=candidate.gpu_class_label,
         ))
         candidate.next_attempt_at = _short_retry_at(now)
-        await _emit_admission_paused_event(config, uid, candidate, 3, now)
+        await _emit_admission_paused_event(config, state, uid, candidate, 3, now)
         return _PREFLIGHT_RETRY, None
 
     # Guard 4: capacity overcommit — hold JIT requests for any GPU class whose
@@ -1126,7 +1177,7 @@ async def _preflight_ondemand_candidate(
             clabel=candidate.gpu_class_label,
         ))
         candidate.next_attempt_at = _short_retry_at(now)
-        await _emit_admission_paused_event(config, uid, candidate, 4, now)
+        await _emit_admission_paused_event(config, state, uid, candidate, 4, now)
         return _PREFLIGHT_RETRY, None
 
     # Guard 5: per-node feasibility — a multi-GPU (>=2) pod can only schedule if
@@ -1168,16 +1219,6 @@ async def _preflight_ondemand_candidate(
                 candidate.next_attempt_at = _short_retry_at(now)
                 return _PREFLIGHT_RETRY, None
 
-    gpu_class_id = state.gpu_class_ids.get(candidate.gpu_class_label)
-    if gpu_class_id is None:
-        log.warning("%s", kv(
-            event="ondemand.candidate_held", ns=candidate.pod_namespace,
-            pod=candidate.pod_name, clabel=candidate.gpu_class_label,
-            reason="class_id_unknown",
-        ))
-        candidate.next_attempt_at = _jittered_retry_at(now)
-        return _PREFLIGHT_RETRY, None
-
     # A best-effort admission reserves no window, so there is nothing to size.
     # The field is required by the delegation schema (shared with the lease
     # path), so it carries 0 -- which is also what the app would price it at.
@@ -1205,17 +1246,25 @@ async def _preflight_ondemand_candidate(
 
 async def _post_pending_status(
     config: Config,
-    candidate: OnDemandCandidate,
+    state: ControllerState,
+    uid: str,
+    pod_name: str,
+    namespace: str,
     key: tuple[str, str],
     now: datetime,
     emit: Callable[[], Awaitable[None]],
+    *,
+    topic: str = PENDING_TOPIC_HOLD,
 ) -> None:
-    """Put a status Event on a still-pending candidate's pod, unless it would
-    only repeat the last one too soon.
+    """Put a status Event on a still-pending pod, unless it would only repeat
+    the last one too soon.
 
-    The one throttle behind every Event addressed to the owner of a pod waiting
-    for on-demand admission (``OnDemandLeaseDenied``,
-    ``OnDemandAdmissionPaused``).  *key* is the Event's reason plus the text that
+    The one throttle behind every Event addressed to the owner of a pod that is
+    not running: the app refusing its lease ask (``OnDemandLeaseDenied``,
+    ``OnDemandLeaseRejected``), a class-wide pause (``OnDemandAdmissionPaused``),
+    nothing able to admit the pod as written (``UnknownGpuClass``,
+    ``NoReservation``) and an annotation it had to ignore
+    (``AnnotationIgnored``).  *key* is the Event's reason plus the text that
     varies with it; *emit* writes the Event.
 
     **Throttled by content, not only by clock.**  A key that differs from the
@@ -1228,38 +1277,85 @@ async def _post_pending_status(
     describe`` goes blank on a pod that is still blocked.  ``0`` disables the
     throttle entirely.
 
-    One key per candidate rather than one per Event reason is what keeps the
-    pod's Events a single story: a pod that moves from a paused class to a
-    denied lease and back is told each time, instead of its newest Event
-    describing a block that no longer applies.
+    **One story per pod.**  What was told is kept in ``state.pending_status``
+    under the pod's uid -- not on whichever object happens to track the pod --
+    so a pod moving between the candidate list, the reserved queue and no path
+    at all keeps one account, and one that goes paused, then denied, then
+    paused again is told each time instead of its newest Event describing a
+    block that no longer applies.  *topic* keeps apart the one thing that is
+    not part of that story: an ignored annotation
+    (``PENDING_TOPIC_ANNOTATIONS``) stays true whatever holds the pod, and
+    sharing the hold's key would make the two alternate -- each a "change" --
+    and restate both on every retry.
 
     Best-effort throughout, like every other emitter here: a failure to emit is
     logged and never disturbs the retry cadence, which is the thing that
     actually gets the pod running.
     """
     repeat = timedelta(minutes=config.ondemand_denial_event_repeat_minutes)
-    if (
-        key == candidate.status_event_key
-        and candidate.status_event_at is not None
-        and now - candidate.status_event_at < repeat
-    ):
+    if not state.pending_status_due(uid, topic, key, now, repeat):
         return
     try:
         await emit()
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
-            event="k8s.event_failed", ns=candidate.pod_namespace,
-            pod=candidate.pod_name, reason=key[0], err=exc,
+            event="k8s.event_failed", ns=namespace, pod=pod_name,
+            reason=key[0], err=exc,
         ))
         return
     # Stamped only on a successful emit, so a failed one is retried on the next
     # attempt rather than being suppressed for the whole repeat interval.
-    candidate.status_event_key = key
-    candidate.status_event_at = now
+    state.record_pending_status(uid, topic, key, now)
+
+
+# How long a pod can go untold before what it *was* told is forgotten, at the
+# least -- the queue tick widens it to three repeat intervals when the repeat is
+# set longer.  Only a pod nothing is evaluating any more goes this long: one
+# still pending re-reports on every repeat interval.
+_PENDING_STATUS_RETENTION = timedelta(hours=2)
+
+
+def _support_phrase(config: Config) -> str:
+    """The "contact support" ending shared by every Event addressed to a pod's owner.
+
+    The contact ends the message with no full stop after it, so an address or
+    URL copied out of ``kubectl describe`` does not pick one up.
+    """
+    return (
+        f"contact support: {config.support_contact}"
+        if config.support_contact else "contact support."
+    )
+
+
+# Text quoted back to a pod's owner is bounded and stripped of control
+# characters even though most of it is their own: kubectl prints an Event
+# message verbatim to a terminal, and an annotation value is free text.
+_EVENT_QUOTE_MAX_CHARS = 64
+
+
+def _plain(value: str) -> str:
+    """*value* made fit to print in an Event message."""
+    cleaned = scrub(value)
+    if len(cleaned) > _EVENT_QUOTE_MAX_CHARS:
+        cleaned = cleaned[:_EVENT_QUOTE_MAX_CHARS] + "…"
+    return cleaned
+
+
+def _quoted(value: str) -> str:
+    """*value* made fit to print, in quotes -- for free text such as an
+    annotation value, where the quotes show what was actually written."""
+    return f"'{_plain(value)}'"
+
+
+def _listed(names: tuple[str, ...], limit: int = 3) -> str:
+    """Up to *limit* names, comma-joined, with an ellipsis standing for the rest."""
+    shown = ", ".join(_plain(name) for name in names[:limit])
+    return shown + (", …" if len(names) > limit else "")
 
 
 async def _emit_lease_denial_event(
     config: Config,
+    state: ControllerState,
     uid: str,
     candidate: OnDemandCandidate,
     detail: Optional[str],
@@ -1267,16 +1363,19 @@ async def _emit_lease_denial_event(
 ) -> None:
     """Tell the pod's owner why its JIT lease was refused, via a Kubernetes Event.
 
-    Only the app's documented 409 is surfaced.  A network failure or a 5xx says
-    nothing about the ask, and the non-retryable 4xx (a read-only service key, a
-    schema mismatch, an unknown group) is an operator fault the pod's owner can
-    neither read usefully nor act on -- it already gets a WARNING log line.
+    This is the app's documented 409: capacity, an SU budget or a policy gate.
+    A network failure or a 5xx says nothing about the ask, and the rest of the
+    non-retryable 4xx (a read-only service key, a schema mismatch) is an
+    operator fault the pod's owner can neither read usefully nor act on -- it
+    already gets a WARNING log line.  The one exception, a 404 for a name the
+    pod itself supplied, has an Event of its own (``_emit_lease_rejected_event``).
     Throttled by ``_post_pending_status``, keyed on the app's reason.
     """
     if not config.ondemand_denial_event_enabled or not detail:
         return
     await _post_pending_status(
-        config, candidate, ("OnDemandLeaseDenied", detail), now,
+        config, state, uid, candidate.pod_name, candidate.pod_namespace,
+        ("OnDemandLeaseDenied", detail), now,
         lambda: emit_lease_denied_event(
             uid,
             candidate.pod_name,
@@ -1284,6 +1383,412 @@ async def _emit_lease_denial_event(
             detail,
             gpu_class=candidate.gpu_class_label,
             gpu_count=candidate.gpu_requested,
+        ),
+    )
+
+
+def _usage_group_source_phrase(source: Optional[str], config: Config) -> Optional[str]:
+    """Where a candidate's usage group came from, in terms its owner recognises.
+
+    *source* is ``OnDemandCandidate.usage_group_source``.  The default is the
+    case that matters most: the owner never wrote that group anywhere, so
+    without this they would have no idea where it came from.
+    """
+    if source == "label" and config.required_group_label:
+        return f"from the pod's {config.required_group_label} label"
+    if source == "annotation":
+        return f"from the pod's {USAGE_GROUP_ANNOTATION} annotation"
+    if source == "default":
+        return "the cluster's default usage group, as the pod names none"
+    return None
+
+
+def _near_miss_hint(
+    miss: NearMiss, gpu_class: str, group: Optional[str], config: Config
+) -> Optional[str]:
+    """Name the reservations the user holds that this pod narrowly misses.
+
+    "No reservation matches" is the wrong thing to tell someone looking at one
+    in the booking calendar, so when they hold a live booking of this class
+    under another usage group, or one of another class, say so and say which
+    of the pod's labels decides it.  *group* is the pod's own usage group for
+    matching (``QueueEntry.group_label``).  ``None`` when there is nothing to
+    add.  Stable while the user's bookings are: it ends up in a throttle key.
+    """
+    sentences: list[str] = []
+    if miss.other_groups and config.required_group_label:
+        pod_group = (
+            f"this pod's usage group is {_quoted(group)}" if group
+            else "this pod names no usage group"
+        )
+        sentences.append(
+            f"You do have a gpu-class {gpu_class} reservation under usage group "
+            f"{_listed(miss.other_groups)}, but {pod_group}; set its "
+            f"{config.required_group_label} label to that group to use it."
+        )
+    if miss.other_classes:
+        sentences.append(
+            f"You do have a reservation for gpu-class "
+            f"{_listed(miss.other_classes)}, but this pod's gpu-class label is "
+            f"{gpu_class}."
+        )
+    return " ".join(sentences) or None
+
+
+def _lease_rejected_message(
+    candidate: OnDemandCandidate,
+    detail: Optional[str],
+    hint: Optional[str],
+    config: Config,
+) -> str:
+    """What the owner of a pod whose lease ask the app answered 404 reads.
+
+    Every name a 404 can be about came off the pod, so beside the app's own
+    reason the message says which names were sent and where the usage group
+    came from -- which the app cannot know -- and that waiting will not fix it.
+    It is the throttle key (``_post_pending_status``), so it carries nothing
+    that changes between retries.
+    """
+    what = (
+        f"On-demand GPU lease for {candidate.gpu_requested} x "
+        f"{candidate.gpu_class_label} was rejected by the reservation service"
+    )
+    if detail:
+        what += f": {scrub(detail).rstrip('.')}."
+    else:
+        what += (
+            ", which does not recognise the user, usage group or GPU class it named."
+        )
+    source = _usage_group_source_phrase(candidate.usage_group_source, config)
+    sent = (
+        f"The request named user {candidate.pod_namespace} (this pod's namespace) "
+        f"and usage group {_quoted(candidate.usage_group or '')}"
+        + (f" ({source})" if source else "")
+        + "."
+    )
+    todo = (
+        "Waiting will not fix this: if the usage group is wrong, correct it and "
+        f"recreate the pod; if these look right, {_support_phrase(config)}"
+    )
+    return " ".join(part for part in (what, sent, hint, todo) if part)
+
+
+async def _emit_lease_rejected_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    candidate: OnDemandCandidate,
+    detail: Optional[str],
+    now: datetime,
+) -> None:
+    """Tell the pod's owner the app did not recognise a name its lease ask carried.
+
+    The app answers 404 for an unknown or inactive user, usage group or GPU
+    class, and all three come from the pod: its namespace, its group label or
+    ``galends/usage-group`` annotation, its ``gpu-class`` label.  So unlike the
+    rest of the non-retryable 4xx this is the pod owner's to fix -- a mistyped
+    group label is the usual cause -- or at least theirs to report.  The retry
+    keeps its exponential backoff; only the telling is new.  Emitted even
+    without a ``detail``, because the names that were sent say enough on their
+    own.  Rides the denial Event's switch: it is the app's refusal of the same
+    ask.
+    """
+    if not config.ondemand_denial_event_enabled:
+        return
+    # Only a booking under another usage group is worth naming here: the usual
+    # 404 is a mistyped group, and the user's bookings of other classes have
+    # nothing to do with it.
+    miss = state.near_miss_bookings(
+        candidate.pod_namespace, candidate.gpu_class_label, candidate.group_label, now,
+    )
+    hint = _near_miss_hint(
+        miss._replace(other_classes=()),
+        candidate.gpu_class_label, candidate.group_label, config,
+    )
+    message = _lease_rejected_message(candidate, detail, hint, config)
+    await _post_pending_status(
+        config, state, uid, candidate.pod_name, candidate.pod_namespace,
+        (LEASE_REJECTED_REASON, message), now,
+        lambda: emit_pod_problem_event(
+            uid, candidate.pod_name, candidate.pod_namespace, message,
+            reason=LEASE_REJECTED_REASON,
+            gpu_class=candidate.gpu_class_label, gpu_count=candidate.gpu_requested,
+        ),
+    )
+
+
+# At most this many known class labels are listed in an UnknownGpuClass Event.
+_KNOWN_CLASSES_SHOWN = 10
+
+
+def _unknown_class_message(
+    gpu_class: str, known: tuple[str, ...], config: Config
+) -> str:
+    """What the owner of a pod whose gpu-class label the app does not know reads.
+
+    Lists the classes the app does know, because a typo is the likeliest cause
+    and the list is how to spot one.  Changes only when that list does.
+    """
+    known_classes = (
+        f"Known classes: {_listed(known, _KNOWN_CLASSES_SHOWN)}."
+        if known else "The reservation service lists no GPU classes at all."
+    )
+    return (
+        f"This pod's gpu-class label is {_plain(gpu_class)}, which is not a GPU "
+        f"class the reservation service knows, so no reservation can match it and "
+        f"it cannot be admitted on demand. {known_classes} Correct the label and "
+        f"recreate the pod; if it is right, {_support_phrase(config)}"
+    )
+
+
+async def _emit_unknown_class_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    pod_name: str,
+    namespace: str,
+    gpu_class: str,
+    now: datetime,
+) -> None:
+    """Tell the pod's owner its gpu-class label names no class the app knows.
+
+    Only once the app has listed every class it *does* know
+    (``state.gpu_classes_known``): before the first successful bulk class
+    fetch a label can be missing from the map for want of data, and blaming the
+    pod for the controller's own gap would be false.  A class created in the app
+    since the last refresh can be reported for up to one fetch interval; the
+    next attempt after the refresh proceeds normally.
+    """
+    if not state.gpu_classes_known or not config.pod_problem_event_enabled:
+        return
+    message = _unknown_class_message(gpu_class, tuple(sorted(state.gpu_class_ids)), config)
+    await _post_pending_status(
+        config, state, uid, pod_name, namespace,
+        (UNKNOWN_GPU_CLASS_REASON, message), now,
+        lambda: emit_pod_problem_event(
+            uid, pod_name, namespace, message,
+            reason=UNKNOWN_GPU_CLASS_REASON, gpu_class=gpu_class,
+        ),
+    )
+
+
+def _annotation_problem_clause(problem: AnnotationProblem) -> str:
+    """One ignored annotation, described for the pod's owner.
+
+    Shared by the ``AnnotationIgnored`` notice and by ``NoReservation``, which
+    names an ignored annotation in place of the missing input it explains.
+    """
+    value = _quoted(problem.value)
+    if problem.reason == "not_enabled":
+        return (
+            f"its {problem.annotation} annotation ({value}) has no effect, because "
+            f"best-effort admission is not enabled on this cluster"
+        )
+    if problem.annotation == MIN_RUNTIME_ANNOTATION:
+        return (
+            f"its {problem.annotation} annotation is {value}, which is not a whole "
+            f"number of seconds greater than zero"
+        )
+    accepted = ", ".join(f"'{v}'" for v in sorted(RUNTIME_GUARANTEE_VALUES))
+    return (
+        f"its {problem.annotation} annotation is {value}, which is not a value it "
+        f"accepts ({accepted})"
+    )
+
+
+def _annotation_notice_message(
+    problems: list[AnnotationProblem], *, waits_for_reservation: bool, config: Config
+) -> str:
+    """What the owner of a pod that went ahead despite ignored annotations reads.
+
+    *waits_for_reservation* is the reserved-queue case: the pod has a booking to
+    wait for, and valid annotations would have had it admitted on demand now
+    instead.  Otherwise the pod is an on-demand candidate, and that can only be
+    so with an ignored runtime if the cluster default stood in for it.
+    """
+    one = len(problems) == 1
+    parts = [
+        f"Ignored {'an annotation' if one else 'annotations'} on this pod: "
+        + "; ".join(_annotation_problem_clause(p) for p in problems) + "."
+    ]
+    if waits_for_reservation:
+        parts.append(
+            "It waits for its reservation to open instead of being admitted on demand."
+        )
+    else:
+        if any(p.annotation == MIN_RUNTIME_ANNOTATION for p in problems):
+            parts.append(
+                f"The cluster's default minimum runtime of "
+                f"{config.default_min_runtime_seconds} seconds is used instead."
+            )
+        if any(p.annotation == RUNTIME_GUARANTEE_ANNOTATION for p in problems):
+            parts.append(
+                "It is admitted with a guaranteed runtime, charged like any "
+                "on-demand lease, rather than on a best-effort basis."
+            )
+    parts.append(
+        f"To change that, correct the {'annotation' if one else 'annotations'} "
+        f"and recreate the pod."
+    )
+    return " ".join(parts)
+
+
+async def _emit_annotation_notice(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    pod_name: str,
+    namespace: str,
+    problems: list[AnnotationProblem],
+    now: datetime,
+    *,
+    waits_for_reservation: bool,
+) -> None:
+    """Tell the owner of a pod that went ahead which of its annotations were ignored.
+
+    For a pod that *is* being handled -- an on-demand candidate running on the
+    cluster's default runtime, or a pod left waiting for a booking it could have
+    been admitted ahead of -- where the annotation changed the outcome but
+    nothing else reports it.  A pod no path will admit is told the same thing
+    inside ``NoReservation`` instead, where it is the reason.
+
+    On its own topic (``PENDING_TOPIC_ANNOTATIONS``): an ignored annotation
+    stays true whatever holds the pod, so sharing the hold's key would make the
+    two alternate and restate each other on every retry.
+    """
+    if not config.pod_problem_event_enabled or not problems:
+        return
+    message = _annotation_notice_message(
+        problems, waits_for_reservation=waits_for_reservation, config=config
+    )
+    await _post_pending_status(
+        config, state, uid, pod_name, namespace,
+        (ANNOTATION_IGNORED_REASON, message), now,
+        lambda: emit_pod_problem_event(
+            uid, pod_name, namespace, message, reason=ANNOTATION_IGNORED_REASON,
+        ),
+        topic=PENDING_TOPIC_ANNOTATIONS,
+    )
+
+
+def _ondemand_ineligibility(
+    config: Config,
+    *,
+    min_runtime: Optional[int],
+    best_effort: bool,
+    usage_group: Optional[str],
+    problems: list[AnnotationProblem],
+    has_usage_group_annotation: bool,
+) -> list[str]:
+    """Why a Pending pod does not qualify for on-demand admission, one clause each.
+
+    Mirrors the ``jit_eligible`` test in ``pod_watch_loop``: on-demand admission
+    switched off, no usable minimum runtime (unless best-effort stands in for
+    one), no usage group.  An ignored annotation is named in place of the
+    "has none" clause it explains, so the owner reads what to correct rather
+    than only what is missing.  Empty when the pod qualifies.
+    """
+    if not config.ondemand_lease_enabled:
+        return ["on-demand admission is not enabled on this cluster"]
+    reasons: list[str] = []
+    if min_runtime is None and not best_effort:
+        runtime_problems = [p for p in problems if p.annotation == MIN_RUNTIME_ANNOTATION]
+        reasons.extend(_annotation_problem_clause(p) for p in runtime_problems)
+        if not runtime_problems:
+            reasons.append(
+                f"it has no {MIN_RUNTIME_ANNOTATION} annotation saying how long it "
+                f"needs to run, in seconds"
+            )
+        # A runtime-guarantee annotation that could have stood in for the runtime.
+        reasons.extend(
+            _annotation_problem_clause(p) for p in problems
+            if p.annotation == RUNTIME_GUARANTEE_ANNOTATION
+        )
+    if usage_group is None:
+        if config.required_group_label:
+            clause = (
+                f"it has no {config.required_group_label} label naming its usage group"
+            )
+            if has_usage_group_annotation:
+                clause += (
+                    f" (the {USAGE_GROUP_ANNOTATION} annotation is not used on this "
+                    f"cluster)"
+                )
+        else:
+            clause = f"it has no {USAGE_GROUP_ANNOTATION} annotation naming its usage group"
+        reasons.append(clause)
+    return reasons
+
+
+def _no_reservation_message(
+    namespace: str,
+    gpu_class: str,
+    group: Optional[str],
+    reasons: list[str],
+    hint: Optional[str],
+    config: Config,
+) -> str:
+    """What the owner of a pod that no path will admit reads.
+
+    States what the pod was matched on, every reason it cannot be admitted on
+    demand, any booking it narrowly misses, and what to do.  The throttle key,
+    so nothing in it changes between evaluations of an unchanged pod.
+    """
+    matched_on = f"user {namespace}, gpu-class {gpu_class}"
+    if config.required_group_label and group:
+        matched_on += f", usage group {_plain(group)}"
+    if config.ondemand_lease_enabled:
+        todo = (
+            f"correct the pod and recreate it, or book a gpu-class {gpu_class} "
+            f"reservation."
+        )
+    else:
+        todo = f"book a gpu-class {gpu_class} reservation to run it."
+    todo = ("Otherwise, " + todo) if hint else (todo[0].upper() + todo[1:])
+    why = (
+        "; ".join(reasons[:-1]) + "; and " + reasons[-1]
+        if len(reasons) > 1 else reasons[0]
+    )
+    return " ".join(part for part in (
+        f"No GPU reservation matches this pod ({matched_on}), and it cannot be "
+        f"admitted on demand: {why}.",
+        hint,
+        todo,
+    ) if part)
+
+
+async def _emit_no_reservation_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    pod_name: str,
+    namespace: str,
+    gpu_class: str,
+    group: Optional[str],
+    reasons: list[str],
+    now: datetime,
+) -> None:
+    """Tell the owner of a Pending pod that nothing will admit it as written.
+
+    The pod matches no reservation, open or future, and does not qualify for
+    on-demand admission, so no path will ever pick it up; before this it logged
+    ``pod.left_pending`` at DEBUG and nothing else, and sat Pending indefinitely.
+    *reasons* are ``_ondemand_ineligibility``'s clauses; a booking the user
+    holds that the pod narrowly misses is named too.
+    """
+    if not config.pod_problem_event_enabled or not reasons:
+        return
+    hint = _near_miss_hint(
+        state.near_miss_bookings(namespace, gpu_class, group, now),
+        gpu_class, group, config,
+    )
+    message = _no_reservation_message(namespace, gpu_class, group, reasons, hint, config)
+    await _post_pending_status(
+        config, state, uid, pod_name, namespace,
+        (NO_RESERVATION_REASON, message), now,
+        lambda: emit_pod_problem_event(
+            uid, pod_name, namespace, message,
+            reason=NO_RESERVATION_REASON, gpu_class=gpu_class,
         ),
     )
 
@@ -1325,21 +1830,17 @@ def _admission_paused_message(guard: int, gpu_class: str, config: Config) -> str
             f"(for example, they are all down for maintenance), so no new on-demand "
             f"jobs are started on this GPU class until one is back"
         )
-    # The contact ends the message with no full stop after it, so an address or
-    # URL copied out of `kubectl describe` does not pick one up.
-    support = (
-        f"contact support: {config.support_contact}"
-        if config.support_contact else "contact support."
-    )
     return (
         f"On-demand GPU admission for gpu-class {gpu_class} is paused: {cause}. "
         f"Nothing about this pod needs to change; it stays Pending and the "
-        f"controller keeps retrying on its own. If this persists, {support}"
+        f"controller keeps retrying on its own. If this persists, "
+        f"{_support_phrase(config)}"
     )
 
 
 async def _emit_admission_paused_event(
     config: Config,
+    state: ControllerState,
     uid: str,
     candidate: OnDemandCandidate,
     guard: int,
@@ -1363,7 +1864,8 @@ async def _emit_admission_paused_event(
         return
     message = _admission_paused_message(guard, candidate.gpu_class_label, config)
     await _post_pending_status(
-        config, candidate, ("OnDemandAdmissionPaused", message), now,
+        config, state, uid, candidate.pod_name, candidate.pod_namespace,
+        ("OnDemandAdmissionPaused", message), now,
         lambda: emit_admission_paused_event(
             uid,
             candidate.pod_name,
@@ -1443,7 +1945,9 @@ async def _grant_and_admit(
                 # Surface the app's reason on the pod itself: the retry cadence
                 # below is invisible to its owner, who otherwise sees only a pod
                 # that stays Pending with nothing saying why.
-                await _emit_lease_denial_event(config, uid, candidate, attempt.detail, now)
+                await _emit_lease_denial_event(
+                    config, state, uid, candidate, attempt.detail, now
+                )
         else:
             # A fault waiting will not fix — a read-only service key, a schema
             # mismatch after an app upgrade, an unknown group name.  WARNING so
@@ -1457,6 +1961,12 @@ async def _grant_and_admit(
                 status=attempt.status, fails=candidate.lease_error_count,
                 retry_s=int((candidate.next_attempt_at - now).total_seconds()),
             ))
+            if attempt.status == LEASE_NOT_FOUND_STATUS:
+                # Of these faults, a 404 is the one the pod's owner caused: the
+                # user, group and class it can name all came off the pod.
+                await _emit_lease_rejected_event(
+                    config, state, uid, candidate, attempt.detail, now
+                )
         return False
 
     candidate.lease_error_count = 0
@@ -1890,6 +2400,7 @@ async def pod_watch_loop(
                             waited_s=waited,
                         ))
                     state.remove_ondemand_candidate(uid)
+                    state.forget_pending_status(uid)
                     # Occupancy is the unified budget map for every admission path, so a
                     # deleted pod must always be released, regardless of on-demand
                     # placement being enabled (otherwise reserved-path budget leaks until
@@ -1915,6 +2426,7 @@ async def pod_watch_loop(
                     # otherwise re-add it to occupancy on every MODIFIED event.
                     if phase in TERMINAL_PHASES:
                         state.remove_ondemand_candidate(uid)
+                        state.forget_pending_status(uid)
                         state.release_pod(uid)
                         # Record any overstay before teardown removes the lease from
                         # state.reservations (so guarantee_end can still resolve).
@@ -1930,6 +2442,8 @@ async def pod_watch_loop(
                         # Pod already admitted — remove from whichever queue it may be in.
                         state.dequeue_pod(uid)
                         state.remove_ondemand_candidate(uid)
+                        # Nothing is holding it any more, so nothing is left to tell.
+                        state.forget_pending_status(uid)
                         # A reserved-path holder vouches for every window its chained
                         # session spans; pass its booking id so all are cleared at once.
                         booking_id = parse_booking_reference(get_pod_booking_reference(pod))
@@ -2006,10 +2520,20 @@ async def pod_watch_loop(
                     # label already carries DEFAULT_USAGE_GROUP when it applies; the
                     # annotation branch falls back to the same default, so one setting
                     # covers a pod that named no group by either route.
-                    usage_group: str | None = (
-                        group_label
-                        if config.required_group_label
-                        else (get_pod_usage_group(pod) or config.default_usage_group)
+                    own_group_annotation = get_pod_usage_group(pod)
+                    if config.required_group_label:
+                        usage_group: str | None = group_label
+                        own_group = labels.get(config.required_group_label)
+                        own_source = "label"
+                    else:
+                        usage_group = own_group_annotation or config.default_usage_group
+                        own_group = own_group_annotation
+                        own_source = "annotation"
+                    # Where the group came from, so a group the app turns out not
+                    # to know can be traced back to what set it (see
+                    # _usage_group_source_phrase).
+                    usage_group_source = (
+                        own_source if own_group else ("default" if usage_group else None)
                     )
                     # A best-effort pod needs no minimum runtime -- it sizes
                     # nothing -- but still needs a usage group, because
@@ -2020,6 +2544,19 @@ async def pod_watch_loop(
                         and (min_rt is not None or best_effort)
                         and usage_group is not None
                     )
+                    # Job-input annotations the controller is ignoring.  Read only
+                    # where they are reported -- first sight of the pod, and each
+                    # watch resync -- and without the minimum runtime when the pod
+                    # is best-effort, which has no use for one.
+                    problems: list[AnnotationProblem] = []
+                    if event_type == "ADDED":
+                        problems = [
+                            problem
+                            for problem in get_pod_annotation_problems(
+                                pod, best_effort_enabled=config.best_effort_enabled
+                            )
+                            if not (best_effort and problem.annotation == MIN_RUNTIME_ANNOTATION)
+                        ]
 
                     if jit_eligible:
                         # ---- JIT on-demand path ----
@@ -2035,6 +2572,13 @@ async def pod_watch_loop(
                                 min_rt or 0,
                                 pod_created_at, group_label, usage_group,
                                 best_effort=best_effort,
+                                usage_group_source=usage_group_source,
+                            )
+                            # Before the admission batch, so an ignored annotation is
+                            # told ahead of whatever the batch does with the pod.
+                            await _emit_annotation_notice(
+                                config, state, uid, name, namespace, problems, now,
+                                waits_for_reservation=False,
                             )
                             # Responsive path: a newly-discovered candidate kicks an
                             # immediate admission batch covering it plus every other due
@@ -2084,11 +2628,58 @@ async def pod_watch_loop(
                         state.enqueue_pod(
                             uid, name, namespace, gpu_class_label, gpu_count, group_label
                         )
+                        # When the runtime is all that kept this pod off the
+                        # on-demand path, an ignored annotation is why it waits
+                        # for its booking instead of being admitted now.  (With
+                        # on-demand admission off, or no usage group either, the
+                        # annotation changed nothing, so there is nothing to tell.)
+                        if (
+                            config.ondemand_lease_enabled
+                            and phase == "Pending"
+                            and usage_group is not None
+                            and min_rt is None
+                            and not best_effort
+                        ):
+                            await _emit_annotation_notice(
+                                config, state, uid, name, namespace, problems, now,
+                                waits_for_reservation=True,
+                            )
                     elif event_type == "ADDED":
                         log.debug("%s", kv(
                             event="pod.left_pending", ns=namespace, pod=name,
                             reason="no_match_not_jit_eligible",
                         ))
+                        # Nothing will ever pick this pod up as it stands, so its
+                        # owner has to be told why -- a pod not waiting on the
+                        # scheduler (not Pending) has nothing to be told.
+                        # "No reservation matches" is only said once a full
+                        # fetch has shown the reservation list: before that
+                        # it is merely empty, and the claim would be false.
+                        if phase == "Pending":
+                            if (
+                                state.gpu_classes_known
+                                and gpu_class_label not in state.gpu_class_ids
+                            ):
+                                await _emit_unknown_class_event(
+                                    config, state, uid, name, namespace,
+                                    gpu_class_label, now,
+                                )
+                            elif state.reservations_known:
+                                await _emit_no_reservation_event(
+                                    config, state, uid, name, namespace,
+                                    gpu_class_label, group_label,
+                                    _ondemand_ineligibility(
+                                        config,
+                                        min_runtime=min_rt,
+                                        best_effort=best_effort,
+                                        usage_group=usage_group,
+                                        problems=problems,
+                                        has_usage_group_annotation=(
+                                            own_group_annotation is not None
+                                        ),
+                                    ),
+                                    now,
+                                )
             except Exception as exc:  # noqa: BLE001
                 # One bad event (malformed object, handler bug) must not kill
                 # the consumer: before this guard the task died silently, and
@@ -2360,6 +2951,13 @@ async def _run_queue_tick(
     #     (app-delegated LAS selection when enabled; grant-all fallback
     #     otherwise).  Coalesces with any watch-triggered batch. ---
     await _run_ondemand_admission(state, client, config)
+
+    # Forget what was told to pods nothing is evaluating any more -- in practice
+    # a pod deleted while the watch was down, whose DELETED event never came.
+    # A pod still pending re-reports every repeat interval, so three of them (or
+    # the floor, whichever is longer) cannot catch one by mistake.
+    repeat = timedelta(minutes=config.ondemand_denial_event_repeat_minutes)
+    state.prune_pending_status(now - max(_PENDING_STATUS_RETENTION, 3 * repeat))
 
     log.debug("%s", kv(
         event="queue.tick", queued=len(state.task_queue),
@@ -3710,6 +4308,7 @@ async def push_reservations(
             dict(state.gpu_class_labels),
             dict(state.gpu_class_ids),
             dict(state.gpu_class_capacity),
+            state.gpu_classes_known,
         ),
     )
 

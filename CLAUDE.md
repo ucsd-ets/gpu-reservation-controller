@@ -793,7 +793,10 @@ without the toleration,
    the plain wait-for-window behaviour for a pod that isn't JIT-eligible.
 4. Otherwise the pod is left **Pending** (a pod missing the group label or the
    minimum-runtime annotation is deliberately not guessed at; that is left
-   for a future "born overstay" design).
+   for a future "born overstay" design), and its owner is told why with a
+   `NoReservation` Event — or `UnknownGpuClass`, when its `gpu-class` label names
+   no class the app knows (see **Telling the pod's owner the pod itself is the
+   problem**).
 
 **Batch admission** (`main._run_ondemand_admission`, the single entry point for
 both the ADDED trigger and the queue-processor tick): gathers every **due**
@@ -802,12 +805,15 @@ two-step **preflight → delegate → grant** pipeline.
 
 - **Preflight** (`_preflight_ondemand_candidate`): re-reads the pod (drops it
   if gone/terminal/Unknown), re-runs step 1 above (a matching reservation may
-  have appeared since the candidate was queued), applies guard 1
-  (`is_gpu_gated_pending` + `class_node_counts` — see **Guard 1: what the
-  scheduler can and cannot tell us** below), guard 3 (`stuck_holder_gpu_classes`), guard 4
-  (`overcommitted_gpu_classes`), and guard 5 (per-node feasibility — see
-  **Per-node capacity accounting** below), and resolves the pod's `gpu-class`
-  label to a numeric id via `ControllerState.gpu_class_ids`.  Survivors become an
+  have appeared since the candidate was queued), resolves the pod's `gpu-class`
+  label to a numeric id via `ControllerState.gpu_class_ids` — first, because a
+  label the app does not know can never be granted anything, and settling it
+  ahead of the guards is what lets its owner be told (`UnknownGpuClass`) rather
+  than the pod being dropped by guard 1a before the class is ever looked at —
+  then applies guard 1 (`is_gpu_gated_pending` + `class_node_counts` — see
+  **Guard 1: what the scheduler can and cannot tell us** below), guard 3
+  (`stuck_holder_gpu_classes`), guard 4 (`overcommitted_gpu_classes`), and guard 5
+  (per-node feasibility — see **Per-node capacity accounting** below).  Survivors become an
   `OnDemandAdmissionCandidate` — the exact "ask" (username, group, class id, gpu
   count, and `duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES
   * 60`, default buffer 10 min), plus the **pod evidence** described next.
@@ -858,6 +864,8 @@ two-step **preflight → delegate → grant** pipeline.
   `lease.error` at **WARNING** with the response body and backs off
   exponentially to `ERROR_RETRY_CAP_SECONDS` (30 min) via
   `OnDemandCandidate.lease_error_count`, reset on any grant or routine denial.
+  A **404** among them is also told to the pod (`OnDemandLeaseRejected`): every
+  user, group and class it can name came off the pod.
   Collapsing the two was how a misconfigured deployment retried every 2–5 min
   per pending pod indefinitely while logging only below WARNING.
   On **grant** the lease is upserted into `state.reservations`
@@ -923,7 +931,8 @@ now, yielded the moment anything else wants them, charged nothing.  Before this,
 a job with no runtime to promise either bought a guarantee it did not want or sat
 Pending; a `0` in `galends/minimum-runtime-seconds` looked like the way to say so
 and silently disqualified the pod instead (that `0` now logs
-`pod.annotation_invalid reason=not_positive` naming this annotation).
+`pod.annotation_invalid reason=not_positive` naming this annotation, and tells
+the pod's owner — see **Telling the pod's owner the pod itself is the problem**).
 
 Such a pod is admitted under a **zero-length, zero-SU `kind="best_effort"`
 reservation** (`POST /api/reservations` with `best_effort: true`;
@@ -982,7 +991,10 @@ Three consequences worth knowing, each pinned by a test:
 **App side**: `_prioritize_candidates` now sacrifices by what the reservation
 promised — `best_effort`, then `on_demand`, then `booking` — replacing the
 uniform-random placeholder.  **RBAC / config**: none new;
-`BEST_EFFORT_ENABLED=false` (the default) ignores the annotation entirely.
+`BEST_EFFORT_ENABLED=false` (the default) ignores the annotation — telling the
+pod's owner so, as `AnnotationIgnored` or inside `NoReservation`, since a pod
+that asked for free best-effort time is otherwise charged a guaranteed lease or
+left Pending without a word.
 User-facing documentation is `docs/POD-ANNOTATIONS.md` §3.1.
 
 ### Surfacing a lease denial to the pod's owner
@@ -1006,11 +1018,19 @@ will not until something changes; it is the same shape kube-scheduler's
 
 Four properties are load-bearing:
 
-- **Only the app's 409 is surfaced.**  A network failure or a 5xx says nothing
-  about the ask (the app never answered), and the non-retryable 4xx — a
-  `read_only` service key, a schema mismatch, an unknown group — is an operator
-  fault the pod's owner can neither read usefully nor fix.  Those keep the
-  `lease.error` WARNING and reach no pod.
+- **Only the app's own answers about the ask are surfaced.**  A network failure
+  or a 5xx says nothing about the ask (the app never answered), and most
+  non-retryable 4xx — a `read_only` service key, a schema mismatch — is an
+  operator fault the pod's owner can neither read usefully nor fix.  Those keep
+  the `lease.error` WARNING and reach no pod.  The exception is the **404**: the
+  app does not recognise the user, usage group or GPU class the ask named, and
+  every one of those came off the pod (its namespace, its group label or
+  annotation, its `gpu-class` label).  Filing it with the operator faults was how
+  a pod carrying a mistyped `dsmlp/course` label sat Pending with nothing but a
+  404 in the controller's log.  It keeps the exponential backoff and the
+  `lease.error` line, and is also told to the pod as `OnDemandLeaseRejected`
+  (`main._emit_lease_rejected_event`) — see **Telling the pod's owner the pod
+  itself is the problem**.
 - **The detail is carried, not re-derived.**  `LeaseAttempt.detail` (already
   truncated to 200 chars by `_response_detail`, so a proxy's HTML error page
   cannot become a 5 KB Event message) is the single value both the `lease.denied`
@@ -1022,15 +1042,16 @@ Four properties are load-bearing:
   reporting once and going quiet is equally wrong, because Events expire and a
   pod still blocked an hour later would `kubectl describe` clean.  The repeat is
   what keeps the two failure modes apart.  The throttle is
-  `main._post_pending_status`, shared with the admission-paused Event (see
-  **Telling the pod's owner that admission is paused**).
-- **Best-effort, and the stamp follows the emit.**  `status_event_key` /
-  `status_event_at` on the `OnDemandCandidate` are written **only** after a
+  `main._post_pending_status`, shared by every Event addressed to the owner of
+  a pod that is not running (see **Telling the pod's owner that admission is
+  paused** and **Telling the pod's owner the pod itself is the problem**).
+- **Best-effort, and the stamp follows the emit.**  What was told is recorded in
+  `ControllerState.pending_status` (keyed by pod uid) **only** after a
   successful emit, so a failed one is retried on the next attempt rather than
   suppressed for the whole interval.  A failure logs `k8s.event_failed` and never
   disturbs the retry cadence, which is the thing that actually gets the pod
-  running.  The state is in-memory like the rest of the candidate: after a
-  restart the pod is re-warned once, which is the right side to err on.
+  running.  The state is in-memory: after a restart the pod is re-warned once,
+  which is the right side to err on.
 
 **RBAC / config**: none new — Event creation reuses the `events: create`
 permission the guarantee and preemption emitters already need.
@@ -1144,7 +1165,12 @@ reason — the two travel together.
 
 **RBAC / observability**: none new.  There is deliberately no "a default was
 applied" log event: `ondemand.candidate_added` already prints the effective
-`min_runtime_s` and `group`, which is the value that matters.
+`min_runtime_s` and `group`, which is the value that matters.  The one case the
+pod's owner is told about is a default standing in for a value they *did* write
+but which was invalid (`AnnotationIgnored`), since they would otherwise believe
+their own runtime was in force; a default filling a gap they left says nothing,
+and one supplying the usage group of a lease the app 404s is named as such in
+`OnDemandLeaseRejected`.
 
 ### App-side vs physical capacity reconciliation
 
@@ -1263,7 +1289,7 @@ set, with no full stop after it so it copies cleanly out of `kubectl describe`.
   and a drained class, which also reads overcommitted whenever the app still
   counts its GPUs (physical `0` < app-side `N`), reports the drain.
 - **One throttle, one cadence, one story.**  `main._post_pending_status` is the
-  throttle for *both* pending-pod Events, keyed per candidate on
+  throttle for every pending-pod Event, keyed per pod uid on
   `(reason, varying text)` — the app's `detail` for a denial, the rendered
   message for a pause.  So the pause runs on exactly the denial's cadence
   (changed status at once, unchanged once per
@@ -1293,6 +1319,98 @@ set, with no full stop after it so it copies cleanly out of `kubectl describe`.
 **RBAC / config**: none new — `events: create` is already required.
 `ONDEMAND_PAUSE_EVENT_ENABLED=false` disables it; `SUPPORT_CONTACT` is optional.
 User-facing documentation is `docs/POD-ANNOTATIONS.md` §5.2.
+
+### Telling the pod's owner the pod itself is the problem
+
+The two sections above cover the app refusing a lease and a class being paused.
+Four more ways a `gpu-class` pod could be held or ignored reached only the
+controller's log — or nothing at all — although in each the thing to fix is the
+pod itself, which only its owner can change:
+
+| Event (`Warning`) | When | Was |
+|---|---|---|
+| `OnDemandLeaseRejected` | The app answered the lease ask **404**: it does not recognise the user, usage group or GPU class the ask named — all of which came off the pod | `lease.error` WARNING, filed with the operator faults |
+| `UnknownGpuClass` | The pod's `gpu-class` label names no class the app knows | `ondemand.candidate_held reason=class_id_unknown` WARNING, every 2–5 min |
+| `NoReservation` | No reservation matches the pod and it does not qualify for on-demand admission, so no path will ever pick it up | `pod.left_pending` at **DEBUG** |
+| `AnnotationIgnored` | A `galends/*` job-input annotation was invalid, or asks for something the deployment does not offer, and ignoring it changed what happens | `pod.annotation_invalid` WARNING, or nothing (`galends/runtime-guarantee` while `BEST_EFFORT_ENABLED` is off) |
+
+Each message says what is wrong, what the controller did instead, and what to
+do; the renderers are the `_…_message` helpers in `main`, and the one write is
+`k8s_client.emit_pod_problem_event` (capped at the 1024 characters
+`events.k8s.io/v1` allows a note).
+
+- **`OnDemandLeaseRejected`** (`main._emit_lease_rejected_event`, from
+  `_grant_and_admit`) carries the app's `detail` when it sent one, and states
+  what the controller *sent* — the user (the pod's namespace) and the usage
+  group, and where that group came from: the `REQUIRED_GROUP_LABEL` label, the
+  `galends/usage-group` annotation, or `DEFAULT_USAGE_GROUP`
+  (`OnDemandCandidate.usage_group_source`, recorded by routing).  The app cannot
+  know the last, and it is the difference between "fix your label" and "you
+  never named a group; contact support".  A booking the user holds under another
+  usage group is named too.  Emitted even without a `detail`, unlike the 409.
+  Rides `ONDEMAND_DENIAL_EVENT_ENABLED`, being the app's refusal of the same ask.
+- **`UnknownGpuClass`** is told from two places: preflight, which now resolves
+  the class id **before** guard 1a (a label the app does not know can never be
+  granted anything, and a guard-1a drop used to hide it for good), and the
+  left-Pending branch of `pod_watch_loop`.  It lists the classes the app does
+  know, since a typo is the usual cause.
+- **`NoReservation`** (`main._emit_no_reservation_event`) replaces the silent
+  `pod.left_pending` outcome.  `_ondemand_ineligibility` mirrors the
+  `jit_eligible` test and yields one clause per cause — on-demand admission off
+  (and nothing else, since then nothing else matters); no usable minimum
+  runtime, unless best-effort stands in for one; no usage group — naming an
+  ignored annotation in place of the "has none" clause it explains.
+  `ControllerState.near_miss_bookings` adds what "no reservation matches" hides:
+  a live booking this user holds for the same class under another usage group
+  (only while `REQUIRED_GROUP_LABEL` is on), or one of another class.
+- **`AnnotationIgnored`** (`main._emit_annotation_notice`) is for a pod that went
+  ahead: an on-demand candidate running on `DEFAULT_MINIMUM_RUNTIME_SECONDS`
+  because its own runtime was junk, one charged a guaranteed lease because it
+  asked for best-effort on a cluster without it, or one left waiting for its
+  booking because the runtime was all that kept it off the on-demand path.  A
+  pod no path will admit gets the same facts inside `NoReservation` instead.
+  The verdicts come from `k8s_client.get_pod_annotation_problems`, which shares
+  its parse with the `pod.annotation_invalid` getters, so the log line and the
+  Event cannot disagree about a value.  A best-effort pod's minimum runtime is
+  never reported: it has no use for one.
+
+Four properties are load-bearing:
+
+- **One ledger per pod, two topics.**  `ControllerState.pending_status` (pod uid
+  → topic → the last Event and when) replaced `status_event_key/at` on
+  `OnDemandCandidate`, so a pod tells one story whichever path holds it — a
+  candidate, the reserved queue, or none — and moving between them is not
+  mistaken for news.  The `annotations` topic is separate from the `hold` topic
+  because an ignored annotation stays true whatever holds the pod: on one key
+  the two would alternate, each a "change", and both would be restated on every
+  retry.
+- **Never blame the pod for the controller's gap.**  `UnknownGpuClass` needs
+  `state.gpu_classes_known` — a *bulk* class fetch has succeeded, now or on an
+  earlier cycle (`GpuClassMaps.complete`); the per-id fallback alone holds only
+  the classes some reservation named.  `NoReservation` needs
+  `state.reservations_known` — a full fetch has installed its result; a push is
+  a delta, and before the first fetch the list is merely empty.  With the app
+  unreachable at startup, neither is said.
+- **Told at first sight and on each resync, not on every MODIFIED.**  A
+  left-Pending pod is tracked by no path, so it is re-evaluated only when the
+  watch replays it (ADDED, every ~10 min) — which, with the repeat interval, is
+  the restatement cadence.  A burst of scheduler-condition MODIFIEDs drives
+  nothing.
+- **Forgotten when the pod is no longer pending.**  DELETED, a terminal phase
+  and admission (the toleration seen) drop the pod's entry;
+  `prune_pending_status` runs each queue tick for a pod whose DELETED event was
+  never seen (a re-LIST replays only pods that still exist), dropping untracked
+  entries not told anything for `max(2 h, 3 × ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES)`
+  — a pod still pending is re-told every repeat interval, so it cannot be
+  caught.
+
+**Known gap**: a pod waiting on the reserved path — queued for a booking that
+has not opened, or over its booking's budget — still gets no status Event, so a
+`NoReservation` told before the user booked stays the newest Event on the pod
+until it expires.  **RBAC / config**: none new.  `POD_PROBLEM_EVENT_ENABLED=false`
+disables `UnknownGpuClass`, `NoReservation` and `AnnotationIgnored`;
+`OnDemandLeaseRejected` rides `ONDEMAND_DENIAL_EVENT_ENABLED`.  User-facing
+documentation is `docs/POD-ANNOTATIONS.md` §5.3.
 
 ### Per-node capacity accounting
 
@@ -1659,10 +1777,11 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `BEST_EFFORT_ENABLED` | `false` | Honour a pod's `galends/runtime-guarantee: none` by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation instead of a guaranteed lease (see **Best-effort admission**). Ships dark: the app must serve the best-effort create shape, and against one that does not, every such candidate takes a non-retryable 4xx into `lease.error` backoff. The pod annotation alone is deliberately *not* the opt-in — unlike `galends/force-node-capacity`, any pod author can set it |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
-| `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's **409** denial reason for a JIT lease onto the waiting pod as a `Warning` Event (`reason=OnDemandLeaseDenied`), so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
-| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial *or* an admission pause, which share one throttle (the name predates the pause) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between the two, emits immediately regardless; `0` emits on every attempt |
+| `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's refusal of a JIT lease onto the waiting pod as a `Warning` Event — its **409** denial reason (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class it does not recognise (`reason=OnDemandLeaseRejected`) — so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause, or a pod-problem Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
-| `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of that Event's "contact support" suggestion. Unset = the suggestion names no one |
+| `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of the "contact support" suggestion in that Event and the pod-problem Events. Unset = the suggestion names no one |
+| `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), or one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**). Throttled with the denial Event, on its cadence; `false` disables |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
 | `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |

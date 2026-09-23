@@ -187,20 +187,22 @@ config:
   # (the pod then converges lazily via adoption once past its lease guarantee).
   ondemandMergeEnabled: true
 
-  # Mirror the reservation app's 409 denial reason for a JIT on-demand lease onto
-  # the waiting pod as a Warning Kubernetes Event (reason=OnDemandLeaseDenied), so
-  # the pod's owner can see why their job is still Pending without access to the
-  # controller's logs.  Informational only — the controller retries either way.
-  # Set to false to disable.
+  # Mirror the reservation app's refusal of a JIT on-demand lease onto the
+  # waiting pod as a Warning Kubernetes Event, so the pod's owner can see why
+  # their job is still Pending without access to the controller's logs: a 409
+  # denial (reason=OnDemandLeaseDenied), or a 404 for a user, usage group or GPU
+  # class the app does not recognise (reason=OnDemandLeaseRejected) -- all names
+  # that came off the pod.  Informational only — the controller retries either
+  # way.  Set to false to disable.
   ondemandDenialEventEnabled: true
 
   # How long an *unchanged* status is suppressed before being restated on a
-  # pending pod -- a lease denial, or an admission pause (ondemandPauseEventEnabled
-  # below; the two share this one cadence).  The lease retry cadence is 2-5
-  # minutes, so without this a blocked pod would collect a new Event every few
-  # minutes; the repeat still fires because Events expire and a pod that is still
-  # stuck should still say so.  A status that *changes* is emitted immediately
-  # regardless.  0 = every attempt.
+  # pending pod -- a lease denial, an admission pause (ondemandPauseEventEnabled
+  # below) or a pod-problem Event (podProblemEventEnabled); all share this one
+  # cadence.  The lease retry cadence is 2-5 minutes, so without this a blocked
+  # pod would collect a new Event every few minutes; the repeat still fires
+  # because Events expire and a pod that is still stuck should still say so.  A
+  # status that *changes* is emitted immediately regardless.  0 = every attempt.
   ondemandDenialEventRepeatMinutes: 30
 
   # Put a Warning Kubernetes Event (reason=OnDemandAdmissionPaused) on every pod
@@ -213,9 +215,19 @@ config:
   ondemandPauseEventEnabled: true
 
   # How pod owners reach support -- an email address or URL -- named at the end
-  # of that Event ("If this persists, contact support: <supportContact>").  Keep
-  # it short; it is part of every such Event.  Empty = the Event names no one.
+  # of that Event ("If this persists, contact support: <supportContact>"), and of
+  # the pod-problem Events below.  Keep it short; it is part of every such Event.
+  # Empty = the Event names no one.
   supportContact: ""
+
+  # Put a Warning Kubernetes Event on a pod the controller cannot act on as
+  # written, telling its owner what to fix: its gpu-class label names no class
+  # the reservation app knows (reason=UnknownGpuClass), no reservation matches it
+  # and it does not qualify for on-demand admission (reason=NoReservation), or
+  # one of its galends/* annotations was ignored (reason=AnnotationIgnored).
+  # Restated on the ondemandDenialEventRepeatMinutes cadence above.
+  # Set to false to disable.
+  podProblemEventEnabled: true
 
   # Stamp pods at risk of demand-driven preemption with informational
   # galends/termination-warning-* annotations (projected termination time, risk

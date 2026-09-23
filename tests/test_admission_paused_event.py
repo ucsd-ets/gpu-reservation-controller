@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import k8s_client
-from app.controller import ControllerState, OnDemandCandidate
+from app.controller import PENDING_TOPIC_HOLD, ControllerState, OnDemandCandidate
 from app.k8s_client import emit_admission_paused_event
 from app.reservation_client import LeaseAttempt
 
@@ -432,7 +432,7 @@ class TestPreflightTellsThePod:
         assert status == m._PREFLIGHT_RETRY
         assert candidate.next_attempt_at > before
         assert rec.calls == []
-        assert candidate.status_event_key is None
+        assert state.pending_status == {}
 
     def test_a_failed_emit_never_disturbs_the_hold(self, monkeypatch, caplog):
         m = _main_module(monkeypatch)
@@ -452,8 +452,7 @@ class TestPreflightTellsThePod:
         assert kv_fields(failed[0].getMessage())["reason"] == "OnDemandAdmissionPaused"
         # Not stamped, so the next hold retries the emit instead of staying
         # silent for the whole repeat interval.
-        assert candidate.status_event_key is None
-        assert candidate.status_event_at is None
+        assert state.pending_status == {}
 
 
 class TestAdmissionBatchTellsEachHeldPod:
@@ -561,17 +560,34 @@ class TestCordonedClassEndToEnd:
 # ---------------------------------------------------------------------------
 
 
+# What each test has told so far; the throttle lives in
+# ControllerState.pending_status, keyed by pod uid.  Fresh per test.
+_STATE = ControllerState()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state():
+    global _STATE
+    _STATE = ControllerState()
+    yield
+
+
+def _told(uid="uid-1"):
+    """The status last told to *uid*'s owner, or None."""
+    return _STATE.pending_status.get(uid, {}).get(PENDING_TOPIC_HOLD)
+
+
 def _pause(m, monkeypatch, candidate, guard, now, rec, config=None):
     monkeypatch.setattr(m, "emit_admission_paused_event", rec)
     asyncio.run(m._emit_admission_paused_event(
-        config or _config(), candidate.pod_uid, candidate, guard, now,
+        config or _config(), _STATE, candidate.pod_uid, candidate, guard, now,
     ))
 
 
 def _deny(m, monkeypatch, candidate, detail, now, rec):
     monkeypatch.setattr(m, "emit_lease_denied_event", rec)
     asyncio.run(m._emit_lease_denial_event(
-        _config(), candidate.pod_uid, candidate, detail, now,
+        _config(), _STATE, candidate.pod_uid, candidate, detail, now,
     ))
 
 
@@ -594,7 +610,7 @@ class TestPauseCadence:
         later = NOW + timedelta(minutes=30)
         _pause(m, monkeypatch, candidate, 4, later, rec)
         assert len(rec.calls) == 2
-        assert candidate.status_event_at == later
+        assert _told().at == later
 
     def test_the_interval_is_the_denial_events(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -619,7 +635,7 @@ class TestPauseCadence:
         _pause(m, monkeypatch, candidate, 4, NOW + timedelta(minutes=1), rec)
         assert [c["guard"] for c in rec.calls] == [3, 4]
 
-    def test_candidates_do_not_share_throttle_state(self, monkeypatch):
+    def test_pods_do_not_share_throttle_state(self, monkeypatch):
         m = _main_module(monkeypatch)
         rec = _Recorder()
         _pause(m, monkeypatch, _candidate("uid-1"), 4, NOW, rec)
@@ -657,7 +673,7 @@ class TestOneStoryPerPod:
         _deny(m, monkeypatch, candidate, DETAIL, NOW + timedelta(minutes=1), denied)
         _pause(m, monkeypatch, candidate, 4, NOW + timedelta(minutes=2), paused)
         assert len(paused.calls) == 2
-        assert candidate.status_event_key[0] == "OnDemandAdmissionPaused"
+        assert _told().key[0] == "OnDemandAdmissionPaused"
 
 
 # ---------------------------------------------------------------------------

@@ -185,6 +185,12 @@ class Config:
     # How a pod's owner reaches support -- an email address or URL -- named in
     # that suggestion.  None = the suggestion names no one.
     support_contact: Optional[str] = None
+    # Tell the owner of a pod the controller cannot act on as written with a
+    # Warning Event: its gpu-class label names no class the app knows
+    # (UnknownGpuClass), no reservation matches it and it does not qualify for
+    # on-demand admission (NoReservation), or one of its galends/* annotations
+    # was ignored (AnnotationIgnored).  On the denial Event's repeat cadence.
+    pod_problem_event_enabled: bool = True
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
     # Honour galends/runtime-guarantee=none by admitting the pod under a
@@ -279,6 +285,7 @@ class Config:
                 "ONDEMAND_PAUSE_EVENT_ENABLED", True
             ),
             support_contact=(os.environ.get("SUPPORT_CONTACT") or "").strip() or None,
+            pod_problem_event_enabled=_env_bool("POD_PROBLEM_EVENT_ENABLED", True),
             preemption_delegate_selection=_env_bool(
                 "PREEMPTION_DELEGATE_SELECTION", True
             ),

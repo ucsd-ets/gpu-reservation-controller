@@ -120,6 +120,8 @@ spec:
             - name: SUPPORT_CONTACT
               value: {{ .Values.config.supportContact | quote }}
             {{- end }}
+            - name: POD_PROBLEM_EVENT_ENABLED
+              value: {{ .Values.config.podProblemEventEnabled | quote }}
             - name: TERMINATION_WARNING_ENABLED
               value: {{ .Values.config.terminationWarningEnabled | quote }}
             - name: TERMINATION_WARNING_LEAD_MINUTES
