@@ -140,10 +140,10 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | INFO | `pod.toleration_applied` | `ns pod tol_key tol_value booking_ref` | The patch landed. |
 | INFO | `pod.admitted` | `ns pod rid clabel gpus free reserved until` | The one line to grep for a successful admission. |
 | INFO | `pod.guarantee_recorded` | `ns pod guarantee_s until` | Informational annotations; Kubernetes enforces nothing. |
-| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus` \| `clabel guard` \| `clabel`) | `reason=RuntimeGuaranteed` \| `BestEffortAdmitted` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `OnDemandLeaseDenied` \| `OnDemandLeaseRejected` \| `OnDemandAdmissionPaused` \| `UnknownGpuClass` \| `NoReservation` \| `AnnotationIgnored`. `BestEffortAdmitted` replaces `RuntimeGuaranteed` for a pod admitted with no runtime guarantee (a `RuntimeGuaranteed` message would read "guaranteed for 0m00s, until \<the instant the pod started\>"). The six from `OnDemandLeaseDenied` on are the `Warning`-type Events — a still-Pending pod's status, on one shared per-pod throttle (§5); they and `BestEffortAdmitted` are addressed to the pod's *owner* rather than to an operator. `AnnotationIgnored` carries no `clabel`. |
+| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus` \| `clabel guard` \| `clabel`) | `reason=RuntimeGuaranteed` \| `BestEffortAdmitted` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `OnDemandLeaseDenied` \| `OnDemandLeaseRejected` \| `OnDemandAdmissionPaused` \| `UnknownGpuClass` \| `NoReservation` \| `AnnotationIgnored` \| `WaitingForReservation` \| `ReservationFull` \| `ReservationTooSmall`. `BestEffortAdmitted` replaces `RuntimeGuaranteed` for a pod admitted with no runtime guarantee (a `RuntimeGuaranteed` message would read "guaranteed for 0m00s, until \<the instant the pod started\>"). The nine from `OnDemandLeaseDenied` on are a still-Pending pod's status, on one shared per-pod throttle (§5) — `Warning`-type, except `WaitingForReservation`, which is `Normal`; they and `BestEffortAdmitted` are addressed to the pod's *owner* rather than to an operator. `AnnotationIgnored` carries no `clabel`. |
 | INFO | `pod.dequeued` | `ns pod reason` | e.g. `toleration_already_present`. |
 | INFO | `pod.queue_dropped` | `ns pod` + `rid reason` \| `phase reason` | Window expired, reservation cancelled with no replacement, or the pod went terminal. |
-| INFO | `pod.requeued` | `ns pod reason old.rid new.rid` | Re-matched after its reservation was cancelled. |
+| INFO | `pod.requeued` | `ns pod reason old.rid new.rid` | `reason=reservation_cancelled`: re-matched after its reservation was cancelled. `reason=open_reservation_with_room`: moved by the queue tick to one of its owner's reservations open now with room, from one that could not take it now (not yet open, full, too small, or ended); attempted on the same tick. |
 | WARNING | `pod.admission_error` | `ns pod rid err` | Optimistic placement rolled back; entry stays queued. |
 | WARNING | `pod.guarantee_record_failed` | `ns pod err` | Best-effort — the toleration is **not** revoked. |
 | INFO | `pod.gate_removed` / DEBUG `pod.gate_absent` | `ns pod gate` | `POD_SCHEDULING_GATE_NAME` handling. |
@@ -232,11 +232,16 @@ the healthy state.
 audit blocking admission" without matching on message text.
 
 **Every pending-pod Event shares one throttle, kept per pod uid** (the denial,
-the pause below, and `OnDemandLeaseRejected` / `UnknownGpuClass` /
-`NoReservation`, which report the pod itself as the problem): a changed status
-goes out at once, an unchanged one at most once per
-`ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES`, so the newest one on a pod is what holds
-it now.  `AnnotationIgnored` runs on its own track of the same throttle, since an
+the pause below, `OnDemandLeaseRejected` / `UnknownGpuClass` / `NoReservation`,
+which report the pod itself as the problem, and `WaitingForReservation` /
+`ReservationFull` / `ReservationTooSmall` for a pod queued on one of its owner's
+reservations): a changed status goes out at once, an unchanged one at most once
+per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES`, so the newest one on a pod is what
+holds it now.  A queued pod is told where it is routed (first sight, each watch
+resync, a JIT candidate rerouted to a booking) and on every queue tick it stays
+queued; `ReservationFull` names the owner's pods holding the reservation, so it
+changes -- and is told again -- as they come and go, at most once a tick.
+`RESERVATION_WAIT_EVENT_ENABLED=false` turns those three off.  `AnnotationIgnored` runs on its own track of the same throttle, since an
 ignored annotation stays true whatever holds the pod.  A failed write logs
 `k8s.event_failed` with the Event's `reason` and is retried at the next attempt.
 

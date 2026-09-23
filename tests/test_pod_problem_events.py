@@ -45,8 +45,9 @@ from app.k8s_client import (
     LEASE_REJECTED_REASON,
     NO_RESERVATION_REASON,
     UNKNOWN_GPU_CLASS_REASON,
+    WAITING_FOR_RESERVATION_REASON,
     AnnotationProblem,
-    emit_pod_problem_event,
+    emit_pending_pod_event,
     get_pod_annotation_problems,
 )
 from app.reservation_client import LeaseAttempt
@@ -129,7 +130,7 @@ def _candidate(uid="uid-1", *, group_label=None, usage_group=GROUP_NAME,
 
 
 class _ProblemRecorder:
-    """Stands in for ``emit_pod_problem_event`` as ``main`` calls it."""
+    """Stands in for ``emit_pending_pod_event`` as ``main`` calls it."""
 
     def __init__(self, raises=None):
         self.calls: list[dict] = []
@@ -370,7 +371,7 @@ class TestAnnotationProblems:
 
 
 # ---------------------------------------------------------------------------
-# k8s_client.emit_pod_problem_event — the Event write
+# k8s_client.emit_pending_pod_event — the Event write
 # ---------------------------------------------------------------------------
 
 
@@ -386,13 +387,13 @@ class _CapturingCore:
 def _emit(monkeypatch, *, reason, message="the pod is wrong", **kw):
     core = _CapturingCore()
     monkeypatch.setattr(k8s_client, "_core_v1", core)
-    asyncio.run(emit_pod_problem_event(
+    asyncio.run(emit_pending_pod_event(
         "uid-1", "pod-1", USERNAME, message, reason=reason, **kw
     ))
     return core.events[0]
 
 
-class TestEmitPodProblemEvent:
+class TestEmitPendingPodEvent:
     @pytest.mark.parametrize("reason,action,prefix", [
         (LEASE_REJECTED_REASON, "RequestOnDemandLease", "gpu-lease-rejected-"),
         (UNKNOWN_GPU_CLASS_REASON, "AdmitPod", "gpu-unknown-class-"),
@@ -456,7 +457,7 @@ def _ask(candidate):
 
 def _grant(monkeypatch, m, status, detail, *, config=None, state=None, candidate=None):
     rec = _ProblemRecorder()
-    monkeypatch.setattr(m, "emit_pod_problem_event", rec)
+    monkeypatch.setattr(m, "emit_pending_pod_event", rec)
     state = state if state is not None else _state()
     candidate = candidate or _candidate()
     done = asyncio.run(m._grant_and_admit(
@@ -588,7 +589,7 @@ def _preflight(monkeypatch, m, state, candidate, *, config=None, pod=None):
         return pod or _pending_pod(candidate.pod_uid)
 
     monkeypatch.setattr(m, "read_pod", fake_read_pod)
-    monkeypatch.setattr(m, "emit_pod_problem_event", rec)
+    monkeypatch.setattr(m, "emit_pending_pod_event", rec)
     status, ask = asyncio.run(m._preflight_ondemand_candidate(
         state, config or _config(), candidate.pod_uid, candidate,
     ))
@@ -701,7 +702,7 @@ def _watch(monkeypatch, m, config, events, state=None, recorder=None):
     monkeypatch.setattr(m, "PodWatcher", lambda **kw: _FakeWatcher(events))
     monkeypatch.setattr(m, "_run_ondemand_admission", fake_admission)
     monkeypatch.setattr(m, "_try_apply_toleration", no_apply)
-    monkeypatch.setattr(m, "emit_pod_problem_event", rec)
+    monkeypatch.setattr(m, "emit_pending_pod_event", rec)
     state = state if state is not None else _state(
         required_group_label=config.required_group_label
     )
@@ -741,7 +742,7 @@ class TestTheReportedCase:
 
         monkeypatch.setattr(m, "PodWatcher", lambda **kw: _FakeWatcher([("ADDED", pod)]))
         monkeypatch.setattr(m, "read_pod", fake_read_pod)
-        monkeypatch.setattr(m, "emit_pod_problem_event", rec)
+        monkeypatch.setattr(m, "emit_pending_pod_event", rec)
         asyncio.run(m.pod_watch_loop(state, client, config))
 
         assert client.requests == 1
@@ -944,19 +945,23 @@ class TestAnnotationIgnored:
         assert state.ondemand_candidates["uid-1"].best_effort is True
         assert rec.calls == []
 
-    def test_a_pod_left_waiting_for_its_booking_is_told(self, monkeypatch):
+    def test_a_pod_left_waiting_for_its_booking_is_told_in_its_wait_event(
+        self, monkeypatch
+    ):
         # A booking far off: with a valid runtime this pod would have been
-        # admitted on demand now.
+        # admitted on demand now.  That is said inside the Event saying what it
+        # waits for, where it is why it cannot start sooner -- not beside it.
         m = _main_module(monkeypatch)
         state = _state(_booking(start=_later()))
         pod = _pod(annotations={USAGE_GROUP: GROUP_NAME, MIN_RUNTIME: "0"})
         rec, state, _b = _watch(monkeypatch, m, _config(), [("ADDED", pod)], state=state)
         assert "uid-1" in state.task_queue
         [call] = rec.calls
-        assert call["reason"] == ANNOTATION_IGNORED_REASON
-        assert "waits for its reservation to open" in call["message"]
+        assert call["reason"] == WAITING_FOR_RESERVATION_REASON
+        assert f"its {MIN_RUNTIME} annotation is '0'" in call["message"]
+        assert _told(state, topic=PENDING_TOPIC_ANNOTATIONS) is None
 
-    def test_nothing_is_told_when_the_annotation_changed_nothing(self, monkeypatch):
+    def test_nothing_is_said_of_it_when_the_annotation_changed_nothing(self, monkeypatch):
         # On-demand admission is off here, so the pod would wait for its booking
         # however it was annotated.
         m = _main_module(monkeypatch)
@@ -967,7 +972,9 @@ class TestAnnotationIgnored:
             state=state,
         )
         assert "uid-1" in state.task_queue
-        assert rec.calls == []
+        [call] = rec.calls
+        assert call["reason"] == WAITING_FOR_RESERVATION_REASON
+        assert MIN_RUNTIME not in call["message"]
 
     def test_a_pod_its_open_booking_admits_is_not_told(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -989,14 +996,13 @@ class TestAnnotationIgnored:
         async def deny(uid, name, namespace, detail, *, gpu_class, gpu_count):
             denials.append(detail)
 
-        monkeypatch.setattr(m, "emit_pod_problem_event", notes)
+        monkeypatch.setattr(m, "emit_pending_pod_event", notes)
         monkeypatch.setattr(m, "emit_lease_denied_event", deny)
         config = _config(default_min_runtime_seconds=600)
         for minute in range(3):
             at = NOW + timedelta(minutes=minute)
             asyncio.run(m._emit_annotation_notice(
                 config, state, "uid-1", "pod-uid-1", USERNAME, problems, at,
-                waits_for_reservation=False,
             ))
             asyncio.run(m._emit_lease_denial_event(
                 config, state, "uid-1", candidate, "no capacity", at,

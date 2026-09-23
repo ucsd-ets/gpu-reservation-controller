@@ -404,6 +404,15 @@ class QueueEntry:
     reservation: ReservationResponse
     next_attempt_at: datetime  # earliest time to try applying the toleration
     group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
+    # Why this pod waits for its booking rather than being admitted on demand:
+    # main._ondemand_ineligibility's clauses, recorded by routing when it queued
+    # the pod only because it could not go on demand (the any-match fallback --
+    # a booking beyond ONDEMAND_HORIZON_MINUTES, full, or too small).  Quoted in
+    # the pod's reservation-wait Event, so its owner can see what keeps it from
+    # starting sooner.  Empty when on-demand admission is off, or routing queued
+    # the pod for a booking it would wait for anyway.  Kept when the entry is
+    # re-pointed at another reservation: it describes the pod, not the booking.
+    ondemand_ineligibility: tuple[str, ...] = ()
 
 
 @dataclass
@@ -877,6 +886,15 @@ class ControllerState:
         # galends/booking-reference, so no separate annotation is needed.
         self.occupancy: dict[int, dict[str, int]] = {}
 
+        # Who the pods in ``occupancy`` are: pod uid → (namespace, name).  A
+        # directory, not a second occupancy map -- ``reservation_holders`` looks
+        # up the uids ``occupancy`` lists and never the reverse, so an entry
+        # outliving its pod is inert.  Rebuilt from the same snapshot each
+        # queue-processor tick, and added to wherever a pod is admitted or seen
+        # admitted in between, so a pod waiting on a full reservation can be
+        # told which of its owner's pods hold it (``ReservationFull``).
+        self.holder_names: dict[str, tuple[str, str]] = {}
+
         # Safety interlock (guard 3): set of GPU class labels that currently
         # have at least one reservation-holder pod stuck Pending.  Updated each
         # queue_processor_loop tick.  On-demand placement is held for any class
@@ -1216,6 +1234,7 @@ class ControllerState:
         namespace: str,
         gpu_class_label: str,
         group_label: Optional[str] = None,
+        gpu_requested: Optional[int] = None,
     ) -> Optional[ReservationResponse]:
         """Find the nearest upcoming (or active) reservation for *namespace* / *gpu_class_label*.
 
@@ -1226,7 +1245,11 @@ class ControllerState:
           is the pod's group label value, ignored when the feature is disabled
         - reservation window has not yet expired
 
-        When multiple matches exist, return the one whose window starts soonest.
+        When multiple matches exist, return the one whose window starts soonest
+        -- among those big enough for the pod, when *gpu_requested* is given: a
+        booking holding fewer GPUs than the pod asks for can never admit it, so
+        a pod is queued for a smaller one only when the user holds nothing
+        bigger (and is then told so, ``ReservationTooSmall``).
         """
         now = datetime.now(timezone.utc)
         candidates = [
@@ -1242,6 +1265,10 @@ class ControllerState:
         ]
         if not candidates:
             return None
+        if gpu_requested is not None:
+            big_enough = [r for r in candidates if r.gpu_count >= gpu_requested]
+            if big_enough:
+                candidates = big_enough
         return min(candidates, key=slot_start)
 
     def find_admittable_reservation(
@@ -1388,18 +1415,29 @@ class ControllerState:
         gpu_class_label: str,
         gpu_requested: int,
         group_label: Optional[str] = None,
+        reservation: Optional[ReservationResponse] = None,
     ) -> None:
         """Match pod to a reservation and add to the work queue if eligible.
 
+        *reservation* is the one routing chose; without it the pod is matched
+        here (``find_best_reservation``, preferring a booking big enough for
+        it).  Routing must pass its choice: re-matching here used to pick the
+        soonest booking regardless of room, so a pod routed to a booking with
+        space could be pinned to a full one instead and wait there until its
+        window ended.
+
         If the pod is already queued for the same reservation, this is a no-op
         (idempotent).  If the reservation changes (e.g. old one cancelled), the
-        entry is replaced.  *group_label* is the pod's REQUIRED_GROUP_LABEL value
-        (ignored when the feature is disabled); it is carried on the QueueEntry so
-        reconcile_queue can re-match with the same group constraint.
+        entry is replaced, keeping what routing recorded about it
+        (``ondemand_ineligibility``).  *group_label* is the pod's
+        REQUIRED_GROUP_LABEL value (ignored when the feature is disabled); it is
+        carried on the QueueEntry so reconcile_queue can re-match with the same
+        group constraint.
         """
-        reservation = self.find_best_reservation(
-            pod_namespace, gpu_class_label, group_label
-        )
+        if reservation is None:
+            reservation = self.find_best_reservation(
+                pod_namespace, gpu_class_label, group_label, gpu_requested
+            )
         if reservation is None:
             return  # no matching reservation; nothing to do
 
@@ -1419,6 +1457,7 @@ class ControllerState:
             reservation=reservation,
             next_attempt_at=datetime.now(timezone.utc),
             group_label=group_label,
+            ondemand_ineligibility=existing.ondemand_ineligibility if existing else (),
         )
         self.task_queue[pod_uid] = entry
         log.info("%s", kv(
@@ -1610,7 +1649,8 @@ class ControllerState:
         for uid in stale_uids:
             entry = self.task_queue.pop(uid)
             new_res = self.find_best_reservation(
-                entry.pod_namespace, entry.gpu_class_label, entry.group_label
+                entry.pod_namespace, entry.gpu_class_label, entry.group_label,
+                entry.gpu_requested,
             )
             if new_res:
                 self.task_queue[uid] = QueueEntry(
@@ -1622,6 +1662,7 @@ class ControllerState:
                     reservation=new_res,
                     next_attempt_at=datetime.now(timezone.utc),
                     group_label=entry.group_label,
+                    ondemand_ineligibility=entry.ondemand_ineligibility,
                 )
                 log.info("%s", kv(
                     event="pod.requeued", ns=entry.pod_namespace, pod=entry.pod_name,
@@ -1830,6 +1871,34 @@ class ControllerState:
             if uid != exclude_uid
         )
         return max(0, reservation.gpu_count - used)
+
+    def reservation_holders(
+        self, reservation_id: int, namespace: str, exclude_uid: Optional[str] = None
+    ) -> tuple[tuple[str, ...], int]:
+        """The pods occupying *reservation_id*: names of those in *namespace*
+        (sorted), and how many others there are.
+
+        A pod waiting on a full reservation is told which of its owner's pods
+        hold it, so only pods in the waiting pod's own namespace are named --
+        normally every holder is, since a reservation matches only its owner's
+        namespace, but a pod left behind by an ownership change is not, and
+        its name is not the new owner's business.  A holder the directory has
+        no name for yet (admitted since the last snapshot by a path that does
+        not record one) is counted, not named.  *exclude_uid* omits the pod
+        being evaluated, as in ``available``.  Sorted so the result, which ends
+        up in a throttled Event message, does not flap between calls.
+        """
+        names: list[str] = []
+        others = 0
+        for uid in self.occupancy.get(reservation_id, {}):
+            if uid == exclude_uid:
+                continue
+            holder = self.holder_names.get(uid)
+            if holder is not None and holder[0] == namespace:
+                names.append(holder[1])
+            else:
+                others += 1
+        return tuple(sorted(names)), others
 
     def _effective_label(self, r: ReservationResponse) -> Optional[str]:
         """Return *r*'s GPU-class label: the cached value, else the label_value

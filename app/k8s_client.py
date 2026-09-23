@@ -1540,21 +1540,32 @@ async def emit_admission_paused_event(
     ))
 
 
-# Warning Events telling a pending pod's owner that something *about the pod*
-# stops the controller admitting it -- the siblings of OnDemandLeaseDenied and
+# Events telling a pending pod's owner why it is not running yet, whose
+# message ``main`` renders -- the siblings of OnDemandLeaseDenied and
 # OnDemandAdmissionPaused, which report the app refusing or a class being
-# paused.  Each reason maps to the Event's ``action`` (what the controller was
-# attempting) and its ``generateName`` prefix.
+# paused.  The first four say something *about the pod* stops the controller
+# admitting it; the last three, that it is queued for a reservation and what
+# that reservation is waiting on.  Each reason maps to the Event's type, its
+# ``action`` (what the controller was attempting) and its ``generateName``
+# prefix.
 LEASE_REJECTED_REASON = "OnDemandLeaseRejected"
 UNKNOWN_GPU_CLASS_REASON = "UnknownGpuClass"
 NO_RESERVATION_REASON = "NoReservation"
 ANNOTATION_IGNORED_REASON = "AnnotationIgnored"
+WAITING_FOR_RESERVATION_REASON = "WaitingForReservation"
+RESERVATION_FULL_REASON = "ReservationFull"
+RESERVATION_TOO_SMALL_REASON = "ReservationTooSmall"
 
-_POD_PROBLEM_EVENTS: dict[str, tuple[str, str]] = {
-    LEASE_REJECTED_REASON: ("RequestOnDemandLease", "gpu-lease-rejected-"),
-    UNKNOWN_GPU_CLASS_REASON: ("AdmitPod", "gpu-unknown-class-"),
-    NO_RESERVATION_REASON: ("AdmitPod", "gpu-no-reservation-"),
-    ANNOTATION_IGNORED_REASON: ("ReadAnnotations", "gpu-annotation-ignored-"),
+_PENDING_POD_EVENTS: dict[str, tuple[str, str, str]] = {
+    LEASE_REJECTED_REASON: ("Warning", "RequestOnDemandLease", "gpu-lease-rejected-"),
+    UNKNOWN_GPU_CLASS_REASON: ("Warning", "AdmitPod", "gpu-unknown-class-"),
+    NO_RESERVATION_REASON: ("Warning", "AdmitPod", "gpu-no-reservation-"),
+    ANNOTATION_IGNORED_REASON: ("Warning", "ReadAnnotations", "gpu-annotation-ignored-"),
+    # Normal: a pod waiting for a window its owner chose to book is the system
+    # working as intended, not something to act on.
+    WAITING_FOR_RESERVATION_REASON: ("Normal", "AdmitPod", "gpu-reservation-wait-"),
+    RESERVATION_FULL_REASON: ("Warning", "AdmitPod", "gpu-reservation-full-"),
+    RESERVATION_TOO_SMALL_REASON: ("Warning", "AdmitPod", "gpu-reservation-too-small-"),
 }
 
 # events.k8s.io/v1's limit on an Event's note; the core/v1 API this module
@@ -1562,7 +1573,7 @@ _POD_PROBLEM_EVENTS: dict[str, tuple[str, str]] = {
 _EVENT_MESSAGE_MAX_CHARS = 1024
 
 
-async def emit_pod_problem_event(
+async def emit_pending_pod_event(
     pod_uid: str,
     pod_name: str,
     namespace: str,
@@ -1572,9 +1583,10 @@ async def emit_pod_problem_event(
     gpu_class: Optional[str] = None,
     gpu_count: Optional[int] = None,
 ) -> None:
-    """Create a ``Warning`` Event on a pod the controller cannot admit as written.
+    """Create an Event telling a pending pod's owner why it is not running yet.
 
-    *reason* is one of the four above:
+    *reason* is one of the seven above.  Something about the pod stops the
+    controller admitting it as written (``Warning``):
 
     - ``OnDemandLeaseRejected`` -- the reservation app answered the pod's lease
       ask with a 404: it does not recognise the user, usage group or GPU class
@@ -1587,15 +1599,23 @@ async def emit_pod_problem_event(
     - ``AnnotationIgnored`` -- one of its ``galends/*`` job-input annotations
       was invalid, or asks for something this deployment does not offer.
 
+    Or it is queued for one of its owner's reservations:
+
+    - ``WaitingForReservation`` (``Normal``) -- the reservation has not opened.
+    - ``ReservationFull`` (``Warning``) -- it is open, but the owner's other
+      pods hold its GPUs.
+    - ``ReservationTooSmall`` (``Warning``) -- it holds fewer GPUs than the pod
+      requests, so it can never admit it.
+
     *message* is rendered by the caller (``main``), which knows what each means
     to the pod's owner; this only writes it -- capped at the 1024 characters
     ``events.k8s.io/v1`` allows a note, since it quotes the app's reason and
     the pod's own labels and annotations, whose lengths nothing here controls.
     ``Warning`` for the same reason as ``OnDemandLeaseDenied``: the pod is not
-    running, and will not until something changes -- here, usually the pod
-    itself.
+    running, and will not until something changes -- usually the pod itself,
+    or another of its owner's.
     """
-    action, name_prefix = _POD_PROBLEM_EVENTS[reason]
+    event_type, action, name_prefix = _PENDING_POD_EVENTS[reason]
     if len(message) > _EVENT_MESSAGE_MAX_CHARS:
         message = message[: _EVENT_MESSAGE_MAX_CHARS - 1] + "…"
     await _emit_pod_event(
@@ -1605,7 +1625,7 @@ async def emit_pod_problem_event(
         name_prefix=name_prefix,
         reason=reason,
         action=action,
-        event_type="Warning",
+        event_type=event_type,
         message=message,
     )
     log.info("%s", kv(

@@ -198,8 +198,8 @@ config:
 
   # How long an *unchanged* status is suppressed before being restated on a
   # pending pod -- a lease denial, an admission pause (ondemandPauseEventEnabled
-  # below) or a pod-problem Event (podProblemEventEnabled); all share this one
-  # cadence.  The lease retry cadence is 2-5 minutes, so without this a blocked
+  # below), a pod-problem Event (podProblemEventEnabled) or a reservation-wait
+  # Event (reservationWaitEventEnabled); all share this one cadence.  The lease retry cadence is 2-5 minutes, so without this a blocked
   # pod would collect a new Event every few minutes; the repeat still fires
   # because Events expire and a pod that is still stuck should still say so.  A
   # status that *changes* is emitted immediately regardless.  0 = every attempt.
@@ -228,6 +228,14 @@ config:
   # Restated on the ondemandDenialEventRepeatMinutes cadence above.
   # Set to false to disable.
   podProblemEventEnabled: true
+
+  # Tell the owner of a pod queued for one of their reservations what it is
+  # waiting on, as a Kubernetes Event: the window has not opened
+  # (reason=WaitingForReservation, a Normal Event), their other pods hold its
+  # GPUs, which are named (reason=ReservationFull), or it holds fewer GPUs than
+  # the pod requests (reason=ReservationTooSmall).  Restated on the
+  # ondemandDenialEventRepeatMinutes cadence above.  Set to false to disable.
+  reservationWaitEventEnabled: true
 
   # Stamp pods at risk of demand-driven preemption with informational
   # galends/termination-warning-* annotations (projected termination time, risk

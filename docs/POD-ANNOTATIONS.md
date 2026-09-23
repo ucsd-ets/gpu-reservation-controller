@@ -487,9 +487,11 @@ The controller also emits Kubernetes **Events** against the pod
 a new reservation, `Preempted` immediately before deletion,
 `OnDemandLeaseDenied` when a lease request is refused — §5.1 —
 `OnDemandAdmissionPaused` when on-demand admission for the pod's GPU class is
-on hold — §5.2 — and `OnDemandLeaseRejected`, `UnknownGpuClass`,
+on hold — §5.2 — `OnDemandLeaseRejected`, `UnknownGpuClass`,
 `NoReservation` and `AnnotationIgnored` when something about the pod itself
-needs fixing — §5.3). These are richer
+needs fixing — §5.3 — and `WaitingForReservation`, `ReservationFull` and
+`ReservationTooSmall` while the pod waits for one of your reservations — §5.4).
+These are richer
 than the annotations but need Kubernetes API access to read, so they are for
 whoever runs `kubectl` — the pod's owner, an operator, a dashboard — rather than
 for in-pod consumers. Being addressed to a person, their messages state times in
@@ -595,7 +597,7 @@ right, reported to support.
 | `OnDemandLeaseRejected` | The reservation service did not recognise something the pod's on-demand request named: its **usage group** (the usual cause — a mistyped group label or `galends/usage-group` annotation), its user (the pod's namespace) or its GPU class. The Event quotes the service's reason, the user and group that were sent, and where the group came from — the pod's label, its annotation, or the cluster's default when the pod named none. If you hold a booking of this class under a *different* usage group, it says so. |
 | `UnknownGpuClass` | The pod's `gpu-class` label is not a GPU class the reservation service knows, so no reservation can match it and it cannot be admitted on demand. The Event lists the classes that do exist. |
 | `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
-| `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis, or it waits for its reservation instead of being admitted now. |
+| `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, or the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis.  A pod that waits for its reservation instead of being admitted now because of one is told in its §5.4 Event instead. |
 
 ```console
 $ kubectl describe pod my-training-job
@@ -609,7 +611,7 @@ Events:
 
 - **They repeat on the schedule of §5.1** — a changed status at once, an
   unchanged one at most once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default
-  30) — and share its throttle, so the newest of §5.1–§5.3 on a pod is always
+  30) — and share its throttle, so the newest of §5.1–§5.4 on a pod is always
   what is holding it now.  `AnnotationIgnored` keeps its own schedule beside
   them: it stays true whatever else holds the pod.
 - **Fix, then recreate.**  The controller reads a pod's labels and annotations
@@ -620,6 +622,43 @@ Events:
   `NoReservation` are only reported once the controller has the reservation
   service's full class list and reservation list — so a pod created while the
   service is unreachable is told nothing rather than something false.
+
+### 5.4 While the pod waits for your reservation
+
+A pod that matches one of your reservations waits for it: until its window
+opens, or until one of its GPUs is free.  It gets an Event saying which, so the
+newest thing on the pod is not kube-scheduler's "untolerated taint" — or a
+`NoReservation` from before you booked.
+
+| Event | Type | What it means |
+|---|---|---|
+| `WaitingForReservation` | `Normal` | The reservation has not opened yet.  The Event gives its id and window; the pod is admitted shortly after the window opens (within the controller's queue interval, 5 minutes by default). |
+| `ReservationFull` | `Warning` | The reservation is open, but your other pods hold its GPUs.  The Event names them — a notebook server you forgot to stop is the usual cause.  The pod is admitted as soon as enough of them end; stop one to start it sooner. |
+| `ReservationTooSmall` | `Warning` | The reservation holds fewer GPUs than the pod requests, so it can never admit it — the pod is queued on it only because you hold no larger one of the class.  Book a reservation of at least the pod's `nvidia.com/gpu` request, or lower the request and recreate the pod. |
+
+```console
+$ kubectl describe pod my-training-job
+...
+Events:
+  Type     Reason            Age   From                        Message
+  ----     ------            ----  ----                        -------
+  Warning  FailedScheduling  48s   default-scheduler           0/41 nodes are available: ...
+  Warning  ReservationFull   47s   gpu-reservation-controller  Your GPU reservation #4127 (1 x a100, 2026-08-21 09:00:00 PDT to 2026-08-21 17:00:00 PDT) is fully in use by your pod jupyter-jsmith. This pod will be admitted as soon as 1 GPU is free. It cannot be admitted on demand meanwhile: it has no galends/minimum-runtime-seconds annotation saying how long it needs to run, in seconds.
+```
+
+- **Why it cannot start on demand instead.**  When the pod waits only because
+  it does not qualify for on-demand admission — the reservation is far off, full
+  or too small — the Event ends by saying why not: no (or an invalid)
+  `galends/minimum-runtime-seconds`, no usage group, or on-demand admission
+  switched off.  Fix that and recreate the pod to be admitted on demand while
+  you wait (charged like any on-demand lease).  A pod whose reservation opens
+  within the next half hour or so waits for it either way.
+- **Same schedule as §5.1–§5.3**: a changed status at once — the window
+  opening onto a full reservation, a different pod holding it — and an unchanged
+  one at most once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30).
+- **It follows your bookings.**  If a reservation that can take the pod *now*
+  appears — you book one, or one of your other bookings frees up — the pod
+  moves to it within the queue interval; you do not need to recreate it.
 
 ## 6. Acting on the warning: checkpointing a PyTorch job
 

@@ -122,6 +122,8 @@ spec:
             {{- end }}
             - name: POD_PROBLEM_EVENT_ENABLED
               value: {{ .Values.config.podProblemEventEnabled | quote }}
+            - name: RESERVATION_WAIT_EVENT_ENABLED
+              value: {{ .Values.config.reservationWaitEventEnabled | quote }}
             - name: TERMINATION_WARNING_ENABLED
               value: {{ .Values.config.terminationWarningEnabled | quote }}
             - name: TERMINATION_WARNING_LEAD_MINUTES

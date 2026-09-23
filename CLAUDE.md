@@ -61,8 +61,8 @@ app/
 | Task | Cadence | Responsibility |
 |------|---------|----------------|
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
-| `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
-| `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
+| `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; retries the pods waiting on a reservation a deleted/terminated pod held; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
+| `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; moves a queued pod to an open reservation with room; tells each pod still queued what it waits on; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee: reactively, when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**), and — throttled to `HEADROOM_CHECK_INTERVAL` — anticipatorily, to hold a fixed fraction of each class free for on-demand jobs that have not arrived yet (see **Anticipatory headroom preemption**) |
 | `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
 | `ondemand_gate_warning_loop` | every 60 s (only when `ONDEMAND_LEASE_ENABLED`) | Restates at WARNING (`ondemand.gated`) every GPU class whose JIT admission is paused by a class-wide gate — guard 1b, 3 or 4 — with a plain-English cause and remedy for an operator (see **Operator warning for paused on-demand admission**) |
@@ -1044,7 +1044,8 @@ Four properties are load-bearing:
   what keeps the two failure modes apart.  The throttle is
   `main._post_pending_status`, shared by every Event addressed to the owner of
   a pod that is not running (see **Telling the pod's owner that admission is
-  paused** and **Telling the pod's owner the pod itself is the problem**).
+  paused**, **Telling the pod's owner the pod itself is the problem** and
+  **Telling the pod's owner what its reservation is waiting on**).
 - **Best-effort, and the stamp follows the emit.**  What was told is recorded in
   `ControllerState.pending_status` (keyed by pod uid) **only** after a
   successful emit, so a failed one is retried on the next attempt rather than
@@ -1336,8 +1337,9 @@ pod itself, which only its owner can change:
 
 Each message says what is wrong, what the controller did instead, and what to
 do; the renderers are the `_…_message` helpers in `main`, and the one write is
-`k8s_client.emit_pod_problem_event` (capped at the 1024 characters
-`events.k8s.io/v1` allows a note).
+`k8s_client.emit_pending_pod_event` (capped at the 1024 characters
+`events.k8s.io/v1` allows a note), shared with the reservation-wait Events of
+the next section.
 
 - **`OnDemandLeaseRejected`** (`main._emit_lease_rejected_event`, from
   `_grant_and_admit`) carries the app's `detail` when it sent one, and states
@@ -1363,12 +1365,12 @@ do; the renderers are the `_…_message` helpers in `main`, and the one write is
   `ControllerState.near_miss_bookings` adds what "no reservation matches" hides:
   a live booking this user holds for the same class under another usage group
   (only while `REQUIRED_GROUP_LABEL` is on), or one of another class.
-- **`AnnotationIgnored`** (`main._emit_annotation_notice`) is for a pod that went
-  ahead: an on-demand candidate running on `DEFAULT_MINIMUM_RUNTIME_SECONDS`
-  because its own runtime was junk, one charged a guaranteed lease because it
-  asked for best-effort on a cluster without it, or one left waiting for its
-  booking because the runtime was all that kept it off the on-demand path.  A
-  pod no path will admit gets the same facts inside `NoReservation` instead.
+- **`AnnotationIgnored`** (`main._emit_annotation_notice`) is for an on-demand
+  candidate that went ahead: running on `DEFAULT_MINIMUM_RUNTIME_SECONDS`
+  because its own runtime was junk, or charged a guaranteed lease because it
+  asked for best-effort on a cluster without it.  A pod no path will admit gets
+  the same facts inside `NoReservation` instead, and one left waiting for its
+  booking because of them inside its reservation-wait Event (next section).
   The verdicts come from `k8s_client.get_pod_annotation_problems`, which shares
   its parse with the `pod.annotation_invalid` getters, so the log line and the
   Event cannot disagree about a value.  A best-effort pod's minimum runtime is
@@ -1404,13 +1406,101 @@ Four properties are load-bearing:
   — a pod still pending is re-told every repeat interval, so it cannot be
   caught.
 
-**Known gap**: a pod waiting on the reserved path — queued for a booking that
-has not opened, or over its booking's budget — still gets no status Event, so a
-`NoReservation` told before the user booked stays the newest Event on the pod
-until it expires.  **RBAC / config**: none new.  `POD_PROBLEM_EVENT_ENABLED=false`
+**RBAC / config**: none new.  `POD_PROBLEM_EVENT_ENABLED=false`
 disables `UnknownGpuClass`, `NoReservation` and `AnnotationIgnored`;
 `OnDemandLeaseRejected` rides `ONDEMAND_DENIAL_EVENT_ENABLED`.  User-facing
 documentation is `docs/POD-ANNOTATIONS.md` §5.3.
+
+### Telling the pod's owner what its reservation is waiting on
+
+A pod on the **reserved path** — queued for one of its owner's bookings — got no
+status Event at all: kube-scheduler's `FailedScheduling` names only the
+untolerated taint, and the newest Event the controller had put on the pod could
+be a `NoReservation` from before its owner booked, telling them to book what
+they already had.  `main._tell_queued_status` closes that, through the same
+`_post_pending_status` throttle (`hold` topic), with one of three Events
+classified by `main._queued_status`:
+
+| Event | Type | When |
+|---|---|---|
+| `WaitingForReservation` | `Normal` | The reservation has not opened — the system working as intended |
+| `ReservationFull` | `Warning` | It is open, but `available` is short of the pod's request: the owner's other pods hold its GPUs, and are named |
+| `ReservationTooSmall` | `Warning` | Its `gpu_count` is below the pod's request, so it can never admit it — checked first, since waiting for it to open would be waiting for nothing |
+
+`None` — nothing told — when the window is open and has room: the next attempt
+admits the pod, or an admission error is being retried, which is an operator's
+to see.
+
+- **Where it is told**: where the pod is routed onto the queue (ADDED — first
+  sight and each resync — in both the admittable branch, after the fast path,
+  and the any-match branch), where preflight reroutes a JIT candidate to a
+  booking (whose newest Event may say its lease was denied or its class
+  paused), and on **every queue tick** the pod stays queued.  The tick is what
+  notices change — a window opening onto a full reservation, a holder ending —
+  and bounds how often a busy reservation's churn can restate a waiter: at most
+  once per tick.
+- **Holders are named, from a directory.**  `ControllerState.holder_names` (pod
+  uid → namespace, name) is rebuilt from the tick's tolerated-pod snapshot next
+  to `reconcile_occupancy`, and added to on admission (`_try_apply_toleration`)
+  and the watch's has-toleration branch, so a pod admitted between ticks is
+  named at once.  `reservation_holders` looks names up **through occupancy**,
+  never the reverse, so a stale entry is inert; it names only pods in the
+  waiting pod's own namespace (a pod left by an ownership change is another
+  user's) and counts the rest.  A forgotten notebook server is the usual cause,
+  which is why the name matters.
+- **Why not on demand.**  When routing queued the pod *only* because it cannot
+  go on demand — the any-match fallback: a booking beyond
+  `ONDEMAND_HORIZON_MINUTES`, full, or too small — it records
+  `_ondemand_ineligibility`'s clauses on the entry
+  (`QueueEntry.ondemand_ineligibility`, ADDED only, since annotation problems are
+  read only then), and the Event ends with them.  That replaced the any-match
+  `AnnotationIgnored`, which only covered a junk runtime and said less.  Nothing
+  is recorded where on-demand admission is off (there is no sooner to offer).
+- **The message is the throttle key**, so it holds only absolute instants
+  (`_reservation_phrase` renders the window with `local_display`) — "opens in 20
+  minutes" would restate it every evaluation.  `ReservationTooSmall` implies the
+  owner holds nothing larger, so it waits for `state.reservations_known`, like
+  `NoReservation`.
+
+Four fixes to *which* reservation a queued pod waits on came with it, because
+an Event describing the wrong one would be worse than none:
+
+- **`enqueue_pod` takes routing's choice** (`reservation=`).  It used to
+  re-match with `find_best_reservation` — soonest, ignoring room — so a pod
+  routed to an open booking with room could be pinned to a sooner full one, and
+  wait there until its window ended.
+- **`find_best_reservation(gpu_requested=)` prefers a booking big enough** for
+  the pod over a sooner smaller one, falling back to the soonest only when the
+  owner holds nothing bigger (hence `ReservationTooSmall`).  Routing's any-match
+  and `reconcile_queue` pass it.
+- **The tick re-points** an entry its reservation cannot take now (not open,
+  full, too small, ended) to one of the owner's bookings **open now with room**
+  (`find_admittable_reservation` with a zero horizon), logs `pod.requeued
+  reason=open_reservation_with_room`, and attempts it on the same tick.  Never
+  away from a reservation that can take the pod.  It skips an entry the watch
+  dequeued or replaced during an earlier await — re-pointing would re-queue a
+  deleted pod.
+- **One path per pod.**  The JIT branch dequeues on ADDED (only there — a
+  MODIFIED adds no candidate, so dequeuing on it would strand the pod until the
+  next resync), the any-match branch drops any candidate, and a terminal pod
+  leaves the queue (it used to linger until its window opened).
+
+And **`_retry_waiters`**: when a pod is deleted or goes terminal, the
+reservation `release_pod` freed it from has its open-window waiters attempted at
+once, ignoring their cooldown — a release is new information, and the budget
+check is in-memory.  Without it a `ReservationFull` pod sat up to two ticks after
+the GPU it wanted came free, so a queue of jobs run one after another under one
+booking lost minutes between each.  It tells nothing: a waiter left waiting is
+re-told on the tick.
+
+**Known gaps**: a pod dropped from the queue (its window ended with no open
+booking to move to, or its booking was cancelled with no replacement) is
+re-routed only at the next watch resync (≤10 min), so its last wait Event stands
+until then; likewise a left-Pending pod whose owner then books is picked up only
+at the resync.  A window opening is acted on at the next tick, not the instant
+it opens.  **RBAC / config**: none new.  `RESERVATION_WAIT_EVENT_ENABLED=false`
+disables the three Events (the queue fixes stand).  User-facing documentation is
+`docs/POD-ANNOTATIONS.md` §5.4.
 
 ### Per-node capacity accounting
 
@@ -1778,10 +1868,11 @@ the claimed set and the grace re-arm path above applies.
 | `BEST_EFFORT_ENABLED` | `false` | Honour a pod's `galends/runtime-guarantee: none` by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation instead of a guaranteed lease (see **Best-effort admission**). Ships dark: the app must serve the best-effort create shape, and against one that does not, every such candidate takes a non-retryable 4xx into `lease.error` backoff. The pod annotation alone is deliberately *not* the opt-in — unlike `galends/force-node-capacity`, any pod author can set it |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's refusal of a JIT lease onto the waiting pod as a `Warning` Event — its **409** denial reason (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class it does not recognise (`reason=OnDemandLeaseRejected`) — so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
-| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause, or a pod-problem Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
 | `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of the "contact support" suggestion in that Event and the pod-problem Events. Unset = the suggestion names no one |
 | `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), or one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**). Throttled with the denial Event, on its cadence; `false` disables |
+| `RESERVATION_WAIT_EVENT_ENABLED` | `true` | Put an Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`WaitingForReservation`, `Normal`), the owner's other pods hold its GPUs (`ReservationFull`, naming them) or it holds fewer GPUs than the pod requests (`ReservationTooSmall`) (see **Telling the pod's owner what its reservation is waiting on**). Throttled with the denial Event, on its cadence; `false` disables |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
 | `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |

@@ -191,6 +191,12 @@ class Config:
     # on-demand admission (NoReservation), or one of its galends/* annotations
     # was ignored (AnnotationIgnored).  On the denial Event's repeat cadence.
     pod_problem_event_enabled: bool = True
+    # Tell the owner of a pod queued for one of their reservations what it is
+    # waiting on: the window has not opened (WaitingForReservation, a Normal
+    # Event), their other pods hold its GPUs (ReservationFull), or it holds
+    # fewer GPUs than the pod requests (ReservationTooSmall).  On the denial
+    # Event's repeat cadence.
+    reservation_wait_event_enabled: bool = True
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
     # Honour galends/runtime-guarantee=none by admitting the pod under a
@@ -286,6 +292,9 @@ class Config:
             ),
             support_contact=(os.environ.get("SUPPORT_CONTACT") or "").strip() or None,
             pod_problem_event_enabled=_env_bool("POD_PROBLEM_EVENT_ENABLED", True),
+            reservation_wait_event_enabled=_env_bool(
+                "RESERVATION_WAIT_EVENT_ENABLED", True
+            ),
             preemption_delegate_selection=_env_bool(
                 "PREEMPTION_DELEGATE_SELECTION", True
             ),

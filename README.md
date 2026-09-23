@@ -285,9 +285,9 @@ used to reach only the controller's log (or not even that):
 - `AnnotationIgnored` — a `galends/*` annotation was invalid or asks for
   something this cluster does not offer (`galends/runtime-guarantee` with
   best-effort admission off) and was ignored, where that changed what happens:
-  the cluster's default runtime is used instead, the pod is charged a guaranteed
-  lease instead of running best-effort, or it waits for its booking instead of
-  being admitted now.
+  the cluster's default runtime is used instead, or the pod is charged a
+  guaranteed lease instead of running best-effort.  (A pod that waits for its
+  booking instead of being admitted now is told inside the Event below.)
 
 The first two are said only once the controller holds the data that makes them
 true — a full reservation fetch, and the app's complete class list — never while
@@ -297,6 +297,29 @@ on-demand candidate), so a pod keeps one story whichever path holds it; an
 ignored annotation runs on a separate track so it never alternates with the
 hold.  `POD_PROBLEM_EVENT_ENABLED=false` disables these three.  See
 [`docs/POD-ANNOTATIONS.md` §5.3](docs/POD-ANNOTATIONS.md).
+
+**Telling the pod's owner what its reservation is waiting on** — a pod queued
+for one of its owner's reservations gets an Event saying why it is not running
+yet, on the same throttle, rather than only kube-scheduler's "untolerated taint"
+(or a `NoReservation` from before they booked):
+
+- `WaitingForReservation` (`Normal`) — the reservation has not opened; the
+  Event gives its id and window.
+- `ReservationFull` (`Warning`) — it is open, but the owner's other pods hold its
+  GPUs; the Event names them, since a forgotten notebook server is the usual
+  cause.
+- `ReservationTooSmall` (`Warning`) — it holds fewer GPUs than the pod requests,
+  so it can never admit it.
+
+When the pod waits only because it cannot be admitted on demand (a booking far
+off, full or too small), the Event says why not — including an ignored
+annotation.  The queue also now keeps each pod on a reservation that can take
+it: the booking routing chose (not a sooner, full one), one big enough over a
+sooner smaller one, and, every queue-processor tick, any of the owner's bookings
+open now with room.  When a holder is deleted or finishes, the pods waiting on
+its reservation are retried at once rather than on the next tick.
+`RESERVATION_WAIT_EVENT_ENABLED=false` disables the Events.  See
+[`docs/POD-ANNOTATIONS.md` §5.4](docs/POD-ANNOTATIONS.md).
 
 **Per-node feasibility (guard 5)** — GPUs are node-scoped: a pod requesting N
 `nvidia.com/gpu` only schedules if a *single* node has N free (Kubernetes never
@@ -520,10 +543,11 @@ All settings are supplied via environment variables.
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | no | `true` | Mirror the reservation app's refusal of a JIT lease onto the waiting pod as a `Warning` Kubernetes Event, so its owner can see why it is still Pending without access to the controller's logs: a **409** denial (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class the app does not recognise (`reason=OnDemandLeaseRejected`) — every one of which came off the pod. Informational only — the controller retries either way. A network failure or any other non-409 fault (a read-only service key, a schema mismatch) stays in the log. Set to `false` to disable |
-| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | no | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause (`ONDEMAND_PAUSE_EVENT_ENABLED`), or a pod-problem Event (`POD_PROBLEM_EVENT_ENABLED`); the name predates all but the first. The retry cadence is 2–5 min, so without this a blocked pod would accumulate a new Event every few minutes; the repeat still fires because Events expire, and a pod that is still stuck should still say so. A status that **changes** — including a switch between any two of them — is emitted immediately regardless. `0` emits on every attempt |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | no | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause (`ONDEMAND_PAUSE_EVENT_ENABLED`), a pod-problem Event (`POD_PROBLEM_EVENT_ENABLED`) or a reservation-wait Event (`RESERVATION_WAIT_EVENT_ENABLED`); the name predates all but the first. The retry cadence is 2–5 min, so without this a blocked pod would accumulate a new Event every few minutes; the repeat still fires because Events expire, and a pod that is still stuck should still say so. A status that **changes** — including a switch between any two of them — is emitted immediately regardless. `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event (`reason=OnDemandAdmissionPaused`) on every pod held by a class-wide on-demand pause — no schedulable node in the class (guard 1b), a stuck reservation holder (guard 3) or an app-side capacity overcommit (guard 4) — saying why it is still Pending and suggesting its owner contact support if it persists. Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
 | `SUPPORT_CONTACT` | no | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of that suggestion (`If this persists, contact support: <value>`), and of the pod-problem Events below. Keep it short: it is part of every such Event. Unset, the suggestion names no one |
 | `POD_PROBLEM_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the reservation app knows (`reason=UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`reason=NoReservation`), or one of its `galends/*` annotations was ignored (`reason=AnnotationIgnored`). Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
+| `RESERVATION_WAIT_EVENT_ENABLED` | no | `true` | Put a Kubernetes Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`reason=WaitingForReservation`, a `Normal` Event), the owner's other pods hold its GPUs, which are named (`reason=ReservationFull`), or it holds fewer GPUs than the pod requests (`reason=ReservationTooSmall`). Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
 | `BEST_EFFORT_ENABLED` | no | `false` | Honour a pod's `galends/runtime-guarantee: none` annotation by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation rather than a guaranteed lease — no runtime guarantee, no Service Units, preemptible from the first second. Requires an app build serving the best-effort create shape; `false` ignores the annotation entirely |
 | `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. The app endpoint is shipped but selects grant-all today, so enabling this changes no behaviour until the app carries real admission policy |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side |

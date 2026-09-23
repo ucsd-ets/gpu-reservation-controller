@@ -39,7 +39,7 @@ import socket
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Awaitable, Callable, NamedTuple, Optional
+from typing import AsyncIterator, Awaitable, Callable, NamedTuple, Optional, Sequence
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -80,11 +80,14 @@ from .k8s_client import (
     LEASE_REJECTED_REASON,
     MIN_RUNTIME_ANNOTATION,
     NO_RESERVATION_REASON,
+    RESERVATION_FULL_REASON,
+    RESERVATION_TOO_SMALL_REASON,
     RUNTIME_GUARANTEE_ANNOTATION,
     RUNTIME_GUARANTEE_VALUES,
     TERMINAL_PHASES,
     UNKNOWN_GPU_CLASS_REASON,
     USAGE_GROUP_ANNOTATION,
+    WAITING_FOR_RESERVATION_REASON,
     AnnotationProblem,
     PodWatcher,
     ReservationFacts,
@@ -99,7 +102,7 @@ from .k8s_client import (
     emit_admission_paused_event,
     emit_lease_denied_event,
     emit_overstay_relinked_event,
-    emit_pod_problem_event,
+    emit_pending_pod_event,
     emit_preempted_event,
     emit_reservation_cancelled_event,
     emit_reservation_reassigned_event,
@@ -907,6 +910,9 @@ async def _try_apply_toleration(
 
     # Optimistically reserve capacity before any await (single-threaded loop).
     state.record_placement(entry.reservation.id, uid, entry.gpu_requested)
+    # And say whose it is, for a pod left waiting on the same reservation
+    # (inert if this is rolled back: holders are looked up through occupancy).
+    state.holder_names[uid] = (entry.pod_namespace, entry.pod_name)
     try:
         # Re-fetch the pod immediately before patching so we include any
         # tolerations that arrived since we last saw it.
@@ -970,6 +976,43 @@ async def _try_apply_toleration(
         ))
         entry.next_attempt_at = _jittered_retry_at(datetime.now(timezone.utc))
         return False
+
+
+async def _retry_waiters(
+    state: ControllerState, config: Config, reservation_id: Optional[int]
+) -> None:
+    """A pod holding *reservation_id* has just gone: try the pods waiting on it.
+
+    Without this a pod waiting on a full reservation -- told its owner's other
+    pods hold it (``ReservationFull``) -- was retried only on the queue tick,
+    and after a cooldown, so it could sit up to two ticks after the GPU it
+    wanted came free: a queue of jobs run one after another under one booking
+    lost minutes between each.  A release is new information, so the cooldown
+    is not honoured here; the budget check in ``_try_apply_toleration`` is
+    in-memory, so a waiter that still does not fit costs nothing.  Nothing is
+    told from here: a waiter left waiting is re-told on the tick, which is what
+    bounds how often a reservation's churn can restate it.  *reservation_id*
+    ``None`` (the pod held nothing) is a no-op, so callers pass
+    ``release_pod``'s result straight through.
+    """
+    if reservation_id is None:
+        return
+    now = datetime.now(timezone.utc)
+    for uid, entry in list(state.task_queue.items()):
+        if (
+            entry.reservation.id != reservation_id
+            # Changed by another event while an earlier waiter was patched.
+            or state.task_queue.get(uid) is not entry
+            or not slot_start(entry.reservation) <= now < slot_end(entry.reservation)
+            # Already being admitted -- by the queue tick, mid-patch: an
+            # attempt records its placement before its first await -- or
+            # admitted and not yet dequeued.  A second attempt would only
+            # patch the pod again and post a second RuntimeGuaranteed.
+            or uid in state.occupancy.get(reservation_id, {})
+        ):
+            continue
+        if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
+            state.dequeue_pod(uid)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1106,7 @@ async def _preflight_ondemand_candidate(
             candidate.gpu_class_label,
             candidate.gpu_requested,
             candidate.group_label,
+            reservation=admittable,
         )
         entry = state.task_queue.get(uid)
         if entry is not None:
@@ -1076,6 +1120,12 @@ async def _preflight_ondemand_candidate(
             ):
                 if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
                     state.dequeue_pod(uid)
+            # Still queued -- its booking opens within the horizon -- so it now
+            # waits for that, and the newest thing it was told (a denied lease,
+            # a paused class) no longer applies: say so straight away rather
+            # than at the next tick.
+            if uid in state.task_queue:
+                await _tell_queued_status(config, state, uid, entry, fast_path_now)
         return _PREFLIGHT_REMOVE, None
 
     # A gpu-class label the app does not know can never be granted anything,
@@ -1263,9 +1313,10 @@ async def _post_pending_status(
     not running: the app refusing its lease ask (``OnDemandLeaseDenied``,
     ``OnDemandLeaseRejected``), a class-wide pause (``OnDemandAdmissionPaused``),
     nothing able to admit the pod as written (``UnknownGpuClass``,
-    ``NoReservation``) and an annotation it had to ignore
-    (``AnnotationIgnored``).  *key* is the Event's reason plus the text that
-    varies with it; *emit* writes the Event.
+    ``NoReservation``), an annotation it had to ignore (``AnnotationIgnored``)
+    and what its reservation is waiting on (``WaitingForReservation``,
+    ``ReservationFull``, ``ReservationTooSmall``).  *key* is the Event's reason
+    plus the text that varies with it; *emit* writes the Event.
 
     **Throttled by content, not only by clock.**  A key that differs from the
     last one told is new information and is emitted immediately; an unchanged
@@ -1509,7 +1560,7 @@ async def _emit_lease_rejected_event(
     await _post_pending_status(
         config, state, uid, candidate.pod_name, candidate.pod_namespace,
         (LEASE_REJECTED_REASON, message), now,
-        lambda: emit_pod_problem_event(
+        lambda: emit_pending_pod_event(
             uid, candidate.pod_name, candidate.pod_namespace, message,
             reason=LEASE_REJECTED_REASON,
             gpu_class=candidate.gpu_class_label, gpu_count=candidate.gpu_requested,
@@ -1565,7 +1616,7 @@ async def _emit_unknown_class_event(
     await _post_pending_status(
         config, state, uid, pod_name, namespace,
         (UNKNOWN_GPU_CLASS_REASON, message), now,
-        lambda: emit_pod_problem_event(
+        lambda: emit_pending_pod_event(
             uid, pod_name, namespace, message,
             reason=UNKNOWN_GPU_CLASS_REASON, gpu_class=gpu_class,
         ),
@@ -1597,35 +1648,28 @@ def _annotation_problem_clause(problem: AnnotationProblem) -> str:
 
 
 def _annotation_notice_message(
-    problems: list[AnnotationProblem], *, waits_for_reservation: bool, config: Config
+    problems: list[AnnotationProblem], *, config: Config
 ) -> str:
-    """What the owner of a pod that went ahead despite ignored annotations reads.
+    """What the owner of an on-demand candidate with ignored annotations reads.
 
-    *waits_for_reservation* is the reserved-queue case: the pod has a booking to
-    wait for, and valid annotations would have had it admitted on demand now
-    instead.  Otherwise the pod is an on-demand candidate, and that can only be
-    so with an ignored runtime if the cluster default stood in for it.
+    A candidate can only have an ignored runtime if the cluster default stood
+    in for it, and an ignored runtime guarantee means it is charged a lease.
     """
     one = len(problems) == 1
     parts = [
         f"Ignored {'an annotation' if one else 'annotations'} on this pod: "
         + "; ".join(_annotation_problem_clause(p) for p in problems) + "."
     ]
-    if waits_for_reservation:
+    if any(p.annotation == MIN_RUNTIME_ANNOTATION for p in problems):
         parts.append(
-            "It waits for its reservation to open instead of being admitted on demand."
+            f"The cluster's default minimum runtime of "
+            f"{config.default_min_runtime_seconds} seconds is used instead."
         )
-    else:
-        if any(p.annotation == MIN_RUNTIME_ANNOTATION for p in problems):
-            parts.append(
-                f"The cluster's default minimum runtime of "
-                f"{config.default_min_runtime_seconds} seconds is used instead."
-            )
-        if any(p.annotation == RUNTIME_GUARANTEE_ANNOTATION for p in problems):
-            parts.append(
-                "It is admitted with a guaranteed runtime, charged like any "
-                "on-demand lease, rather than on a best-effort basis."
-            )
+    if any(p.annotation == RUNTIME_GUARANTEE_ANNOTATION for p in problems):
+        parts.append(
+            "It is admitted with a guaranteed runtime, charged like any "
+            "on-demand lease, rather than on a best-effort basis."
+        )
     parts.append(
         f"To change that, correct the {'annotation' if one else 'annotations'} "
         f"and recreate the pod."
@@ -1641,16 +1685,15 @@ async def _emit_annotation_notice(
     namespace: str,
     problems: list[AnnotationProblem],
     now: datetime,
-    *,
-    waits_for_reservation: bool,
 ) -> None:
     """Tell the owner of a pod that went ahead which of its annotations were ignored.
 
-    For a pod that *is* being handled -- an on-demand candidate running on the
-    cluster's default runtime, or a pod left waiting for a booking it could have
-    been admitted ahead of -- where the annotation changed the outcome but
-    nothing else reports it.  A pod no path will admit is told the same thing
-    inside ``NoReservation`` instead, where it is the reason.
+    For an on-demand candidate -- running on the cluster's default runtime, or
+    charged a lease it asked to be spared -- where the annotation changed the
+    outcome but nothing else reports it.  A pod no path will admit is told the
+    same thing inside ``NoReservation`` instead, and one queued for a booking
+    inside its reservation-wait Event, where in both it is why the pod cannot
+    start on demand.
 
     On its own topic (``PENDING_TOPIC_ANNOTATIONS``): an ignored annotation
     stays true whatever holds the pod, so sharing the hold's key would make the
@@ -1658,13 +1701,11 @@ async def _emit_annotation_notice(
     """
     if not config.pod_problem_event_enabled or not problems:
         return
-    message = _annotation_notice_message(
-        problems, waits_for_reservation=waits_for_reservation, config=config
-    )
+    message = _annotation_notice_message(problems, config=config)
     await _post_pending_status(
         config, state, uid, pod_name, namespace,
         (ANNOTATION_IGNORED_REASON, message), now,
-        lambda: emit_pod_problem_event(
+        lambda: emit_pending_pod_event(
             uid, pod_name, namespace, message, reason=ANNOTATION_IGNORED_REASON,
         ),
         topic=PENDING_TOPIC_ANNOTATIONS,
@@ -1720,6 +1761,16 @@ def _ondemand_ineligibility(
     return reasons
 
 
+def _joined(clauses: Sequence[str]) -> str:
+    """*clauses* as one list in prose: ``a``, ``a; and b``, ``a; b; and c``.
+
+    Semicolons rather than commas, because the clauses themselves have commas.
+    """
+    if len(clauses) > 1:
+        return "; ".join(clauses[:-1]) + "; and " + clauses[-1]
+    return clauses[0]
+
+
 def _no_reservation_message(
     namespace: str,
     gpu_class: str,
@@ -1745,13 +1796,9 @@ def _no_reservation_message(
     else:
         todo = f"book a gpu-class {gpu_class} reservation to run it."
     todo = ("Otherwise, " + todo) if hint else (todo[0].upper() + todo[1:])
-    why = (
-        "; ".join(reasons[:-1]) + "; and " + reasons[-1]
-        if len(reasons) > 1 else reasons[0]
-    )
     return " ".join(part for part in (
         f"No GPU reservation matches this pod ({matched_on}), and it cannot be "
-        f"admitted on demand: {why}.",
+        f"admitted on demand: {_joined(reasons)}.",
         hint,
         todo,
     ) if part)
@@ -1786,9 +1833,174 @@ async def _emit_no_reservation_event(
     await _post_pending_status(
         config, state, uid, pod_name, namespace,
         (NO_RESERVATION_REASON, message), now,
-        lambda: emit_pod_problem_event(
+        lambda: emit_pending_pod_event(
             uid, pod_name, namespace, message,
             reason=NO_RESERVATION_REASON, gpu_class=gpu_class,
+        ),
+    )
+
+
+def _gpus(n: int) -> str:
+    """``1 GPU``, ``2 GPUs``."""
+    return f"{n} GPU" if n == 1 else f"{n} GPUs"
+
+
+def _reservation_phrase(entry: QueueEntry) -> str:
+    """A queued pod's reservation, as its owner would find it in the calendar.
+
+    Absolute instants only: the result ends up in a throttle key, so anything
+    relative ("opens in 20 minutes") would make every evaluation a change.
+    """
+    r = entry.reservation
+    return (
+        f"GPU reservation #{r.id} ({r.gpu_count} x {entry.gpu_class_label}, "
+        f"{local_display(slot_start(r))} to {local_display(slot_end(r))})"
+    )
+
+
+def _ondemand_meanwhile(entry: QueueEntry, when: str) -> Optional[str]:
+    """Why the pod cannot start on demand *when* (``before then``, ...), if
+    routing recorded why (``QueueEntry.ondemand_ineligibility``)."""
+    if not entry.ondemand_ineligibility:
+        return None
+    return (
+        f"It cannot be admitted on demand {when}: "
+        f"{_joined(entry.ondemand_ineligibility)}."
+    )
+
+
+def _holders_phrase(names: tuple[str, ...], others: int) -> Optional[str]:
+    """The pods holding a reservation: up to three of the owner's by name,
+    the rest counted (``ControllerState.reservation_holders``)."""
+    shown = names[:3]
+    hidden = len(names) - len(shown) + others
+    if not shown:
+        return f"{hidden} other pod{'s' if hidden != 1 else ''}" if hidden else None
+    named = (
+        f"your pod{'s' if len(shown) > 1 else ''} "
+        + ", ".join(_plain(name) for name in shown)
+    )
+    return named + (f" and {hidden} other{'s' if hidden != 1 else ''}" if hidden else "")
+
+
+def _waiting_for_reservation_message(entry: QueueEntry) -> str:
+    """What the owner of a pod queued for a reservation not yet open reads."""
+    return " ".join(part for part in (
+        f"Waiting for your {_reservation_phrase(entry)} to open; this pod will be "
+        f"admitted shortly after it does.",
+        _ondemand_meanwhile(entry, "before then"),
+    ) if part)
+
+
+def _reservation_full_message(
+    entry: QueueEntry, free: int, names: tuple[str, ...], others: int
+) -> str:
+    """What the owner of a pod whose reservation is open but taken reads.
+
+    Names the owner's pods holding it, since a forgotten notebook server is
+    the usual cause and the name is how to find it.  Changes as those pods
+    come and go -- each a real change of status, told straight away.
+    """
+    held = _holders_phrase(names, others)
+    if free:
+        what = (
+            f"Your {_reservation_phrase(entry)} has only {free} of its "
+            f"{entry.reservation.gpu_count} GPUs free, and this pod requests "
+            f"{entry.gpu_requested}" + (f"; the rest are in use by {held}" if held else "")
+            + "."
+        )
+    else:
+        what = (
+            f"Your {_reservation_phrase(entry)} is fully in use"
+            + (f" by {held}" if held else "") + "."
+        )
+    enough = _gpus(entry.gpu_requested) + (" is" if entry.gpu_requested == 1 else " are")
+    return " ".join(part for part in (
+        what,
+        f"This pod will be admitted as soon as {enough} free.",
+        _ondemand_meanwhile(entry, "meanwhile"),
+    ) if part)
+
+
+def _reservation_too_small_message(entry: QueueEntry) -> str:
+    """What the owner of a pod asking for more GPUs than its reservation holds reads.
+
+    Routing queues a pod on a reservation too small for it only when its owner
+    holds no larger one of the class, so booking one is the fix.
+    """
+    return " ".join(part for part in (
+        f"This pod requests {_gpus(entry.gpu_requested)}, but your "
+        f"{_reservation_phrase(entry)} holds only {entry.reservation.gpu_count}, "
+        f"so the pod can never be admitted under it.",
+        _ondemand_meanwhile(entry, "either"),
+        f"Book a gpu-class {entry.gpu_class_label} reservation of at least "
+        f"{_gpus(entry.gpu_requested)}, or lower the pod's nvidia.com/gpu request "
+        f"and recreate it.",
+    ) if part)
+
+
+def _queued_status(
+    state: ControllerState, entry: QueueEntry, now: datetime
+) -> Optional[tuple[str, str]]:
+    """What a pod on the reserved queue is waiting on: an Event reason and message.
+
+    ``None`` when nothing holds it there but the queue's own cadence -- the
+    window is open and has room, so the next attempt admits it, or an admission
+    error is being retried, which is an operator's to see rather than the
+    owner's.  Too small is checked first: waiting for such a reservation to
+    open would be waiting for nothing.  It also implies the owner holds no
+    larger one, so it waits, like ``NoReservation``, for a full reservation
+    fetch (``state.reservations_known``).
+    """
+    r = entry.reservation
+    if entry.gpu_requested > r.gpu_count:
+        # Queued on a reservation too small only when its owner holds nothing
+        # larger -- which only a full fetch can show (a push is a delta).
+        if not state.reservations_known:
+            return None
+        return RESERVATION_TOO_SMALL_REASON, _reservation_too_small_message(entry)
+    if now < slot_start(r):
+        return WAITING_FOR_RESERVATION_REASON, _waiting_for_reservation_message(entry)
+    free = state.available(r, exclude_uid=entry.pod_uid)
+    if free < entry.gpu_requested:
+        names, others = state.reservation_holders(
+            r.id, entry.pod_namespace, exclude_uid=entry.pod_uid
+        )
+        return RESERVATION_FULL_REASON, _reservation_full_message(entry, free, names, others)
+    return None
+
+
+async def _tell_queued_status(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    entry: QueueEntry,
+    now: datetime,
+) -> None:
+    """Tell the owner of a pod queued for one of their reservations what it waits on.
+
+    A queued pod used to get no Event at all: kube-scheduler's
+    ``FailedScheduling`` names only an untolerated taint, and the newest Event
+    the controller had put on it could be a ``NoReservation`` from before its
+    owner booked -- telling them to book what they already had.  Called where
+    the pod is routed to the queue (first sight, each watch resync, and a JIT
+    candidate rerouted to a booking) and on every queue-processor tick it
+    stays queued, through the shared throttle, so a pod waiting all afternoon
+    restates its status on the repeat interval and a change -- the window
+    opening onto a full reservation, a holder ending -- is told at once.
+    """
+    if not config.reservation_wait_event_enabled:
+        return
+    status = _queued_status(state, entry, now)
+    if status is None:
+        return
+    reason, message = status
+    await _post_pending_status(
+        config, state, uid, entry.pod_name, entry.pod_namespace,
+        (reason, message), now,
+        lambda: emit_pending_pod_event(
+            uid, entry.pod_name, entry.pod_namespace, message, reason=reason,
+            gpu_class=entry.gpu_class_label, gpu_count=entry.gpu_requested,
         ),
     )
 
@@ -2405,7 +2617,7 @@ async def pod_watch_loop(
                     # deleted pod must always be released, regardless of on-demand
                     # placement being enabled (otherwise reserved-path budget leaks until
                     # the next reconcile).
-                    state.release_pod(uid)
+                    released = state.release_pod(uid)
                     # Record any overstay before teardown removes the lease from
                     # state.reservations (so guarantee_end can still resolve the window).
                     await _report_overstay_if_any(
@@ -2414,6 +2626,9 @@ async def pod_watch_loop(
                     # If this pod was admitted under a JIT on-demand lease, release the
                     # lease too — it exists only to cover this pod (no-op for bookings).
                     await _teardown_ondemand_lease(state, client, pod)
+                    # Its GPUs are free: a pod waiting on the same reservation
+                    # need not wait for the next tick to take them.
+                    await _retry_waiters(state, config, released)
 
                 elif event_type in ("ADDED", "MODIFIED"):
                     phase = get_pod_phase(pod)
@@ -2425,9 +2640,13 @@ async def pod_watch_loop(
                     # keeps a terminal pod out of the has_tol keep-warm below, which would
                     # otherwise re-add it to occupancy on every MODIFIED event.
                     if phase in TERMINAL_PHASES:
+                        # Off the reserved queue too, or a pod that finished
+                        # before its window opened would be told it is waiting
+                        # for it until the window came round.
+                        state.dequeue_pod(uid)
                         state.remove_ondemand_candidate(uid)
                         state.forget_pending_status(uid)
-                        state.release_pod(uid)
+                        released = state.release_pod(uid)
                         # Record any overstay before teardown removes the lease from
                         # state.reservations (so guarantee_end can still resolve).
                         await _report_overstay_if_any(
@@ -2436,6 +2655,9 @@ async def pod_watch_loop(
                         # A pod that finished on its own no longer needs its JIT lease;
                         # cancel it if that's what admitted this pod (no-op otherwise).
                         await _teardown_ondemand_lease(state, client, pod)
+                        # The next job queued on the same reservation starts now,
+                        # not on the next tick.
+                        await _retry_waiters(state, config, released)
                         continue
 
                     if has_tol:
@@ -2454,6 +2676,7 @@ async def pod_watch_loop(
                         # its booking-reference id, so capacity accounting survives a restart.
                         if booking_id is not None:
                             state.record_placement(booking_id, uid, get_pod_gpu_count(pod))
+                            state.holder_names[uid] = (namespace, name)
                         continue
 
                     gpu_count = get_pod_gpu_count(pod)
@@ -2466,7 +2689,8 @@ async def pod_watch_loop(
                         # ---- reserved path: a match is open now, or opens soon ----
                         state.remove_ondemand_candidate(uid)
                         state.enqueue_pod(
-                            uid, name, namespace, gpu_class_label, gpu_count, group_label
+                            uid, name, namespace, gpu_class_label, gpu_count, group_label,
+                            reservation=admittable,
                         )
 
                         # Fast path: ADDED pod inside an open window — don't wait for
@@ -2493,6 +2717,11 @@ async def pod_watch_loop(
                                     ))
                                     if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
                                         state.dequeue_pod(uid)
+                                # Not admitted on the spot: say what it waits for
+                                # -- its window, or (having lost a race for the
+                                # last GPU) its owner's other pods.
+                                if uid in state.task_queue:
+                                    await _tell_queued_status(config, state, uid, entry, now)
                         continue
 
                     # A pod may declare that it wants no runtime guarantee at
@@ -2567,6 +2796,14 @@ async def pod_watch_loop(
                                 event="pod.routed_jit", ns=namespace, pod=name,
                                 clabel=gpu_class_label, reason="no_admittable_reservation",
                             ))
+                            # One path per pod: a pod queued for a reservation
+                            # that can no longer take it (it filled up, or the
+                            # pod lost a race for its last GPU) goes on demand
+                            # instead of being held by both.  Only here, where
+                            # the candidate is added -- a MODIFIED does not add
+                            # one, so dequeuing on it would leave the pod on
+                            # neither path until the next resync.
+                            state.dequeue_pod(uid)
                             state.add_ondemand_candidate(
                                 uid, name, namespace, gpu_class_label, gpu_count,
                                 min_rt or 0,
@@ -2578,7 +2815,6 @@ async def pod_watch_loop(
                             # told ahead of whatever the batch does with the pod.
                             await _emit_annotation_notice(
                                 config, state, uid, name, namespace, problems, now,
-                                waits_for_reservation=False,
                             )
                             # Responsive path: a newly-discovered candidate kicks an
                             # immediate admission batch covering it plus every other due
@@ -2623,27 +2859,37 @@ async def pod_watch_loop(
                     # preserve the existing wait-for-window behaviour if some future
                     # reservation matches, however far off or over budget; otherwise
                     # leave the pod Pending.
-                    any_match = state.find_best_reservation(namespace, gpu_class_label, group_label)
+                    any_match = state.find_best_reservation(
+                        namespace, gpu_class_label, group_label, gpu_count
+                    )
                     if any_match is not None:
+                        state.remove_ondemand_candidate(uid)
                         state.enqueue_pod(
-                            uid, name, namespace, gpu_class_label, gpu_count, group_label
+                            uid, name, namespace, gpu_class_label, gpu_count, group_label,
+                            reservation=any_match,
                         )
-                        # When the runtime is all that kept this pod off the
-                        # on-demand path, an ignored annotation is why it waits
-                        # for its booking instead of being admitted now.  (With
-                        # on-demand admission off, or no usage group either, the
-                        # annotation changed nothing, so there is nothing to tell.)
-                        if (
-                            config.ondemand_lease_enabled
-                            and phase == "Pending"
-                            and usage_group is not None
-                            and min_rt is None
-                            and not best_effort
-                        ):
-                            await _emit_annotation_notice(
-                                config, state, uid, name, namespace, problems, now,
-                                waits_for_reservation=True,
+                        entry = state.task_queue.get(uid)
+                        if event_type == "ADDED" and entry is not None:
+                            # This pod is queued only because it could not go on
+                            # demand, so what stops it is what would let it start
+                            # sooner: recorded for its wait Event, which also
+                            # names any annotation ignored on the way (read only
+                            # on ADDED).  Nothing to record where on-demand
+                            # admission is off -- there is no sooner to offer.
+                            entry.ondemand_ineligibility = tuple(
+                                _ondemand_ineligibility(
+                                    config,
+                                    min_runtime=min_rt,
+                                    best_effort=best_effort,
+                                    usage_group=usage_group,
+                                    problems=problems,
+                                    has_usage_group_annotation=(
+                                        own_group_annotation is not None
+                                    ),
+                                )
+                                if config.ondemand_lease_enabled else ()
                             )
+                            await _tell_queued_status(config, state, uid, entry, now)
                     elif event_type == "ADDED":
                         log.debug("%s", kv(
                             event="pod.left_pending", ns=namespace, pod=name,
@@ -2796,6 +3042,11 @@ async def _run_queue_tick(
                 if p.reservation_id is not None
             ]
         )
+        # Rebuilt alongside, so a waiting pod can be told which pods hold its
+        # reservation, and so the directory cannot outgrow the cluster.
+        state.holder_names = {
+            p.uid: (p.namespace, p.name) for p in live if p.reservation_id is not None
+        }
         # Claim every window a live holder occupies (chain-aware) before
         # declaring no-shows.
         holder_ids = [
@@ -2921,6 +3172,43 @@ async def _run_queue_tick(
 
     # --- reserved path ---
     for uid, entry in list(state.task_queue.items()):
+        # The watch runs during this loop's awaits: skip a pod it has since
+        # dequeued (deleted, admitted) or re-queued, rather than re-queue a
+        # deleted pod below or tell it anything.
+        if state.task_queue.get(uid) is not entry:
+            continue
+
+        # --- a reservation that can take the pod now beats the one it waits on ---
+        # Routing picks the best match when it sees the pod, but that is only
+        # on first sight and each watch resync: a booking made since (say, in
+        # answer to ReservationTooSmall) or one a holder has since left would
+        # otherwise wait for the next resync to be noticed.  Only a reservation
+        # open now with room qualifies, so this never trades a booking the pod
+        # is admissible under for another.
+        current = entry.reservation
+        if not (
+            slot_start(current) <= now < slot_end(current)
+            and state.available(current, exclude_uid=uid) >= entry.gpu_requested
+        ):
+            better = state.find_admittable_reservation(
+                entry.pod_namespace, entry.gpu_class_label, entry.gpu_requested,
+                now, timedelta(0), entry.group_label,
+            )
+            if better is not None and better.id != current.id:
+                log.info("%s", kv(
+                    event="pod.requeued", ns=entry.pod_namespace, pod=entry.pod_name,
+                    reason="open_reservation_with_room",
+                    **{"old.rid": current.id, "new.rid": better.id},
+                ))
+                state.enqueue_pod(
+                    uid, entry.pod_name, entry.pod_namespace, entry.gpu_class_label,
+                    entry.gpu_requested, entry.group_label, reservation=better,
+                )
+                entry = state.task_queue[uid]
+                # enqueue_pod stamps its own, later, now -- which would put the
+                # attempt below off to the next tick.
+                entry.next_attempt_at = now
+
         start = slot_start(entry.reservation)
         end = slot_end(entry.reservation)
 
@@ -2936,11 +3224,14 @@ async def _run_queue_tick(
 
         # --- window not yet open, or still in retry cooldown ---
         if now < start or now < entry.next_attempt_at:
+            await _tell_queued_status(config, state, uid, entry, now)
             continue
 
         # --- window is active: attempt to apply the toleration ---
         if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
             to_remove.append(uid)
+        elif state.task_queue.get(uid) is entry:
+            await _tell_queued_status(config, state, uid, entry, now)
 
     # Route removals through the logging helper so admissions produce a
     # "Dequeued" line, not just deletions (CODE-REVIEW D5).
