@@ -25,7 +25,7 @@ import httpx
 import pytest
 
 from app import k8s_client
-from app.controller import ControllerState, OnDemandCandidate
+from app.controller import PENDING_TOPIC_HOLD, ControllerState, OnDemandCandidate
 from app.k8s_client import emit_lease_denied_event
 from app.reservation_client import LeaseAttempt, ReservationClient
 from app.schemas import OnDemandAdmissionCandidate, OnDemandReservationRequest
@@ -260,11 +260,31 @@ class _Recorder:
         self.calls.append((uid, name, namespace, detail, gpu_class, gpu_count))
 
 
-def _run(m, monkeypatch, config, candidate, detail, now, recorder=None):
+def _run(m, monkeypatch, config, candidate, detail, now, recorder=None, state=None):
     recorder = recorder or _Recorder()
+    state = state if state is not None else _STATE
     monkeypatch.setattr(m, "emit_lease_denied_event", recorder)
-    asyncio.run(m._emit_lease_denial_event(config, "uid-1", candidate, detail, now))
+    asyncio.run(m._emit_lease_denial_event(
+        config, state, candidate.pod_uid, candidate, detail, now,
+    ))
     return recorder
+
+
+# What each test has told so far.  Reset per test (see the autouse fixture):
+# the throttle lives in ControllerState.pending_status, keyed by pod uid.
+_STATE = ControllerState()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state():
+    global _STATE
+    _STATE = ControllerState()
+    yield
+
+
+def _told(uid="uid-1"):
+    """The status last told to *uid*'s owner, or None."""
+    return _STATE.pending_status.get(uid, {}).get(PENDING_TOPIC_HOLD)
 
 
 class TestDenialEventThrottle:
@@ -274,7 +294,7 @@ class TestDenialEventThrottle:
         rec = _run(m, monkeypatch, _config(), candidate, DETAIL, NOW)
         assert len(rec.calls) == 1
         assert rec.calls[0][3] == DETAIL
-        assert candidate.status_event_at == NOW
+        assert _told().at == NOW
 
     def test_same_reason_within_the_interval_is_suppressed(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -297,7 +317,7 @@ class TestDenialEventThrottle:
         later = NOW + timedelta(minutes=31)
         _run(m, monkeypatch, _config(), candidate, DETAIL, later, rec)
         assert len(rec.calls) == 2
-        assert candidate.status_event_at == later
+        assert _told().at == later
 
     def test_a_changed_reason_emits_immediately(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -325,7 +345,7 @@ class TestDenialEventThrottle:
         rec = _run(m, monkeypatch, _config(ondemand_denial_event_enabled=False),
                    candidate, DETAIL, NOW)
         assert rec.calls == []
-        assert candidate.status_event_at is None
+        assert _told() is None
 
     @pytest.mark.parametrize("detail", [None, ""])
     def test_no_detail_emits_nothing(self, monkeypatch, detail):
@@ -346,19 +366,29 @@ class TestDenialEventThrottle:
         assert kv_fields(failed[0].getMessage())["reason"] == "OnDemandLeaseDenied"
         # Not stamped, so the next denial retries rather than being suppressed
         # for the whole repeat interval.
-        assert candidate.status_event_key is None
-        assert candidate.status_event_at is None
+        assert _told() is None
         ok = _Recorder()
         _run(m, monkeypatch, _config(), candidate, DETAIL,
              NOW + timedelta(seconds=30), ok)
         assert len(ok.calls) == 1
 
-    def test_candidates_do_not_share_throttle_state(self, monkeypatch):
+    def test_pods_do_not_share_throttle_state(self, monkeypatch):
         m = _main_module(monkeypatch)
         rec = _Recorder()
         _run(m, monkeypatch, _config(), _candidate("uid-1"), DETAIL, NOW, rec)
         _run(m, monkeypatch, _config(), _candidate("uid-2"), DETAIL, NOW, rec)
         assert len(rec.calls) == 2
+
+    def test_the_story_survives_the_candidate(self, monkeypatch):
+        # Told state is keyed by pod uid, not held on the candidate: a pod that
+        # leaves the candidate list and comes back (rerouted to a booking that
+        # then fell through, say) is not re-told an unchanged reason early.
+        m = _main_module(monkeypatch)
+        rec = _Recorder()
+        _run(m, monkeypatch, _config(), _candidate("uid-1"), DETAIL, NOW, rec)
+        _run(m, monkeypatch, _config(), _candidate("uid-1"), DETAIL,
+             NOW + timedelta(minutes=5), rec)
+        assert len(rec.calls) == 1
 
 
 # ---------------------------------------------------------------------------

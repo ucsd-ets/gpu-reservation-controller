@@ -41,8 +41,15 @@ log = logging.getLogger(__name__)
 
 # The app's documented denial code for an infeasible on-demand lease: capacity,
 # SU budget, or a policy ceiling.  Routine, expected, and worth retrying — every
-# other status is a fault the operator has to fix.
+# other status is a fault that waiting will not fix.
 LEASE_DENIED_STATUS = 409
+
+# The app's answer to a lease ask naming a user, usage group or GPU class it does
+# not recognise (or holds inactive).  Not retryable, like every non-409 4xx --
+# but unlike a read-only key or a schema mismatch, every name it can refer to
+# came off the pod (its namespace, its group label or annotation, its gpu-class
+# label), so it is the one such fault worth telling the pod's owner about.
+LEASE_NOT_FOUND_STATUS = 404
 
 
 @dataclass(frozen=True)
