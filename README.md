@@ -123,11 +123,13 @@ multi-GPU reservation.
 ┌──────────────────────────────────────────────────────┐
 │ 5. Capacity audit   (every CAPACITY_CHECK_INTERVAL)  │
 │    Compare app-side effective_gpus_today against the │
-│    GPUs physically present in the cluster:            │
-│      a. Log every per-class difference as a WARNING   │
-│      b. If app-side > physical for a class, pause new │
-│         on-demand admissions for THAT class until the │
-│         next audit finds the deficiency resolved      │
+│    GPUs physically present in the cluster:           │
+│      a. Log every per-class difference as a WARNING  │
+│      b. If app-side > physical for a class, hold new │
+│         on-demand admissions for THAT class that do  │
+│         not fit in its physical GPUs (all of them if │
+│         ONDEMAND_OVERCOMMIT_FIT=false) until the     │
+│         deficiency is resolved                       │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -238,8 +240,8 @@ filter runs ahead of `NodeResourcesFit` — so the pod's own class's nodes are
 rejected on the taint and never report a GPU verdict at all.  Requiring it held
 every candidate at "indeterminate" indefinitely on exactly the clusters this
 controller is built for.  The corresponding *physical* check is that the class
-has at least one schedulable node carrying its taint (same per-node inventory
-guard 5 uses); a fully drained class is held, not dropped, since nodes come
+has at least one schedulable, Ready node carrying its taint (same per-node
+inventory guard 5 uses); a fully drained class is held, not dropped, since nodes come
 back, and a class with no data yet does not block (fail-open).  "Fully drained"
 is judged against the classes the reservation app knows: the node inventory
 simply omits a class with no schedulable node, so each known class is recorded
@@ -272,12 +274,25 @@ it — it allows none of the class's nodes, or only full ones while another node
 has room — is left out: it says nothing about the class, and counting it would
 let one pod pinned to a busy host stall on-demand admission for everyone.
 
+**Capacity overcommit (guard 4)** — when the reservation app counts more GPUs
+for a class than the cluster physically has (a node down, say; see
+`CAPACITY_CHECK_INTERVAL`), the app would sell leases against GPUs that do not
+exist.  By default (`ONDEMAND_OVERCOMMIT_FIT=true`) the controller then grants a
+lease only if it fits in the physical GPUs for its whole duration, alongside
+every reservation already booked in that time — so a lightly loaded class keeps
+starting on-demand jobs through an outage, while a job that would collide with a
+booking starting mid-lease waits.  `ONDEMAND_OVERCOMMIT_FIT=false` instead pauses
+every on-demand admission for the class until the counts agree.  Best-effort
+pods are exempt either way.
+
 **Telling the pod's owner about a paused class** — a drained class (guard 1b),
-a stuck reservation holder (guard 3) and the capacity audit's overcommit pause
-(guard 4) hold *every* on-demand pod of a GPU class until something outside the
+a stuck reservation holder (guard 3) and the capacity audit's overcommit
+(guard 4) hold on-demand pods of a GPU class until something outside the
 pod changes, and the app is never asked, so there is no denial to relay.  Each
 pod they hold gets a `Warning` Kubernetes Event (`reason=OnDemandAdmissionPaused`)
-saying that on-demand admission for its class is paused, why in plain terms,
+saying that on-demand admission for its class is paused (for a guard-4 hold
+under `ONDEMAND_OVERCOMMIT_FIT`, *limited*, adding that a smaller or shorter job
+may start sooner), why in plain terms,
 that nothing about the pod needs to change, and to contact support if it
 persists — naming `SUPPORT_CONTACT` when that is set.
 It runs on the denial Event's throttle and cadence: a changed status is reported
@@ -589,7 +604,7 @@ All settings are supplied via environment variables.
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | no | `true` | Mirror the reservation app's refusal of a JIT lease onto the waiting pod as a `Warning` Kubernetes Event, so its owner can see why it is still Pending without access to the controller's logs: a **409** denial (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class the app does not recognise (`reason=OnDemandLeaseRejected`) — every one of which came off the pod. Informational only — the controller retries either way (rarely, for a denial the app marks `retryable: false`, which the Event says waiting will not fix). A network failure or any other non-409 fault (a read-only service key, a schema mismatch) stays in the log. Set to `false` to disable |
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | no | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause (`ONDEMAND_PAUSE_EVENT_ENABLED`), a pod-problem Event (`POD_PROBLEM_EVENT_ENABLED`) or a reservation-wait Event (`RESERVATION_WAIT_EVENT_ENABLED`); the name predates all but the first. The retry cadence is 2–5 min, so without this a blocked pod would accumulate a new Event every few minutes; the repeat still fires because Events expire, and a pod that is still stuck should still say so. A status that **changes** — including a switch between any two of them — is emitted immediately regardless. `0` emits on every attempt |
-| `ONDEMAND_PAUSE_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event (`reason=OnDemandAdmissionPaused`) on every pod held by a class-wide on-demand pause — no schedulable node in the class (guard 1b), a stuck reservation holder (guard 3) or an app-side capacity overcommit (guard 4) — saying why it is still Pending and suggesting its owner contact support if it persists. Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
+| `ONDEMAND_PAUSE_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event (`reason=OnDemandAdmissionPaused`) on every pod held by a class-level on-demand gate — no schedulable node in the class (guard 1b), a stuck reservation holder (guard 3) or an app-side capacity overcommit (guard 4) — saying why it is still Pending and suggesting its owner contact support if it persists. Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
 | `SUPPORT_CONTACT` | no | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of that suggestion (`If this persists, contact support: <value>`), and of the pod-problem Events below. Keep it short: it is part of every such Event. Unset, the suggestion names no one |
 | `POD_PROBLEM_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the reservation app knows (`reason=UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`reason=NoReservation`), one of its `galends/*` annotations was ignored (`reason=AnnotationIgnored`), or its node selector / required node affinity allows none of its class's nodes (`reason=NoMatchingNode`); plus the `Normal` `reason=WaitingForNode` while the nodes it allows are all full. Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
 | `RESERVATION_WAIT_EVENT_ENABLED` | no | `true` | Put a Kubernetes Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`reason=WaitingForReservation`, a `Normal` Event), the owner's other pods hold its GPUs, which are named (`reason=ReservationFull`), or it holds fewer GPUs than the pod requests (`reason=ReservationTooSmall`). Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
@@ -603,7 +618,8 @@ All settings are supplied via environment variables.
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
 | `PREEMPTION_DELEGATE_SELECTION` | no | `true` | Delegate preemption victim selection to the app (`POST /api/reservations/preemption-victims`) so prioritisation policy lives there; `false` (or any app-call failure) falls back to local uniform-random selection |
-| `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `effective_gpus_today` (its `total_gpus` after any date-span capacity override covering today — the count the app actually admits against) with the GPUs physically present in the cluster (per-node allocatable, or a node's `galends/force-node-capacity` override), logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
+| `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `effective_gpus_today` (its `total_gpus` after any date-span capacity override covering today — the count the app actually admits against) with the GPUs physically present in the cluster (per-node allocatable, or a node's `galends/force-node-capacity` override), logs any difference as a **WARNING**, and gates new on-demand admissions for any class the app over-counts until the deficiency clears (see `ONDEMAND_OVERCOMMIT_FIT`) |
+| `ONDEMAND_OVERCOMMIT_FIT` | no | `true` | How a class the app over-counts is gated (guard 4): grant an on-demand lease only if it fits in the physically present GPUs for its whole duration, alongside every reservation already booked in that time, so a node outage on a lightly loaded class does not stop on-demand jobs. Set to `false` to pause every on-demand admission for the class instead, until the counts agree |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
 | `ONDEMAND_MERGE_ENABLED` | no | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt (`reason="superseded"`), without waiting for the lease guarantee to lapse. Set to `false` to disable (the pod converges lazily via adoption once past its lease guarantee) |
 | `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `galends/termination-warning-*` annotations (projected kill instant, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |
@@ -924,8 +940,13 @@ GPU class record (e.g. `h100`, `a100-80gb`).
 ### 5 — Overriding a node's GPU capacity (optional)
 
 The controller's only notion of how many GPUs physically exist is
-`status.allocatable["nvidia.com/gpu"]`, summed per class over the tainted,
-schedulable nodes.  A **node** annotation overrides that reading for one node:
+`status.allocatable["nvidia.com/gpu"]`, summed per class over the tainted nodes
+that are schedulable and Ready — a cordoned, terminating or **NotReady** node is
+left out, so a GPU node that crashes stops counting as soon as Kubernetes marks
+it NotReady, without anyone cordoning it (it logs `k8s.node_excluded` at DEBUG).
+Pods still bound to a node that is left out count against nothing, and are never
+chosen to free capacity, since deleting them frees none the scheduler can use.
+A **node** annotation overrides the allocatable reading for one node:
 
 ```bash
 # This node contributes 2 GPUs to its class, whatever allocatable says
@@ -957,7 +978,7 @@ class contributes the forced number to each of them — the annotation is per no
 not per class.  A negative or unparseable value is ignored, with a
 `k8s.node_capacity_forced_invalid` **WARNING** naming the node; the node keeps
 its allocatable count.  The annotation does **not** enrol a node: an untainted,
-cordoned, or terminating node is still excluded.
+cordoned, terminating or NotReady node is still excluded.
 
 **It is a replacement, not a cap** — a value above allocatable is honoured, which
 is the operator's call and worth being deliberate about.  The controller will
@@ -966,7 +987,7 @@ it grants can leave their pods Pending.
 
 **Interaction with the capacity audit.** Forcing a class *below* the reservation
 app's `effective_gpus_today` makes that class read as over-committed, which is
-what pauses new JIT on-demand admissions for it (guard 4) and logs the hourly
+what gates new JIT on-demand admissions for it (guard 4) and logs the hourly
 `capacity_audit.mismatch` WARNING — usually the point of forcing capacity down.
 Forcing it *up* to match the app conceals a real shortage instead of fixing it;
 adjust the app-side class capacity for that.

@@ -644,15 +644,20 @@ admission for the pod's whole GPU class is on hold. Three situations do that:
   run. Admission resumes as soon as one is back.
 - **The class is short of hardware.** The reservation service expects more GPUs
   of this class than are currently online — a node is down, say. Leases sold
-  against GPUs that do not exist could never run, so on-demand admission for the
-  class stops until the two agree again.
+  against GPUs that do not exist could never run, so while the two disagree the
+  controller only starts an on-demand job that fits in the GPUs that *are*
+  online, for its whole minimum runtime, alongside everything already reserved
+  in that time. A job that does not fit waits; others of the class still start.
+  (A deployment can set this to stop on-demand admission for the class outright
+  instead.)
 - **Reserved jobs are waiting.** A pod that already holds a *reservation* for
   this GPU class has been admitted but the cluster cannot place it. Reserved
   jobs go first, so no new on-demand jobs start on the class until the waiting
   ones are running.
 
 None of these is anything the pod's owner did or can fix, so each pod held this way
-gets a `Warning` Event saying so:
+gets a `Warning` Event saying so. For a class that is short of hardware, the
+message says admission is *limited* rather than paused:
 
 ```console
 $ kubectl describe pod my-training-job
@@ -661,8 +666,14 @@ Events:
   Type     Reason                   Age   From                        Message
   ----     ------                   ----  ----                        -------
   Warning  FailedScheduling         6m3s  default-scheduler           0/41 nodes are available: ...
-  Warning  OnDemandAdmissionPaused  6m1s  gpu-reservation-controller  On-demand GPU admission for gpu-class a100 is paused: the reservation service expects more a100 GPUs than are currently online in the cluster (for example, a GPU node is down or under maintenance), so no new on-demand jobs are started on this GPU class until that is resolved. Nothing about this pod needs to change; it stays Pending and the controller keeps retrying on its own. If this persists, contact support.
+  Warning  OnDemandAdmissionPaused  6m1s  gpu-reservation-controller  On-demand GPU admission for gpu-class a100 is limited: fewer a100 GPUs are online in the cluster than the reservation service expects (for example, a GPU node is down or under maintenance), and the ones that are online are already reserved for part of the time this job would run, so it is not started until enough of them are free for its whole minimum runtime. Nothing about this pod needs to change; it stays Pending and the controller keeps retrying on its own. A job asking for fewer GPUs or a shorter galends/minimum-runtime-seconds may start sooner. If this persists, contact support.
 ```
+
+"Reserved for part of the time this job would run" can mean a booking that has
+not started yet: a job asking for three hours is held if the GPUs fill up in
+one, even when they are idle now. That is the case the message's last
+suggestion is for — a shorter minimum runtime can finish before the booking
+begins.
 
 - **Leave the pod where it is.** It is not rejected: the controller keeps
   retrying, and requests the lease itself as soon as the pause lifts.
@@ -694,7 +705,7 @@ right, reported to support.
 | `UnknownGpuClass` | The pod's `gpu-class` label is not a GPU class the reservation service knows, so no reservation can match it and it cannot be admitted on demand. The Event lists the classes that do exist. |
 | `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
 | `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, or the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis.  A pod that waits for its reservation instead of being admitted now because of one is told in its §5.4 Event instead. |
-| `NoMatchingNode` | The pod's `nodeSelector`, or the required part of its node affinity, rules out every schedulable node of its GPU class — a mistyped host name, a hardware label the class does not have, or a node that is cordoned — so it could not start there and no on-demand lease is requested for it. The Event quotes the constraint, and names any other GPU class whose nodes it *does* match, since asking for one class's hardware under another's `gpu-class` label is a common cause. The controller keeps checking on its queue interval (5 minutes by default), so a pod waiting on a cordoned node goes ahead once the node is back. |
+| `NoMatchingNode` | The pod's `nodeSelector`, or the required part of its node affinity, rules out every schedulable node of its GPU class — a mistyped host name, a hardware label the class does not have, or a node that is cordoned or down — so it could not start there and no on-demand lease is requested for it. The Event quotes the constraint, and names any other GPU class whose nodes it *does* match, since asking for one class's hardware under another's `gpu-class` label is a common cause. The controller keeps checking on its queue interval (5 minutes by default), so a pod waiting on a cordoned or down node goes ahead once the node is back. |
 
 ```console
 $ kubectl describe pod my-training-job

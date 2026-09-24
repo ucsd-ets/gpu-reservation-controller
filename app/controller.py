@@ -105,14 +105,17 @@ def free_capacity_by_class(
 
     Only pods that are ``node_resident`` and not ``terminating`` count against
     capacity — a terminating pod's GPUs are already being recovered by
-    Kubernetes and are treated as free for planning purposes.  A class absent
-    from *capacity_by_class* (unknown physical capacity) is not included in
-    the result.  A returned value may be negative, signalling an
+    Kubernetes and are treated as free for planning purposes.  Nor does a pod
+    bound to a node the snapshot excluded (``node_excluded``): that node's GPUs
+    are not in *capacity_by_class*, so subtracting the pod as well would count
+    the same GPUs out twice and report a shortfall that is not there.  A class
+    absent from *capacity_by_class* (unknown physical capacity) is not included
+    in the result.  A returned value may be negative, signalling an
     over-committed class (more GPUs in use than the snapshot says exist).
     """
     used: dict[str, int] = {}
     for p in pods:
-        if not p.node_resident or p.terminating:
+        if not p.node_resident or p.terminating or p.node_excluded:
             continue
         if p.gpu_class not in capacity_by_class:
             continue
@@ -230,11 +233,11 @@ def node_counts_by_class(
     ``{gpu_class: node count}``.  Guard 1b reads this: a lease minted for a
     class with nowhere to run is an SU charge against a pod that cannot start.
 
-    ``snapshot_node_gpu_inventory`` excludes cordoned and terminating nodes and
-    lists a class only when at least one node survives that, so a class whose
-    nodes are all cordoned or gone is not ``0`` in the inventory — it is
-    *absent*.  Read as-is, that is indistinguishable from "no data", which guard
-    1b fails open on, so the guard could never fire.  Every class in
+    ``snapshot_node_gpu_inventory`` excludes cordoned, terminating and NotReady
+    nodes and lists a class only when at least one node survives that, so a
+    class whose nodes are all cordoned, down or gone is not ``0`` in the
+    inventory — it is *absent*.  Read as-is, that is indistinguishable from "no
+    data", which guard 1b fails open on, so the guard could never fire.  Every class in
     *known_classes* (the labels the reservation app knows) is therefore recorded
     explicitly, as ``0`` when the inventory has no node for it.  A label outside
     it stays absent — unknown, never blocking — as does everything before the
@@ -365,12 +368,16 @@ class OnDemandGate(NamedTuple):
 
     Produced by :meth:`ControllerState.plan_ondemand_gates` for the periodic
     ``ondemand.gated`` WARNING (``main.ondemand_gate_warning_loop``).  Only the
-    **class-wide** gates appear — guard 1b (no schedulable node), guard 3 (a
-    stuck reservation holder) and guard 4 (app-side overcommit).  These hold
-    every candidate of the class regardless of its ask and persist until an
-    operator (or the cluster) changes something.  Guard 5 is deliberately
-    absent: it is per-candidate fragmentation that clears as pods finish, which
-    is the cluster being full rather than a fault anyone must act on.
+    gates rooted in a fault appear — guard 1b (no schedulable node), guard 3 (a
+    stuck reservation holder) and guard 4 (app-side overcommit).  These persist
+    until an operator (or the cluster) changes something.  1b and 3 hold every
+    candidate of the class regardless of its ask; so does guard 4 with
+    ``ONDEMAND_OVERCOMMIT_FIT`` off (reason ``class_overcommitted``), but with
+    it on (the default) guard 4 holds only the asks that do not fit in the
+    physical GPUs (``overcommit_no_fit``) and appears only while it is holding
+    one.  Guard 5 is deliberately absent: it is per-candidate fragmentation that
+    clears as pods finish, which is the cluster being full rather than a fault
+    anyone must act on.
 
     ``since`` is when this controller first observed the gate (at most one
     warning interval late, and reset by a restart); ``waiting`` counts the
@@ -494,6 +501,11 @@ class OnDemandCandidate:
     # of waiting for a periodic scan; other cooldowns (denial, guard-3/4) leave
     # this False so they are never short-circuited.  See main.pod_watch_loop.
     awaiting_schedule_signal: bool = False
+    # True while the candidate's latest preflight held it at guard 4 (reset at
+    # the top of every preflight).  Under ONDEMAND_OVERCOMMIT_FIT guard 4 holds
+    # only the asks that do not fit, so an over-counted class is a gate only
+    # while it is holding someone -- plan_ondemand_gates counts these.
+    held_by_overcommit: bool = False
     # The pod declared galends/runtime-guarantee: none -- it wants no runtime
     # guarantee at all, and is admitted under a zero-length, zero-SU
     # kind="best_effort" reservation rather than a guaranteed lease.  It is
@@ -542,6 +554,13 @@ class PodRuntimeView:
     # across ticks, which is what makes the notice survive a controller restart
     # (the pod's own annotation is the only record that it was warned).
     termination_warning_at: Optional[datetime] = None
+    # Bound to a node the node snapshot excluded — cordoned, being deleted,
+    # NotReady, or not carrying this pod's class taint.  Such a pod neither
+    # occupies capacity the planners count nor, if killed, frees any they could
+    # use, so free capacity ignores it and no victim pool offers it.  Set only by
+    # callers that built the views against that snapshot (the preemption sweep
+    # and the forecast); ``False`` elsewhere means "not checked".
+    node_excluded: bool = False
 
 
 @dataclass
@@ -880,18 +899,23 @@ class ControllerState:
         self.gpu_class_capacity: dict[str, int] = {}
 
         # GPU class labels found over-committed (app-side effective count >
-        # physical capacity).  New on-demand admissions are paused for any class
-        # in this set (mirrors stuck_holder_gpu_classes above); recomputed by the
-        # hourly audit *and* every queue-processor tick (main.
-        # _refresh_overcommit_pause), so a class clears within one tick once the
-        # deficiency is resolved.  Empty = no pause.
+        # physical capacity).  Guard 4 applies to any class in this set: new
+        # on-demand admissions are held unless they fit in the physical GPUs
+        # (ONDEMAND_OVERCOMMIT_FIT, the default), or all of them are
+        # (mirroring stuck_holder_gpu_classes above) when that is off.
+        # Recomputed by the hourly audit *and* every queue-processor tick
+        # (main._refresh_overcommit_pause), so a class clears within one tick
+        # once the deficiency is resolved.  Empty = guard 4 holds nothing.
         self.overcommitted_gpu_classes: set[str] = set()
 
         # Physical per-class GPU capacity from the last *successful* snapshot
-        # that recomputed overcommitted_gpu_classes (label → allocatable GPUs),
-        # kept so the ondemand.gated warning can state both sides of a guard-4
-        # overcommit, not just that one exists.  Written only alongside
-        # overcommitted_gpu_classes, so the two always describe one snapshot.
+        # that recomputed overcommitted_gpu_classes (label → allocatable GPUs).
+        # It is the capacity guard 4 fits an on-demand ask into on an
+        # over-counted class, and lets the ondemand.gated warning state both
+        # sides of the overcommit, not just that one exists.  Written only
+        # alongside overcommitted_gpu_classes, so the two always describe one
+        # snapshot -- and a label in that set with no entry here has no
+        # schedulable node at all, i.e. zero.
         self.physical_gpu_capacity: dict[str, int] = {}
 
         # Name of the pod label naming the usage group to match (REQUIRED_GROUP_LABEL),
@@ -1816,8 +1840,55 @@ class ControllerState:
                 pod=c.pod_name, poduid=pod_uid,
             ))
 
-    def plan_ondemand_gates(self, now: datetime) -> list[OnDemandGate]:
-        """Every class-wide gate currently pausing JIT on-demand admission.
+    def peak_committed_gpus(
+        self, label: str, start: datetime, end: datetime
+    ) -> tuple[int, datetime]:
+        """Return the most GPUs reservations commit to class *label* at any
+        instant of ``[start, end)``, and the first instant that peak occurs.
+
+        Guard 4's arithmetic (``main._preflight_ondemand_candidate``).  The app
+        sells an on-demand lease only if it fits in the calendar alongside
+        everything already booked, but it checks against its *own* per-class
+        count; on a class it over-counts, the controller re-runs that check
+        against the physical count, over the whole of the lease the candidate
+        would get.  Checking only the present would miss a booking that starts
+        mid-lease: its holder would find the lease pod on the GPU it paid for,
+        and boundary preemption cannot touch a pod inside its guarantee.
+
+        Counts every ``booking`` and ``on_demand`` reservation of the class
+        overlapping the window, whether or not a pod runs under it yet — a
+        booking whose holder has not arrived is exactly what a lease must not
+        crowd out.  A declared no-show is left out, as in ``boundary_demand``:
+        its capacity is already on-demand pool territory.  ``best_effort`` rows
+        hold no capacity.  Pods running past their guarantee are not counted:
+        they hold no reservation, and a booking boundary preempts them.
+
+        The count can only rise where a reservation starts, so it is evaluated
+        at *start* and at every reservation start inside the window.
+        Pure — no I/O, no state mutation.
+        """
+        rows = [
+            r for r in self.reservations
+            if r.kind in ("booking", "on_demand")
+            and r.id not in self.noshow_reservation_ids
+            and slot_start(r) < end
+            and slot_end(r) > start
+            and self._effective_label(r) == label
+        ]
+        instants = {start} | {slot_start(r) for r in rows if slot_start(r) > start}
+        peak, peak_at = 0, start
+        for t in sorted(instants):
+            committed = sum(
+                r.gpu_count for r in rows if slot_start(r) <= t < slot_end(r)
+            )
+            if committed > peak:
+                peak, peak_at = committed, t
+        return peak, peak_at
+
+    def plan_ondemand_gates(
+        self, now: datetime, *, overcommit_fit: bool
+    ) -> list[OnDemandGate]:
+        """Every gate currently pausing or limiting JIT on-demand admission.
 
         Reads the same state ``main._preflight_ondemand_candidate`` consults —
         ``class_node_counts`` (guard 1b), ``stuck_holder_gpu_classes`` (guard 3)
@@ -1825,6 +1896,14 @@ class ControllerState:
         describe a gate the preflight is not actually applying, including guard
         1b's fail-open (only a *known* zero counts) and guard 4's best-effort
         exemption (a best-effort candidate is not counted as held by it).
+
+        *overcommit_fit* is ``ONDEMAND_OVERCOMMIT_FIT``.  Off, guard 4 pauses
+        the whole over-counted class and is reported for as long as it stands,
+        like 1b and 3.  On, it holds only asks that do not fit, so the class is
+        reported only while a candidate is held by it (``held_by_overcommit``),
+        with ``waiting`` counting those.  Otherwise the warning would announce a
+        pause on a class that is admitting on-demand work; the underlying
+        mismatch still has its own hourly ``capacity_audit.mismatch`` WARNING.
 
         Side effect: maintains ``ondemand_gate_since`` — a gate seen for the
         first time is stamped *now*, and a gate no longer in force is pruned,
@@ -1855,12 +1934,22 @@ class ControllerState:
                 stuck_pods=tuple(sorted(self.stuck_holder_pods.get(label, ()))),
             )
         for label in self.overcommitted_gpu_classes:
-            add(
-                label, 4, "class_overcommitted",
-                waiting=waiting(label, count_best_effort=False),
-                app_gpus=self.gpu_class_capacity.get(label),
-                phys_gpus=self.physical_gpu_capacity.get(label),
+            counts = {
+                "app_gpus": self.gpu_class_capacity.get(label),
+                "phys_gpus": self.physical_gpu_capacity.get(label),
+            }
+            if not overcommit_fit:
+                add(
+                    label, 4, "class_overcommitted",
+                    waiting=waiting(label, count_best_effort=False), **counts,
+                )
+                continue
+            held = sum(
+                1 for c in self.ondemand_candidates.values()
+                if c.gpu_class_label == label and c.held_by_overcommit
             )
+            if held:
+                add(label, 4, "overcommit_no_fit", waiting=held, **counts)
 
         live = {(g.label, g.guard) for g in gates}
         for key in list(self.ondemand_gate_since):
@@ -2437,8 +2526,10 @@ class ControllerState:
         Per GPU class: ``kills_needed = max(0, demand - free)``.  Eligible
         candidates are pods of that class admitted by this controller
         (``reservation_id`` set), physically running or about to
-        (``node_resident``), not already ``terminating``, requesting at least
-        one GPU, and past their runtime guarantee (``guarantee_end`` is
+        (``node_resident``) on a node the snapshot counts (not
+        ``node_excluded`` — killing a pod elsewhere frees nothing the booking
+        could use), not already ``terminating``, requesting at least one GPU,
+        and past their runtime guarantee (``guarantee_end`` is
         ``None`` — unresolvable, treated as already over — or ``<= now``).  A
         pod within its guarantee is never a candidate, regardless of shortfall.
         Only classes with a non-zero shortfall are included (their candidate
@@ -2463,6 +2554,7 @@ class ControllerState:
                 if p.gpu_class == gpu_class
                 and p.reservation_id is not None
                 and p.node_resident
+                and not p.node_excluded
                 and not p.terminating
                 and p.gpu_count > 0
                 and self._past_guarantee(p, now)
@@ -2509,11 +2601,11 @@ class ControllerState:
         """Pods of *gpu_class* that headroom is allowed to consider at all.
 
         Exactly ``plan_boundary_candidates``' eligibility predicate — live,
-        node-resident, admitted by this controller, and **past its runtime
-        guarantee**.  Kept as one helper because the two headroom entry points
-        below must agree on it: a pod warned by ``plan_headroom_warnings`` that
-        ``plan_headroom_candidates`` would never consider is a warning that can
-        never come true.
+        node-resident on a node the snapshot counts, admitted by this
+        controller, and **past its runtime guarantee**.  Kept as one helper
+        because the two headroom entry points below must agree on it: a pod
+        warned by ``plan_headroom_warnings`` that ``plan_headroom_candidates``
+        would never consider is a warning that can never come true.
         """
         return [
             p
@@ -2521,6 +2613,7 @@ class ControllerState:
             if p.gpu_class == gpu_class
             and p.reservation_id is not None
             and p.node_resident
+            and not p.node_excluded
             and not p.terminating
             and p.gpu_count > 0
             and self._past_guarantee(p, now)
@@ -2713,8 +2806,8 @@ class ControllerState:
         at the real now, chains intact, via *guarantee_end_by_uid*) against
         the boundary: eligible when ``guarantee_end is None or <= boundary``
         — the sweep's phase-B outcome for that instant.  Same physical gates
-        as ``plan_boundary_candidates`` (admitted, node-resident, not
-        terminating, at least one GPU).  Pure.
+        as ``plan_boundary_candidates`` (admitted, node-resident on a counted
+        node, not terminating, at least one GPU).  Pure.
         """
         demand = self.boundary_demand(boundary, pods, now)
         kills_needed = {
@@ -2728,6 +2821,7 @@ class ControllerState:
             if (
                 p.reservation_id is None
                 or not p.node_resident
+                or p.node_excluded
                 or p.terminating
                 or p.gpu_count <= 0
             ):

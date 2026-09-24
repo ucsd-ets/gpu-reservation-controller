@@ -692,3 +692,59 @@ class TestQueueTickGuard3:
         assert state.node_free_by_node_class == {GPU_CLASS_LABEL: {"h1": 1, "h2": 1}}
         assert state.node_labels == {"h1": {HOST: "h1"}, "h2": {HOST: "h2"}}
         assert state.node_free_by_class == {GPU_CLASS_LABEL: 1}
+
+
+# ---------------------------------------------------------------------------
+# With the readiness rule: a pod pinned to a NotReady node
+# ---------------------------------------------------------------------------
+
+
+class TestPinnedToNotReadyNode:
+    """The inventory drops a NotReady node (``node_exclusion_reason``), so a pod
+    pinned to one allows no node of its class: it is told ``NoMatchingNode``
+    ("out of service"), not ``WaitingForNode``, and no lease is requested.
+    Through the real queue tick and node snapshot, not a hand-built map."""
+
+    def _tick(self, monkeypatch, *, h2_ready):
+        m = _main_module(monkeypatch)
+        ready = lambda ok: SimpleNamespace(type="Ready", status="True" if ok else "False")
+        h1 = _node("h1", GPU_CLASS_LABEL, 4, {HOST: "h1"})
+        h2 = _node("h2", GPU_CLASS_LABEL, 4, {HOST: "h2"})
+        h1.status.conditions = [ready(True)]
+        h2.status.conditions = [ready(h2_ready)]
+        monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1(nodes=[h1, h2]))
+
+        pod = _pod(node_selector={HOST: "h2"})
+
+        async def fake_read_pod(name, namespace):
+            return pod
+
+        async def _noop(*_a, **_kw):
+            return None
+
+        rec = _EventRecorder()
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        monkeypatch.setattr(m, "emit_pending_pod_event", rec)
+        monkeypatch.setattr(m, "emit_lease_denied_event", _noop)
+        monkeypatch.setattr(m, "_apply_guarantee_status", _noop)
+        monkeypatch.setattr(m, "_apply_reservation_facts", _noop)
+        state = ControllerState()
+        state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+        state.gpu_class_ids = {GPU_CLASS_LABEL: GPU_CLASS_ID}
+        state.ondemand_candidates["uid-1"] = _candidate()
+        client = _LeaseRecorder()
+        asyncio.run(m._run_queue_tick(state, client, make_config(
+            pod_adoption_enabled=False, ondemand_merge_enabled=False,
+        )))
+        return state, rec, client
+
+    def test_a_notready_pinned_node_is_no_matching_node(self, monkeypatch):
+        state, rec, client = self._tick(monkeypatch, h2_ready=False)
+        assert state.node_labels == {"h1": {HOST: "h1"}}
+        assert rec.reasons == [NO_MATCHING_NODE_REASON]
+        assert client.requests == []
+
+    def test_once_it_is_ready_the_lease_is_requested(self, monkeypatch):
+        _state_, rec, client = self._tick(monkeypatch, h2_ready=True)
+        assert rec.calls == []
+        assert len(client.requests) == 1

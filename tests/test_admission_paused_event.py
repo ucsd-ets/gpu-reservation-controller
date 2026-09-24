@@ -203,10 +203,27 @@ class TestEmitAdmissionPausedEvent:
 
 class TestAdmissionPausedMessage:
     def test_overcommit_says_what_is_happening_and_who_to_ask(self, monkeypatch):
+        # ONDEMAND_OVERCOMMIT_FIT (the default): the class is not paused -- other
+        # jobs of it are still started -- so the pod is told admission is
+        # limited, and that its own size is part of why.
         m = _main_module(monkeypatch)
         msg = m._admission_paused_message(4, GPU_CLASS_LABEL, _config())
+        assert f"gpu-class {GPU_CLASS_LABEL} is limited" in msg
+        assert "paused" not in msg
+        assert "online" in msg
+        assert "already reserved" in msg
+        assert "fewer GPUs or a shorter galends/minimum-runtime-seconds" in msg
+        assert "Nothing about this pod needs to change" in msg
+        assert msg.endswith("If this persists, contact support.")
+
+    def test_a_blanket_overcommit_pause_says_paused(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        msg = m._admission_paused_message(
+            4, GPU_CLASS_LABEL, _config(ondemand_overcommit_fit=False)
+        )
         assert f"gpu-class {GPU_CLASS_LABEL} is paused" in msg
         assert "online" in msg
+        assert "minimum-runtime" not in msg
         assert "Nothing about this pod needs to change" in msg
         assert msg.endswith("If this persists, contact support.")
 
@@ -228,12 +245,13 @@ class TestAdmissionPausedMessage:
 
     def test_the_three_causes_read_differently(self, monkeypatch):
         m = _main_module(monkeypatch)
-        config = _config()
-        messages = {
-            m._admission_paused_message(guard, GPU_CLASS_LABEL, config)
-            for guard in (1, 3, 4)
-        }
-        assert len(messages) == 3
+        for fit in (True, False):
+            config = _config(ondemand_overcommit_fit=fit)
+            messages = {
+                m._admission_paused_message(guard, GPU_CLASS_LABEL, config)
+                for guard in (1, 3, 4)
+            }
+            assert len(messages) == 3
 
     def test_a_configured_contact_is_named_last(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -252,6 +270,14 @@ class TestAdmissionPausedMessage:
             m._admission_paused_message(3, GPU_CLASS_LABEL, config)
             == m._admission_paused_message(3, GPU_CLASS_LABEL, config)
         )
+
+    def test_the_fit_hold_names_no_count_or_instant(self, monkeypatch):
+        # Guard 4's arithmetic has a count and an instant in it (committed,
+        # peak_at); neither may leak into the throttle key, or every retry
+        # would be a "changed" status.
+        m = _main_module(monkeypatch)
+        msg = m._admission_paused_message(4, GPU_CLASS_LABEL, _config())
+        assert not any(ch.isdigit() for ch in msg.replace(GPU_CLASS_LABEL, ""))
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +517,7 @@ class TestCordonedClassEndToEnd:
     unable to hold anything without a test noticing.
     """
 
-    def _tick(self, monkeypatch, *, cordoned, app_knows_class=True):
+    def _tick(self, monkeypatch, *, cordoned, app_knows_class=True, ready=None):
         from tests.test_k8s_capacity import TAINT_KEY, _FakeCoreV1, _node, _taint
 
         m = _main_module(monkeypatch)
@@ -499,6 +525,7 @@ class TestCordonedClassEndToEnd:
             _node(
                 "gpu-1", taints=[_taint(TAINT_KEY, GPU_CLASS_LABEL)],
                 allocatable={"nvidia.com/gpu": "8"}, unschedulable=cordoned,
+                ready=ready,
             ),
         ]
         monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1(nodes))
@@ -538,6 +565,16 @@ class TestCordonedClassEndToEnd:
         # nowhere to run.
         assert client.requests == []
         assert "uid-1" in state.ondemand_candidates
+
+    def test_a_class_whose_only_node_is_not_ready_is_held_too(self, monkeypatch):
+        """A crashed node is never cordoned by anyone, and still reports its
+        allocatable GPUs; only its Ready condition says it is gone.  Before the
+        snapshot read it, guard 1b let a lease through for a class with nowhere
+        to run, and only guard 3 caught it — after the SU was charged."""
+        state, rec, client = self._tick(monkeypatch, cordoned=False, ready="Unknown")
+        assert state.class_node_counts == {GPU_CLASS_LABEL: 0}
+        assert [c["guard"] for c in rec.calls] == [1]
+        assert client.requests == []
 
     def test_a_schedulable_node_lets_it_through(self, monkeypatch):
         state, rec, client = self._tick(monkeypatch, cordoned=False)

@@ -304,6 +304,32 @@ class TestRunCapacityAudit:
         asyncio.run(m._run_capacity_audit(state, SimpleNamespace()))
         assert state.overcommitted_gpu_classes == {GPU_CLASS_LABEL}
 
+    def test_a_crashed_node_pauses_the_class(self, monkeypatch):
+        """Through the real node snapshot.  A node that stops heartbeating is
+        not cordoned and keeps its last allocatable count; only its Ready
+        condition moves.  Before the snapshot read it, guard 4 could not see an
+        outage at all — only a cordon, a drain or the device plugin lowering
+        the count."""
+        import app.k8s_client as k8s_client
+        from tests.test_k8s_capacity import TAINT_KEY, _FakeCoreV1, _node, _taint
+
+        m = _main_module(monkeypatch)
+        nodes = [
+            _node(name, taints=[_taint(TAINT_KEY, GPU_CLASS_LABEL)],
+                  allocatable={"nvidia.com/gpu": "8"}, ready=ready)
+            for name, ready in (("gpu-1", "True"), ("gpu-2", "Unknown"))
+        ]
+        monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1(nodes))
+        monkeypatch.setattr(
+            m, "snapshot_node_gpu_capacity", k8s_client.snapshot_node_gpu_capacity
+        )
+        state = ControllerState()
+        state.gpu_class_capacity = {GPU_CLASS_LABEL: 16}
+
+        asyncio.run(m._run_capacity_audit(state, SimpleNamespace()))
+        assert state.physical_gpu_capacity == {GPU_CLASS_LABEL: 8}
+        assert state.overcommitted_gpu_classes == {GPU_CLASS_LABEL}
+
 
 # ---------------------------------------------------------------------------
 # Guard 4 — per-class on-demand pause in _preflight_ondemand_candidate
@@ -353,6 +379,8 @@ class _NoGrantClient:
 
 
 def test_overcommitted_class_pauses_ondemand_admission(monkeypatch):
+    # ONDEMAND_OVERCOMMIT_FIT=false: the original blanket pause.  The fitting
+    # default is covered in test_overcommit_fit.py.
     m = _main_module(monkeypatch)
     state = ControllerState()
     state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
@@ -373,6 +401,7 @@ def test_overcommitted_class_pauses_ondemand_admission(monkeypatch):
         ondemand_lease_buffer_minutes=10,
         scheduling_gate_name=None,
         ondemand_pause_event_enabled=False,
+        ondemand_overcommit_fit=False,
     )
     result = asyncio.run(
         m._try_request_lease(state, client, config, "uid-1", candidate)

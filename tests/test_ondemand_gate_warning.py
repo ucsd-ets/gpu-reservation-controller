@@ -63,7 +63,7 @@ class TestPlanOndemandGates:
     def test_nothing_gated_plans_nothing(self):
         state = ControllerState()
         state.class_node_counts = {GPU_CLASS_LABEL: 3}
-        assert state.plan_ondemand_gates(NOW) == []
+        assert state.plan_ondemand_gates(NOW, overcommit_fit=False) == []
 
     def test_overcommit_carries_both_counts_and_skips_best_effort(self):
         state = ControllerState()
@@ -76,7 +76,7 @@ class TestPlanOndemandGates:
             "c": _candidate("c", OTHER_CLASS_LABEL),
         }
 
-        [gate] = state.plan_ondemand_gates(NOW)
+        [gate] = state.plan_ondemand_gates(NOW, overcommit_fit=False)
 
         assert (gate.label, gate.guard, gate.reason) == (
             GPU_CLASS_LABEL, 4, "class_overcommitted",
@@ -90,7 +90,7 @@ class TestPlanOndemandGates:
         state.stuck_holder_pods = {GPU_CLASS_LABEL: ["bob.nb-1", "alice.nb-0"]}
         state.ondemand_candidates = {"b": _candidate("b", best_effort=True)}
 
-        [gate] = state.plan_ondemand_gates(NOW)
+        [gate] = state.plan_ondemand_gates(NOW, overcommit_fit=False)
 
         assert (gate.guard, gate.reason) == (3, "stuck_holder_interlock")
         assert gate.stuck_pods == ("alice.nb-0", "bob.nb-1")
@@ -102,7 +102,7 @@ class TestPlanOndemandGates:
         state = ControllerState()
         state.class_node_counts = {GPU_CLASS_LABEL: 0}
 
-        [gate] = state.plan_ondemand_gates(NOW)
+        [gate] = state.plan_ondemand_gates(NOW, overcommit_fit=False)
 
         assert (gate.label, gate.guard, gate.reason) == (
             GPU_CLASS_LABEL, 1, "no_class_nodes",
@@ -113,7 +113,10 @@ class TestPlanOndemandGates:
         state.overcommitted_gpu_classes = {GPU_CLASS_LABEL, OTHER_CLASS_LABEL}
         state.stuck_holder_gpu_classes = {GPU_CLASS_LABEL}
 
-        keys = [(g.label, g.guard) for g in state.plan_ondemand_gates(NOW)]
+        keys = [
+            (g.label, g.guard)
+            for g in state.plan_ondemand_gates(NOW, overcommit_fit=False)
+        ]
 
         assert keys == [
             (OTHER_CLASS_LABEL, 4), (GPU_CLASS_LABEL, 3), (GPU_CLASS_LABEL, 4),
@@ -123,17 +126,17 @@ class TestPlanOndemandGates:
         state = ControllerState()
         state.overcommitted_gpu_classes = {GPU_CLASS_LABEL}
 
-        assert state.plan_ondemand_gates(NOW)[0].since == NOW
+        assert state.plan_ondemand_gates(NOW, overcommit_fit=False)[0].since == NOW
         later = NOW + timedelta(minutes=5)
-        assert state.plan_ondemand_gates(later)[0].since == NOW
+        assert state.plan_ondemand_gates(later, overcommit_fit=False)[0].since == NOW
 
         state.overcommitted_gpu_classes = set()
-        assert state.plan_ondemand_gates(later) == []
+        assert state.plan_ondemand_gates(later, overcommit_fit=False) == []
         assert state.ondemand_gate_since == {}
 
         state.overcommitted_gpu_classes = {GPU_CLASS_LABEL}
         again = later + timedelta(minutes=1)
-        assert state.plan_ondemand_gates(again)[0].since == again
+        assert state.plan_ondemand_gates(again, overcommit_fit=False)[0].since == again
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +160,7 @@ class TestWarnOndemandGates:
         state.ondemand_candidates = {"a": _candidate("a")}
 
         with caplog.at_level(logging.WARNING, logger="app.main"):
-            m._warn_ondemand_gates(state, make_config())
+            m._warn_ondemand_gates(state, make_config(ondemand_overcommit_fit=False))
 
         [record] = [r for r in caplog.records if "event=ondemand.gated" in r.getMessage()]
         assert record.levelno == logging.WARNING
@@ -198,8 +201,11 @@ class TestWarnOndemandGates:
         state.overcommitted_gpu_classes = {GPU_CLASS_LABEL}
 
         with caplog.at_level(logging.WARNING, logger="app.main"):
-            m._warn_ondemand_gates(state, make_config())
-            m._warn_ondemand_gates(state, make_config(best_effort_enabled=True))
+            m._warn_ondemand_gates(state, make_config(ondemand_overcommit_fit=False))
+            m._warn_ondemand_gates(
+                state,
+                make_config(best_effort_enabled=True, ondemand_overcommit_fit=False),
+            )
 
         off, on = _gated_lines(caplog)
         assert "Best-effort" not in off["detail"]

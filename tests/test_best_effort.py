@@ -319,6 +319,7 @@ def _preflight_config(**overrides):
         scheduling_gate_name=None,
         ondemand_denial_event_enabled=False,
         ondemand_pause_event_enabled=False,
+        ondemand_overcommit_fit=True,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -355,12 +356,36 @@ class TestGuardFourExemption:
         assert ask is not None
 
     def test_it_still_blocks_a_guaranteed_lease(self, monkeypatch):
+        # A guaranteed lease is held when it does not fit in the physical GPUs:
+        # here all 4 are committed to a booking already open.
         m = _main_module(monkeypatch)
+        now = datetime.now(timezone.utc)
         state = _state_ready()
+        state.reservations = [reservation(
+            900, start_utc=now - timedelta(hours=1),
+            end_utc=now + timedelta(hours=3), username="bob", gpu_count=4,
+        )]
         state.overcommitted_gpu_classes = {GPU_CLASS_LABEL}
+        state.physical_gpu_capacity = {GPU_CLASS_LABEL: 4}
         state.node_free_by_class = {GPU_CLASS_LABEL: 4}
         status, _ = _run_preflight(monkeypatch, m, state, _candidate("uid-1"))
         assert status == m._PREFLIGHT_RETRY
+
+    def test_best_effort_ignores_the_committed_calendar_too(self, monkeypatch):
+        # The same booking-full class: guard 4 still does not apply, and guard 5
+        # (a free GPU on some node) is the only physical bound.
+        m = _main_module(monkeypatch)
+        now = datetime.now(timezone.utc)
+        state = _state_ready()
+        state.reservations = [reservation(
+            900, start_utc=now - timedelta(hours=1),
+            end_utc=now + timedelta(hours=3), username="bob", gpu_count=4,
+        )]
+        state.overcommitted_gpu_classes = {GPU_CLASS_LABEL}
+        state.physical_gpu_capacity = {GPU_CLASS_LABEL: 4}
+        state.node_free_by_class = {GPU_CLASS_LABEL: 1}
+        status, _ = _run_preflight(monkeypatch, m, state, _be_candidate())
+        assert status == m._PREFLIGHT_READY
 
 
 class TestGuardFiveAtEveryGpuCount:

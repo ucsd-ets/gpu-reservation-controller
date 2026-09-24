@@ -17,6 +17,7 @@ is_gpu_gated_pending(pod, taint_key)         — guard 1: is Pending fixable by 
 read_pod(name, namespace)                    — fetch current pod object
 snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
 get_node_forced_gpu_capacity(node)           — read galends/force-node-capacity annotation
+node_exclusion_reason(node)                  — why a node's GPUs are not placeable (cordoned/deleting/NotReady)
 snapshot_node_gpu_inventory(taint_key)       — one LIST → allocatable GPUs per class, per node
 snapshot_node_gpu_capacity(taint_key)        — per-class collapse of the inventory (preemption planning)
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
@@ -1169,6 +1170,45 @@ def get_node_forced_gpu_capacity(node) -> Optional[int]:
     return value
 
 
+def node_exclusion_reason(node) -> Optional[str]:
+    """Return why *node*'s GPUs are not placeable, or ``None`` when they are.
+
+    ``cordoned`` (``spec.unschedulable``), ``deleting`` (``deletionTimestamp``
+    set) or ``not_ready`` (its ``Ready`` condition is ``False`` or ``Unknown``).
+
+    ``not_ready`` is the one a crashed node produces.  Nothing about a node that
+    stops heartbeating touches ``spec.unschedulable`` or ``status.allocatable``
+    — the kubelet is the only writer of the latter, and it is the thing that is
+    down — so without this check a dead node kept contributing every GPU it last
+    reported until someone cordoned it.  Worse, once the taint-based eviction
+    deletes its pods (after the default 300 s ``unreachable`` toleration) they
+    sit ``Terminating`` for as long as the kubelet is gone, and a terminating
+    pod's GPUs count as free, so the dead node read as *wholly free*.  The
+    scheduler places nothing there meanwhile (the node lifecycle controller
+    taints it ``node.kubernetes.io/not-ready`` / ``unreachable:NoSchedule``),
+    which is the sense in which its GPUs are not placeable.
+
+    No grace period is added on top of the one Kubernetes already applies
+    (``Unknown`` is set only after ``node-monitor-grace-period``): the scheduler
+    stops placing pods there at the same moment, so capacity the controller kept
+    counting past that point would be capacity nothing can use.
+
+    A node reporting **no** ``Ready`` condition is kept.  A real kubelet posts one
+    within seconds of registering, so its absence says nothing reliable about the
+    node — and dropping capacity on missing data would pause admission or start
+    a preemption on the strength of it.
+    """
+    if node.spec and node.spec.unschedulable:
+        return "cordoned"
+    if node.metadata.deletion_timestamp is not None:
+        return "deleting"
+    conditions = (getattr(node.status, "conditions", None) if node.status else None) or []
+    for condition in conditions:
+        if getattr(condition, "type", None) == "Ready":
+            return None if getattr(condition, "status", None) == "True" else "not_ready"
+    return None
+
+
 async def snapshot_node_gpu_inventory(
     taint_key: str,
     gpu_resource: str = "nvidia.com/gpu",
@@ -1180,8 +1220,12 @@ async def snapshot_node_gpu_inventory(
     LISTs all nodes and, for each node carrying a *taint_key* taint, records
     ``status.allocatable[gpu_resource]`` under ``{taint_value: {node_name: gpus}}``
     (the GPU-class label mirrors the toleration the controller applies to pods).
-    Nodes that are cordoned (``spec.unschedulable``) or being deleted are
-    excluded — their GPUs are not placeable.
+    Nodes that are cordoned (``spec.unschedulable``), being deleted, or NotReady
+    are excluded — their GPUs are not placeable (see ``node_exclusion_reason``).
+    A pod still bound to an excluded node therefore occupies no capacity this map
+    counts; the planners that subtract pod usage from it must skip such a pod
+    (``PodRuntimeView.node_excluded``), or they read the node's absence as a
+    shortfall.
 
     A node carrying the ``galends/force-node-capacity`` annotation contributes
     that number instead of its allocatable count (see
@@ -1204,13 +1248,17 @@ async def snapshot_node_gpu_inventory(
     node_list = await _run(_core_v1.list_node)
     inventory: dict[str, dict[str, int]] = {}
     for node in node_list.items:
-        if node.spec and node.spec.unschedulable:
-            continue
-        if node.metadata.deletion_timestamp is not None:
-            continue
         taints = node.spec.taints if (node.spec and node.spec.taints) else []
         classes = {t.value for t in taints if t.key == taint_key and t.value}
         if not classes:
+            continue
+        # Checked after the taint so only GPU nodes are logged: a cordoned or
+        # NotReady node outside every class is none of this snapshot's business.
+        excluded = node_exclusion_reason(node)
+        if excluded is not None:
+            log.debug("%s", kv(
+                event="k8s.node_excluded", node=node.metadata.name, reason=excluded,
+            ))
             continue
         allocatable = (node.status.allocatable or {}) if node.status else {}
         raw = allocatable.get(gpu_resource, "0")

@@ -178,9 +178,17 @@ config:
   # Each audit compares the reservation app's per-class effective_gpus_today
   # (its configured count after any capacity override covering today) against
   # the GPUs physically present in the cluster, logs any difference as a
-  # WARNING, and pauses new on-demand admissions for any class the app
-  # over-counts (that pause is also re-checked every queue-processor tick).
+  # WARNING, and gates new on-demand admissions for any class the app
+  # over-counts (see ondemandOvercommitFit below; the gated set is also
+  # re-checked every queue-processor tick).
   capacityCheckInterval: 3600
+
+  # How an over-counted class is gated.  true: admit an on-demand lease only if
+  # it fits in the GPUs physically present for its whole duration, alongside
+  # every reservation already booked in that time -- so a node outage on a
+  # lightly loaded class does not stop on-demand jobs.  false: pause every
+  # on-demand admission for the class until the counts agree.
+  ondemandOvercommitFit: true
 
   # Re-link an overstay pod (one running past its runtime guarantee) to a
   # reservation the same user has since booked, so it is no longer eligible
