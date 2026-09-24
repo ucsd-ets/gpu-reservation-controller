@@ -207,8 +207,8 @@ Four things about that loop:
   period entirely (§5). An interactive session should do the opposite: warn the
   user and keep going, since the pod may well survive (§8 rule 3).
 - **Show the message, don't parse it.** `termination-warning-message` is a
-  finished English sentence in the deployment's local zone, so echoing it is
-  right and reading a timestamp back out of it is not. If the script needs the
+  finished English sentence in the deployment's display zone (§5), so echoing
+  it is right and reading a timestamp back out of it is not. If the script needs the
   instant, use `termination-warning-at`, which is UTC:
   `secs_left=$(( $(date -u -d "$(cat "$PODINFO/termination-warning-at")" +%s) - $(date -u +%s) ))`
   — and treat a negative result as "may be stopped at any time" (§8 rule 3),
@@ -221,17 +221,17 @@ Four things about that loop:
 | Key | Written | Value | Lifecycle |
 |-----|---------|-------|-----------|
 | `galends/booking-reference` | at admission | `res-<id>`, e.g. `res-4812` — the reservation the pod is running under | Rewritten when the pod is re-linked to another reservation (adoption / lease→booking merge). Its **presence is the signal that the controller manages this pod**. |
-| `galends/guarantee-status` | at admission, refreshed | `guaranteed` \| `overstay` | `guaranteed` at admission; flips to `overstay` once the guarantee lapses. Never removed while the pod lives. |
-| `galends/guaranteed-until` | at admission, refreshed | absolute UTC instant, `YYYY-MM-DDTHH:MM:SSZ` | Kept *live* while `guaranteed` — it can move **later** if the user books an abutting follow-on window. Once `overstay` it is frozen at its now-past value. |
-| `galends/pod-runtime-limit-seconds` | at admission | integer seconds, e.g. `10800` | The guaranteed *duration* at the moment it was recorded. **Not** refreshed as the guarantee grows — for a countdown, use `guaranteed-until`, not this. |
-| `galends/reservation-kind` | at admission, refreshed | `booking` \| `on_demand` | Describes the reservation the pod is *currently* linked to. Changes when the pod is re-linked to a **different** reservation, and is re-stamped when its **current** one is altered in place (a lease window extended). |
+| `galends/guarantee-status` | at admission, refreshed | `guaranteed` \| `overstay` | `guaranteed` at admission and again on a re-link; flips to `overstay` once the guarantee lapses, noticed on the controller's next queue tick (§7) — which is also how a best-effort pod reaches `overstay` (§3.1). Never removed while the pod lives. |
+| `galends/guaranteed-until` | at admission, refreshed | absolute UTC instant, `YYYY-MM-DDTHH:MM:SSZ` | Kept *live* while `guaranteed` — it can move **later** if the user books an abutting follow-on window. Rewritten to the new reservation's guarantee on a re-link. Once `overstay` it is frozen at its now-past value. |
+| `galends/pod-runtime-limit-seconds` | at admission and on each re-link | integer seconds, e.g. `10800`; `0` for a best-effort pod (§3.1) | The guaranteed *duration* at the moment it was recorded — rewritten when the pod is re-linked to another reservation, but **not** refreshed as the guarantee grows. For a countdown, use `guaranteed-until`, not this. |
+| `galends/reservation-kind` | at admission, refreshed | `booking` \| `on_demand` \| `best_effort` | Describes the reservation the pod is *currently* linked to. Changes when the pod is re-linked to a **different** reservation, and is re-stamped when its **current** one is altered in place (a lease window extended). |
 | `galends/reservation-start` / `galends/reservation-end` | at admission, refreshed | absolute UTC instant, same format | The reservation's **own** window — not the guarantee end. `-end` moves later when the reservation is extended in place. Same lifecycle otherwise. |
 | `galends/reservation-gpu-count` | at admission, refreshed | integer, e.g. `4` | GPUs the *reservation* holds, not what the pod requested. Same lifecycle. |
 | `galends/gpu-class-name` | at admission, refreshed | display name, e.g. `H100` | Same lifecycle. |
 | `galends/admitted-at` | at first admission only | absolute UTC instant, same format | Written once and never rewritten — a re-link is not a new admission. Never removed while the pod lives. |
 | `galends/termination-warning-at` | while at risk | absolute UTC instant, same format | **Appears and disappears.** Present only while the pod is in the at-risk pool; all three warning keys are removed together when the risk clears. |
 | `galends/termination-warning-risk` | while at risk | decimal string in `(0, 1]`, 2 dp, e.g. `0.33` | Same lifecycle. |
-| `galends/termination-warning-message` | while at risk | human-readable English sentence | Same lifecycle. Rendered deterministically from the other two plus the cause — the start of the booking that needs the GPUs (which is later than `-at` for a proactive kill), or holding GPUs free for on-demand jobs, where no booking is involved; safe to display verbatim. **The one value here that is not UTC**: its instant reads in the deployment's local zone (e.g. `2026-08-21 10:30:16 PDT`), because it is prose for a person rather than a value to parse. Parse `-at` instead. |
+| `galends/termination-warning-message` | while at risk | human-readable English sentence | Same lifecycle. Rendered deterministically from the other two plus the cause — the start of the booking that needs the GPUs (which is later than `-at` for a proactive kill), or holding GPUs free for on-demand jobs, where no booking is involved; safe to display verbatim. **The one value here not in the UTC wire format**: its instants read in the deployment's display zone (e.g. `2026-08-21 10:30:16 PDT` — or `… UTC` where the deployment sets none, §5), because it is prose for a person rather than a value to parse. Parse `-at` instead. |
 
 ### What each one means
 
@@ -245,7 +245,9 @@ short lease on their behalf, just-in-time — that lease is a real reservation, 
 charged for it, and it is protected by the same runtime guarantee, but the user
 never asked for it and will not recognise it from their calendar. Say so plainly
 ("started on an on-demand lease until 16:10") rather than calling it "your
-reservation".
+reservation". `best_effort` means the pod asked to run with no guarantee at all
+(§3.1): nothing is reserved, nothing is charged, and the pod is preemptible from
+its first second.
 
 `reservation-start`/`-end` are that reservation's **own** window, which is *not*
 the same as `guaranteed-until`: the guarantee runs to the end of the back-to-back
@@ -268,13 +270,15 @@ started mid-window).
 **`galends/guaranteed-until` — the runtime guarantee.** The instant until which
 this pod's GPU access is protected. It is the end of the pod's current
 reservation window, extended through any directly back-to-back follow-on
-reservations by the same owner for the same GPU class and GPU count. Inside the
+bookings by the same owner for the same GPU class and GPU count (and the same
+usage group, on a cluster that matches pods to reservations by group). Inside the
 guarantee the pod is **never** preempted by the controller, however severe the
 cluster shortfall.
 
-Past that instant the pod is not killed either — it keeps running until some
-*other* reservation actually needs the capacity. That is the `overstay` state:
-still running, no longer protected.
+Past that instant the pod is not killed either — it keeps running until a
+booking starting on its GPU class actually needs the capacity, or, on a cluster
+that holds GPUs free for on-demand jobs, that goal does (below). That is the
+`overstay` state: still running, no longer protected.
 
 **`galends/termination-warning-at` — the projected kill instant.** Present only
 while the controller has identified this pod as an eligible victim in a GPU class
@@ -306,9 +310,10 @@ eligible pool that has to be killed, `min(1, shortfall / pool_gpus)`.
 `1.00` means the whole pool is needed and the pod will almost certainly be
 picked; `0.20` means roughly a one-in-five chance. Pool *membership* is exact;
 the number models uniform-random victim selection, which is the controller's
-local fallback — when victim selection is delegated to the reservation app, the
-app's policy may differ. Render it as a coarse band ("possible" / "likely"),
-not as a precise probability.
+local fallback — when victim selection is delegated to the reservation app (the
+default), the app's policy decides instead, and it currently takes best-effort
+pods before leases and leases before bookings (§3.1). Render it as a coarse band
+("possible" / "likely"), not as a precise probability.
 
 ## 3. Annotations the controller *reads* (job inputs)
 
@@ -317,13 +322,35 @@ them. Worth surfacing read-only in a UI, since they explain admission behaviour:
 
 | Key | Purpose |
 |-----|---------|
-| `galends/minimum-runtime-seconds` | **Positive** integer. Required for a pod to be eligible for a just-in-time on-demand lease when no reservation is open; also sizes that lease. A pod without it simply waits for a matching reservation. `0` is **not** a way to ask for no guarantee — it is rejected with a `pod.annotation_invalid` warning; use `galends/runtime-guarantee` below. |
-| `galends/runtime-guarantee` | `none` — "admit me with no runtime guarantee at all". See §3.1. Any other value is ignored with a warning, as is `none` itself on a cluster without best-effort admission. |
+| `galends/minimum-runtime-seconds` | **Positive** integer. Required (unless the pod is best-effort, §3.1) for a pod to be admitted on demand, under a just-in-time lease, when none of its owner's reservations can take it — see *Wait or lease* below. Also sizes that lease: the runtime plus a buffer (`ONDEMAND_LEASE_BUFFER_MINUTES`, default 10). A pod without it waits for a matching reservation if its owner holds one (§5.4), and otherwise is told nothing will admit it (`NoReservation`, §5.3). `0` is **not** a way to ask for no guarantee — it is rejected with a `pod.annotation_invalid` warning; use `galends/runtime-guarantee` below. |
+| `galends/runtime-guarantee` | `none` — "admit me with no runtime guarantee at all". See §3.1. Any other value is ignored with a `pod.annotation_invalid` warning in the controller's log. On a cluster without best-effort admission the annotation is ignored whatever it says, and not even read, so nothing is logged — the pod's own Events still say so wherever it changes what happens (§5.3). |
 | `galends/usage-group` | The usage group a JIT lease is created under. Required for JIT eligibility unless the deployment identifies the group through a pod *label* instead (`REQUIRED_GROUP_LABEL`). |
 
 A value the controller has to ignore is reported on the pod itself, not only in
 the controller's log, wherever ignoring it changes what happens to the pod — see
 `AnnotationIgnored` and `NoReservation` in §5.3.
+
+**Wait or lease.** These annotations decide whether a pod *can* be admitted on
+demand; whether it *is* depends first on its owner's bookings. The controller
+routes a pod by taking the first of these that applies:
+
+1. A booking of the owner's for the pod's GPU class (and usage group, where the
+   cluster matches by group) that is open now, or opens within
+   `ONDEMAND_HORIZON_MINUTES` (default 30), and has enough GPUs free for the pod:
+   the pod waits for it — and is admitted at once if it is already open — **even
+   if it qualifies for an on-demand lease**.
+2. Otherwise, if the pod qualifies for on-demand admission, a lease is requested
+   for it straight away. Each retry re-checks step 1, so a pod whose booking comes
+   within the horizon while it waits switches to waiting for the booking.
+3. Otherwise, if any booking of the owner's matches at all — further off, full,
+   or holding fewer GPUs than the pod asks for — the pod waits for that (§5.4);
+   on a cluster that offers on-demand admission its Event also says why it
+   cannot go on demand instead.
+4. Otherwise nothing will ever admit the pod as written: `NoReservation`, or
+   `UnknownGpuClass` if its class label is wrong (§5.3).
+
+A pod that starts on a lease before its owner's booking opens is moved onto the
+booking as it opens, and the lease is retired (§5, §8 rule 6).
 
 The pod's `gpu-class` **label** (not an annotation, so it is not in this file
 unless you also project `metadata.labels`) names the GPU class.
@@ -355,10 +382,18 @@ What that buys, and what it costs:
 - **No Service Units are charged.** The reservation minted for the pod is a
   zero-length stub whose only job is to record that the pod was admitted.
 - **No guarantee, from the first second.** The pod is a preemption candidate
-  immediately. It is not preempted *arbitrarily* — the controller still only
-  reclaims capacity that something else actually needs, and it sacrifices
-  best-effort pods before leases and leases before bookings — but nothing
-  protects it, and no minimum runtime applies.
+  immediately, and nothing protects it — no minimum runtime applies. It is not
+  preempted *arbitrarily*, though: the controller reclaims GPUs only when a
+  booking starting on the pod's GPU class needs them, or — on a cluster that
+  holds a share of each class free for on-demand jobs (`HEADROOM_TARGET_PERCENT`,
+  off by default) — to restore that share. Another on-demand job arriving does
+  not by itself displace anyone. When GPUs are reclaimed, which eligible pods go
+  is by default the reservation service's choice, and its policy takes
+  best-effort pods before leases and leases before bookings; if the controller
+  cannot reach the service (or is configured not to ask), it picks at random
+  among the eligible pods, best-effort or not. (The `BestEffortAdmitted` Event
+  puts this more loosely — "as soon as any other job needs the capacity"; this
+  is the precise version.)
 - **It still has to fit.** Group membership, GPU-class access, per-reservation
   GPU caps and group validity dates all apply exactly as for a lease, and the
   controller will not admit the pod unless a node physically has the GPUs free.
@@ -373,21 +408,30 @@ What that buys, and what it costs:
 present — there is nothing to size. The two compose without conflict: a pod may
 declare a runtime it *hopes* for and still waive the guarantee.
 
-**How it reads once admitted.** Two annotations look alarming and are not:
-`galends/guarantee-status` is `overstay` for the pod's whole life, and
-`galends/guaranteed-until` is the instant it started. Both are literally true —
-the guarantee ended when it began. `galends/reservation-kind: best_effort` is
-what distinguishes this from a job that really did outstay a guarantee, so a UI
-should check that first and show something like *"best-effort — no guarantee"*
-rather than *"overstaying"*. The admission Event is `BestEffortAdmitted`, not
-`RuntimeGuaranteed`.
+**How it reads once admitted.** Three annotations look odd and are not:
+`galends/guaranteed-until` is the moment the pod was admitted,
+`galends/pod-runtime-limit-seconds` is `0`, and `galends/guarantee-status` is
+`overstay` for the rest of the pod's life. All three are literally true — the
+guarantee ended when it began. The one wrinkle is that the admission write sets
+`guarantee-status` to `guaranteed`, as every admission does, and it flips to
+`overstay` only at the controller's next queue tick (§7), so for the first few
+minutes it reads `guaranteed`; a UI that compares `guaranteed-until` with the
+clock, as §4 does, is right from the first second. `galends/reservation-kind:
+best_effort` is what distinguishes this from a job that really did outstay a
+guarantee, so a UI should check that first and show something like
+*"best-effort — no guarantee"* rather than *"overstaying"*. The admission Event
+is `BestEffortAdmitted`, not `RuntimeGuaranteed`.
+
+If the pod's owner then holds a booking of the class that is open with room
+for the pod, the pod is moved onto it and gains that booking's guarantee
+(`OverstayRelinked`, §5) — the same rescue as any other pod past its guarantee.
 
 This is an opt-in the **deployment** must also enable (`BEST_EFFORT_ENABLED`);
 where it is off, the annotation is ignored and the pod is handled as before.
 
 ### The whole `galends/` namespace leaves the cluster
 
-The two keys above are the ones the controller itself acts on, but they are not
+The keys above are the ones the controller itself acts on, but they are not
 the only ones it *sends*. When a pod is waiting for a just-in-time lease and the
 deployment delegates that decision to the reservation app
 (`ONDEMAND_DELEGATE_ADMISSION`), the controller offers the pod to the app along
@@ -435,7 +479,7 @@ def status(ann: dict[str, str], now=None):
     if in_guarantee and at_risk:
         return "guarantee-ending"# protected now, flagged to be reclaimed when it lapses
     if at_risk:
-        return "at-risk"         # past guarantee AND wanted by an incoming reservation
+        return "at-risk"         # past guarantee AND its GPUs wanted (a booking, or headroom)
     return "overstay"            # past guarantee, nothing wants the capacity right now
 ```
 
@@ -454,17 +498,23 @@ Countdowns should target `guaranteed-until` (state `guaranteed`) or
 current time. Every timestamp you parse is UTC with an explicit `Z`; parse as
 timezone-aware and render in the user's local zone.
 
-The single exception is `galends/termination-warning-message`, whose instant is
-*already* local — it is a finished sentence for a person, not a field, which is
-why the advice for it is "display verbatim" and never "parse". Its local zone is
-the controller deployment's, so if your users are somewhere else, build your own
-copy from `-at` and `-risk` rather than showing the message.
+The single exception is `galends/termination-warning-message`, whose instants
+are *already* rendered for display — it is a finished sentence for a person, not
+a field, which is why the advice for it is "display verbatim" and never "parse".
+Its zone is whatever the controller deployment configures for display, and UTC
+where it configures none (§5), so if your users are somewhere else, build your
+own copy from `-at` and `-risk` rather than showing the message.
 
 The state above is orthogonal to `reservation-kind`, which sets the *noun* in
 that copy: a `guaranteed` pod on a `booking` has "your reservation until 20:00",
 the same pod on an `on_demand` lease has "an on-demand lease until 20:00". Both
 are real reservations charged in SU, so neither is "free" or "best-effort"
-capacity — the difference is only whether the user asked for it.
+capacity — the difference is only whether the user asked for it. A
+`best_effort` pod is the one that genuinely is: nothing reserved, nothing
+charged, no guarantee at any point. It is only ever `overstay` or `at-risk` by
+the logic above, so give it its own copy — *"best-effort — no guarantee"* — not
+the overstay text, which would tell the user they ran past a reservation they
+never had (§3.1).
 
 Three things to *avoid* claiming in copy: don't say the job "will be terminated
 at" the warning time (it is the earliest possible moment, not a schedule); don't
@@ -483,7 +533,10 @@ should do it on the warning, not on `SIGTERM` — the grace period is whatever t
 pod spec sets, typically 30 s. §6 covers how to do that for a PyTorch job.
 
 The controller also emits Kubernetes **Events** against the pod
-(`RuntimeGuaranteed` at admission, `OverstayRelinked` when a pod running past its
+(`RuntimeGuaranteed` at admission, stating the guarantee — and again each time
+the pod is re-linked, immediately before the re-link Event, stating the new one —
+or `BestEffortAdmitted` in its place for a pod admitted with no guarantee
+(§3.1), `OverstayRelinked` when a pod running past its
 guarantee is re-linked to a reservation you have since booked,
 `ReservationRelinked` when a pod is moved to another of your reservations for
 any other reason — its on-demand lease merged into your booking as that booking
@@ -499,9 +552,15 @@ needs fixing — §5.3 — and `WaitingForReservation`, `ReservationFull` and
 These are richer
 than the annotations but need Kubernetes API access to read, so they are for
 whoever runs `kubectl` — the pod's owner, an operator, a dashboard — rather than
-for in-pod consumers. Being addressed to a person, their messages state times in
-the deployment's local zone (`2026-08-21 10:30:16 PDT`) rather than the UTC the
-annotations carry.
+for in-pod consumers. Being addressed to a person, their messages state times
+in the deployment's display zone, with the zone named
+(`2026-08-21 10:30:16 PDT`), rather than in the UTC wire format the annotations
+carry. That zone is local only if the deployment sets one (`TZ`, or
+`EVENT_DISPLAY_TIMEZONE` for the messages alone); one that sets neither — the
+Helm chart's default — renders them in UTC (`2026-08-21 17:30:16 UTC`). The
+Event examples in this document show a deployment set to US Pacific time.
+§5.5 covers what the controller does to a reservation without any Event, and
+§5.6 the states in which it says nothing at all.
 
 Two deletions are **not** preceded by a termination warning, because nothing
 predicts them — they follow a person's action on the reservation, and the pod
@@ -591,7 +650,7 @@ admission for the pod's whole GPU class is on hold. Three situations do that:
   jobs go first, so no new on-demand jobs start on the class until the waiting
   ones are running.
 
-Neither is anything the pod's owner did or can fix, so each pod held this way
+None of these is anything the pod's owner did or can fix, so each pod held this way
 gets a `Warning` Event saying so:
 
 ```console
@@ -685,16 +744,89 @@ Events:
 - **Why it cannot start on demand instead.**  When the pod waits only because
   it does not qualify for on-demand admission — the reservation is far off, full
   or too small — the Event ends by saying why not: no (or an invalid)
-  `galends/minimum-runtime-seconds`, no usage group, or on-demand admission
-  switched off.  Fix that and recreate the pod to be admitted on demand while
-  you wait (charged like any on-demand lease).  A pod whose reservation opens
-  within the next half hour or so waits for it either way.
+  `galends/minimum-runtime-seconds`, or no usage group.  Fix that and recreate
+  the pod to be admitted on demand while you wait (charged like any on-demand
+  lease).  On a cluster with on-demand admission switched off there is nothing
+  sooner to offer, and the Event says nothing about it.  A pod whose reservation
+  opens within `ONDEMAND_HORIZON_MINUTES` (default 30) and has room waits for it
+  either way (§3, *Wait or lease*).
 - **Same schedule as §5.1–§5.3**: a changed status at once — the window
   opening onto a full reservation, a different pod holding it — and an unchanged
   one at most once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30).
 - **It follows your bookings.**  If a reservation that can take the pod *now*
   appears — you book one, or one of your other bookings frees up — the pod
   moves to it within the queue interval; you do not need to recreate it.
+
+### 5.5 What happens to the reservation itself
+
+Two things the controller does act on a *reservation* rather than a pod, so
+they put nothing on any pod — they show up in the reservation app, as a
+cancelled reservation, not in `kubectl describe`:
+
+- **An unused booking is cancelled as a no-show.** A booking with no pod of
+  yours running under it 15 minutes after it opens (`NOSHOW_TIMEOUT_MINUTES`)
+  is cancelled in the reservation service with reason `no-show`, freeing the
+  window for someone else. The same applies later in the window: once the last
+  pod running under an open booking ends — it finished, you deleted it, a
+  notebook server was culled for being idle — the booking is watched again, and
+  if nothing starts under it for 30 minutes (`NOSHOW_GRACE_MINUTES`, counted
+  from when the controller's periodic checks notice, which can add up to about
+  10 minutes), the booking is cancelled the same way. (The same 30 minutes
+  applies to every booking already open when the controller restarts.) A pod
+  running under an earlier booking that directly abuts this one protects it
+  too, since its guarantee already covers that window. Once cancelled, the booking is gone:
+  a pod started afterwards no longer matches it, and goes on demand (charged) if
+  it qualifies, or gets `NoReservation`. A no-show is charged like any other
+  cancellation — see the reservation service's cancellation rules
+  (`SCHEDULING.md` §3).
+- **An on-demand lease ends with its pod.** A lease exists only to cover the one
+  pod it was requested for, so when that pod finishes, is deleted or is
+  preempted, the controller cancels the lease (reason `pod-terminated`) rather
+  than letting it run out. You pay for the time the pod ran; unused time in the
+  lease's first two hours is free, and past that part of the unused remainder
+  may be charged (`SCHEDULING.md` §3, "On-demand grace") — so a
+  `galends/minimum-runtime-seconds` far above what the job needs can cost SU. A
+  booking is never cancelled because its pod ended. A lease is also retired early
+  when its pod moves onto your booking as that booking opens
+  (`ReservationRelinked`, §5); that cancel (`superseded`) charges only the time
+  already used.
+
+### 5.6 When the controller says nothing
+
+A GPU pod can also sit Pending with no Event from the controller at all. That
+is expected in these cases:
+
+- **It has no `gpu-class` label**, or an empty one: the controller never looks
+  at it.
+- **The scheduler has not ruled on it yet** — the first few seconds after it is
+  created.
+- **The scheduler named something no reservation can fix** — `Insufficient cpu`
+  or `memory`, a node selector nothing matches, a volume that cannot bind. The
+  controller steps aside and kube-scheduler's own `FailedScheduling` Event is
+  the one that says what is wrong; the controller looks at the pod again at its
+  next resync, roughly every 10 minutes.
+- **No single node has room for it.** A pod asking for 2 or more GPUs — or any
+  best-effort pod — waits quietly while its class's free GPUs are spread across
+  nodes with none holding enough on its own (a pod cannot span nodes). It is
+  retried on the controller's queue interval (5 minutes by default) until one
+  node does.
+- **A lease was granted but the pod could not be admitted under it** (a
+  transient Kubernetes error, say): the lease is cancelled at once (reason
+  `controller-revoked`) and a fresh one requested 2–5 minutes later.
+- **The reservation service cannot be reached**, or refuses the controller
+  itself (its credentials, say) — an operator's problem, logged for them
+  (§5.1). Where the deployment lets the reservation service choose which
+  waiting pods to admit on demand (`ONDEMAND_DELEGATE_ADMISSION`), a pod it
+  passes over for a round is not told either.
+- **Its reservation went away while it waited** — the window ended, or the
+  booking was cancelled with nothing to move to: its last §5.4 Event stands
+  until the controller re-examines it at the next resync.
+- **The controller has only just started** and has not yet loaded the
+  reservation service's GPU classes and reservations (§5.3).
+- **The controller is down.**
+
+If a pod stays Pending well past these, with nothing from the controller, ask
+support — with the pod's name, namespace and GPU class.
 
 ## 6. Acting on the warning: checkpointing a PyTorch job
 
@@ -722,7 +854,7 @@ made.
 
 The corollary matters just as much: **the guarantee is not a deadline.** Past
 `guaranteed-until` the job is not killed, it enters `overstay` and keeps running
-until someone else's reservation actually needs the GPUs. Do not exit at the
+until a booking actually needs the GPUs (or the headroom goal of §2 does). Do not exit at the
 guarantee. Do tighten your cadence once you cross it, because from that instant
 you are killable and the notice you get is bounded by §7, not by your own
 planning.
@@ -990,13 +1122,27 @@ Two consequences worth designing around:
    `booking-reference` on a pod the controller has not admitted yet, and the
    warning trio during the window between sweeps.
 2. **Warnings retract.** The three `termination-warning-*` keys are deleted when
-   the pod leaves the at-risk pool — the user re-booked or extended, the incoming
-   reservation no-showed, demand evaporated, or the pod was re-linked to a new
-   reservation. A UI that latches a red banner will show a false alarm
-   indefinitely; clear it when the key disappears. **Extending or re-booking is
-   the reliable way to cancel a pending termination**, and it works right up to
-   the moment the pod is deleted: the controller re-checks each pod's live
-   guarantee on every sweep, so a reservation that lands first always wins.
+   the pod leaves the at-risk pool — the user extended or re-booked, the incoming
+   reservation was cancelled or no-showed, demand evaporated, or the pod was
+   re-linked to a new reservation. A UI that latches a red banner will show a
+   false alarm indefinitely; clear it when the key disappears. **What cancels a
+   pending termination is a new guarantee, and only two kinds of booking give
+   one in time.** A booking of the owner's that directly *abuts* the pod's
+   guarantee — same GPU class and GPU count (and usage group, on a cluster that
+   matches by group), starting exactly when the guarantee ends — extends it as
+   soon as the controller sees the booking, before it opens. A booking of the
+   owner's for the class that is *open now* with room for the pod — which is what
+   Extend in the reservation app creates — re-links the pod onto it (once its
+   current guarantee has lapsed, and always before any kill). A booking that
+   starts later without
+   abutting rescues the pod only once it opens, which can be too late: the pod
+   may even be preempted, up to `PREEMPTION_LEAD_MINUTES` early, to make room for
+   that very booking. Either qualifying kind works right up to the moment the
+   pod is deleted — the controller re-checks each pod's live guarantee on every
+   sweep, so one it has seen first always wins — but it sees a new reservation
+   within seconds only where the reservation service pushes changes to it, and
+   otherwise at its next fetch (`RESERVATION_FETCH_INTERVAL`, 5 minutes by
+   default).
 3. **`termination-warning-at` can pass without anything happening.** The
    shortfall it was computed from may be gone by the time it arrives. Never
    count down to zero and declare the job dead; fall back to "may be stopped at
@@ -1004,9 +1150,10 @@ Two consequences worth designing around:
 4. **The guarantee can move in both directions.** Usually later (an abutting
    follow-on booking). It can technically shrink — a window shortened
    server-side — so re-read rather than caching the first value you saw.
-5. **`pod-runtime-limit-seconds` goes stale by design.** It is the duration at
-   admission and is not refreshed. Use `guaranteed-until` for anything the user
-   sees.
+5. **`pod-runtime-limit-seconds` goes stale by design.** It is the duration
+   when the guarantee was last recorded — at admission, or at the latest re-link
+   — and is not refreshed in between, not even when an abutting booking extends
+   the guarantee. Use `guaranteed-until` for anything the user sees.
 6. **A pod's reservation can change under it.** `booking-reference` and every
    `reservation-*` key are rewritten together when the controller re-links a pod
    — to a window its user booked after the pod was already running, or from a
@@ -1019,8 +1166,9 @@ Two consequences worth designing around:
    `[0, 1]`); the timestamps are `YYYY-MM-DDTHH:MM:SSZ` (Python's
    `datetime.fromisoformat` accepts the `Z` suffix from 3.11 on); `res-<id>` and
    `reservation-gpu-count` are integers. Treat `reservation-kind` as an open set
-   — match `booking` and `on_demand` explicitly and fall back to neutral copy for
-   anything else, rather than assuming a value you do not recognise is a lease.
+   — match `booking`, `on_demand` and `best_effort` explicitly and fall back to
+   neutral copy for anything else, rather than assuming a value you do not
+   recognise is a lease.
    Ignore a value that does not parse instead of erroring the whole widget.
 8. **Nothing here is authoritative.** These are best-effort stamps. For
    authoritative, richer risk data — per-hour buckets, cluster-wide class

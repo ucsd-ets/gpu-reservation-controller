@@ -22,8 +22,10 @@ which ensures that only jobs intended for that GPU type end up there.)
 
 The controller's job is to add the matching **toleration** to pods
 that have a valid, active reservation, subject to the GPU budget 
-for that reservation.  (Current budgets are always 1 unit, but the 
-system is designed to accommodate greater values in the future.)
+for that reservation.  The budget is the reservation's `gpu_count` — how
+many GPUs it holds — and every pod admitted under it counts its
+`nvidia.com/gpu` request against that, so several pods can share one
+multi-GPU reservation.
 
 ### Control loop
 
@@ -107,8 +109,9 @@ system is designed to accommodate greater values in the future.)
 │         ") within PREEMPTION_LEAD_MINUTES of now:     │
 │           demand = incoming bookings' unclaimed GPUs  │
 │           free   = node capacity − live pod usage     │
-│      b. If demand > free, delete random past-guarantee│
-│         pods of that GPU class until covered:         │
+│      b. If demand > free, delete past-guarantee pods  │
+│         of that GPU class until covered (the app      │
+│         picks which; random if it cannot be asked):   │
 │           Create Preempted Event, then delete pod     │
 │      c. Phase A runs before the boundary (proactive); │
 │         phase B runs at the boundary itself and also  │
@@ -339,7 +342,12 @@ preemption sweep is still per-class.)
 **No-show → cancel** — if a reservation holder fails to launch a pod within
 `NOSHOW_TIMEOUT_MINUTES` of the window opening, the controller durably
 cancels the reservation (`POST /api/reservations/{id}/cancel`,
-`reason="no-show"`) so the app can re-book the window immediately.  The
+`reason="no-show"`) so the app can re-book the window immediately.  A
+booking that is vacated mid-window — its last pod finished, was deleted or
+was idle-culled — is re-armed with `NOSHOW_GRACE_MINUTES` from the next
+reservation refresh, and cancelled the same way if nothing starts under it
+by then (the same grace covers windows already open when the controller
+starts).  The
 cancel is re-verified against a fresh pod snapshot first (a pod that raced in
 at the last second is never cancelled out from under it) and retried next
 tick if it fails.  A reservation a live holder is still occupying — directly
@@ -369,17 +377,17 @@ effect:   NoSchedule
 | Annotation | Written when | Purpose |
 |------------|--------------|---------|
 | `galends/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>` — the only prefix, since every admitted pod is tied to a real reservation, JIT or otherwise); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
-| `galends/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets; see *Runtime guarantees and demand-driven preemption* |
+| `galends/pod-runtime-limit-seconds` | guarantee recorded, rewritten on re-link | The runtime guarantee's duration in seconds when it was recorded (`0` for a best-effort pod), for operator visibility and in-pod notification widgets; not refreshed as the guarantee grows. See *Runtime guarantees and demand-driven preemption* |
 | `galends/guaranteed-until` | guarantee recorded, kept live | The same guarantee as an absolute UTC ISO-8601 instant; refreshed while the pod is in guarantee (it can move later when an abutting window is booked), frozen at its now-past value once the pod overstays |
 | `galends/guarantee-status` | guarantee recorded, kept live | `guaranteed` while the pod is inside its runtime guarantee, `overstay` once it is running past it; see *Live guarantee-status annotations* |
-| `galends/reservation-kind` | guarantee recorded, re-stamped on re-link | `booking` (a window the user reserved) or `on_demand` (a just-in-time lease the controller minted on the pod's behalf) |
+| `galends/reservation-kind` | guarantee recorded, re-stamped on re-link | `booking` (a window the user reserved), `on_demand` (a just-in-time lease the controller minted on the pod's behalf) or `best_effort` (a zero-length, zero-SU stub for a pod that asked for no runtime guarantee — `BEST_EFFORT_ENABLED`) |
 | `galends/reservation-start` / `-end` | guarantee recorded, re-stamped on re-link | The reservation's **own** window as absolute UTC ISO-8601 instants — distinct from `guaranteed-until`, which is the end of the back-to-back guarantee *chain* |
 | `galends/reservation-gpu-count` | guarantee recorded, re-stamped on re-link | GPUs the reservation reserves; against the pod's own request this shows how much of a booking the pod is using |
 | `galends/gpu-class-name` | guarantee recorded, re-stamped on re-link | The GPU class's human display name (e.g. `H100`), as opposed to the `gpu-class` label value used for matching |
 | `galends/admitted-at` | first admission only | When the controller admitted this pod, absolute UTC ISO-8601. Deliberately **not** rewritten on a re-link — a re-link is not a new admission |
 | `galends/termination-warning-at` | at risk of preemption | Projected kill instant `max(boundary − lead, guarantee_end)` (the start of the sweep's kill window at the soonest boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
 | `galends/termination-warning-risk` | at risk of preemption | Preemption risk in (0, 1] at that boundary (`min(1, shortfall/pool_gpus)`, 2 decimals) |
-| `galends/termination-warning-message` | at risk of preemption | Human-readable warning text. Renders its instant in **local** time (see `EVENT_DISPLAY_TIMEZONE`) — it is prose for a person, unlike the UTC `-at` above that a widget parses |
+| `galends/termination-warning-message` | at risk of preemption | Human-readable warning text. Renders its instants in **local** time (see `EVENT_DISPLAY_TIMEZONE`; UTC when neither it nor `TZ` is set) — it is prose for a person, unlike the UTC `-at` above that a widget parses |
 
 (`galends/minimum-runtime-seconds` and `galends/usage-group` — the usage-group
 name a JIT lease is created under when `REQUIRED_GROUP_LABEL` is not in use —
@@ -412,14 +420,16 @@ from-scratch scenario.
 When a pod is admitted, the controller records how long its GPU access is
 **guaranteed** — but does **not** enforce that with `spec.activeDeadlineSeconds`.
 A pod may run past its guarantee freely; the controller reclaims capacity
-from an overstaying pod only when a new reservation actually needs it.
+from an overstaying pod only when a booking starting on its GPU class
+actually needs it — or, if `HEADROOM_TARGET_PERCENT` is set, to keep that
+share of each class free for on-demand jobs.
 
 **Guarantee calculation** — the guaranteed instant is:
 
 - The **end** of the pod's current reservation window, plus
-- The **full duration** of any directly back-to-back future reservations with
-  the same owner, GPU class, and GPU count (no gap between consecutive
-  windows).
+- The **full duration** of any directly back-to-back future bookings with
+  the same owner, GPU class, and GPU count — and usage group, when
+  `REQUIRED_GROUP_LABEL` is set — with no gap between consecutive windows.
 
 This is an absolute instant **recomputed live** on every check rather than
 frozen at admission — so a pod's guarantee can *grow* after admission (an
@@ -428,9 +438,12 @@ abutting follow-on booking), something a Kubernetes deadline cannot do.
 **Recording the guarantee** — after applying the toleration, the controller
 annotates the pod (see table above) and creates a Kubernetes **Event** with
 reason `RuntimeGuaranteed` explaining when the guarantee ends and that the
-pod may later be preempted.  Event messages state their times in local time
-(`EVENT_DISPLAY_TIMEZONE`, defaulting to `TZ`), since a user reads them
-through `kubectl describe pod`; the annotations alongside stay UTC.  Recording is best-effort: if the PATCH or Event
+pod may later be preempted — the same Event is emitted again, with the new
+guarantee, whenever the pod is later re-linked to another reservation.  Event
+messages state their times in local time (`EVENT_DISPLAY_TIMEZONE`, defaulting
+to `TZ`), since a user reads them through `kubectl describe pod`; with neither
+set — the chart's default — they read in UTC.  The annotations alongside stay
+UTC either way.  Recording is best-effort: if the PATCH or Event
 creation fails, a warning is logged but the toleration that was already
 applied is not revoked.
 
@@ -440,12 +453,17 @@ diagram above. In short: for each upcoming reservation start ("boundary")
 within `PREEMPTION_LEAD_MINUTES` (default 15) of now, the controller computes
 demand (incoming bookings' unclaimed GPUs) against free physical capacity
 (from a node LIST — see [step 5](#5--overriding-a-nodes-gpu-capacity-optional)
-to override what a node contributes); if demand exceeds free capacity, it deletes **random**
+to override what a node contributes); if demand exceeds free capacity, it deletes
 past-guarantee pods of the same GPU class until the shortfall is covered. A
 pod still within its guarantee is never selected, however severe the
-shortfall — that's logged as an unmet-demand warning instead. Victim
-selection is uniform-random for now; priority ranking among overstayers is a
-deferred future design. Each boundary is evaluated at most once per phase; a
+shortfall — that's logged as an unmet-demand warning instead. **Which**
+eligible pods are deleted is delegated to the reservation app by default
+(`PREEMPTION_DELEGATE_SELECTION`, `POST /api/reservations/preemption-victims`),
+whose current policy sacrifices best-effort pods first, then on-demand leases,
+then bookings, at random within each; with delegation off, or when the app
+call fails, the controller picks uniformly at random among them. Only booking
+starts create boundaries — a granted on-demand lease never triggers
+preemption on its own behalf. Each boundary is evaluated at most once per phase; a
 pod snapshot or node-capacity-snapshot failure skips the sweep entirely
 rather than risk a kill based on unknown physical state. Preempted pods get a
 Kubernetes Event with reason `Preempted` before deletion.
@@ -556,7 +574,7 @@ All settings are supplied via environment variables.
 | `BEST_EFFORT_ENABLED` | no | `false` | Honour a pod's `galends/runtime-guarantee: none` annotation by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation rather than a guaranteed lease — no runtime guarantee, no Service Units, preemptible from the first second. Requires an app build serving the best-effort create shape; `false` ignores the annotation entirely |
 | `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. The app endpoint is shipped but selects grant-all today, so enabling this changes no behaviour until the app carries real admission policy |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side |
-| `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress |
+| `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) before a booking whose window is already open is declared a no-show: one already in progress when the controller starts, or one vacated mid-window after its last pod ends (finished, deleted or idle-culled) |
 | `QUEUE_PROCESSOR_INTERVAL` | no | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
 | `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset leaves both endpoints **disabled** (returns 503) |
