@@ -237,8 +237,8 @@ filter runs ahead of `NodeResourcesFit` — so the pod's own class's nodes are
 rejected on the taint and never report a GPU verdict at all.  Requiring it held
 every candidate at "indeterminate" indefinitely on exactly the clusters this
 controller is built for.  The corresponding *physical* check is that the class
-has at least one schedulable node carrying its taint (same per-node inventory
-guard 5 uses); a fully drained class is held, not dropped, since nodes come
+has at least one schedulable, Ready node carrying its taint (same per-node
+inventory guard 5 uses); a fully drained class is held, not dropped, since nodes come
 back, and a class with no data yet does not block (fail-open).  "Fully drained"
 is judged against the classes the reservation app knows: the node inventory
 simply omits a class with no schedulable node, so each known class is recorded
@@ -902,8 +902,13 @@ GPU class record (e.g. `h100`, `a100-80gb`).
 ### 5 — Overriding a node's GPU capacity (optional)
 
 The controller's only notion of how many GPUs physically exist is
-`status.allocatable["nvidia.com/gpu"]`, summed per class over the tainted,
-schedulable nodes.  A **node** annotation overrides that reading for one node:
+`status.allocatable["nvidia.com/gpu"]`, summed per class over the tainted nodes
+that are schedulable and Ready — a cordoned, terminating or **NotReady** node is
+left out, so a GPU node that crashes stops counting as soon as Kubernetes marks
+it NotReady, without anyone cordoning it (it logs `k8s.node_excluded` at DEBUG).
+Pods still bound to a node that is left out count against nothing, and are never
+chosen to free capacity, since deleting them frees none the scheduler can use.
+A **node** annotation overrides the allocatable reading for one node:
 
 ```bash
 # This node contributes 2 GPUs to its class, whatever allocatable says
@@ -935,7 +940,7 @@ class contributes the forced number to each of them — the annotation is per no
 not per class.  A negative or unparseable value is ignored, with a
 `k8s.node_capacity_forced_invalid` **WARNING** naming the node; the node keeps
 its allocatable count.  The annotation does **not** enrol a node: an untainted,
-cordoned, or terminating node is still excluded.
+cordoned, terminating or NotReady node is still excluded.
 
 **It is a replacement, not a cap** — a value above allocatable is honoured, which
 is the operator's call and worth being deliberate about.  The controller will

@@ -255,7 +255,7 @@ class TestSweepDisabledByDefault:
             raise AssertionError("headroom must not force a snapshot when disabled")
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)
-        monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _boom)
+        monkeypatch.setattr(m, "snapshot_node_gpu_inventory", _boom)
 
         asyncio.run(
             m._run_preemption_sweep(state, make_config(), now=H)

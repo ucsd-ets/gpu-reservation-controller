@@ -194,7 +194,7 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | `guard=` | `reason=` | Meaning |
 |---|---|---|
 | 1 | `schedule_verdict_pending` | No `PodScheduled` verdict yet, so there is nothing to classify. Transient — the MODIFIED fast path shortens it to ~1 s. |
-| 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained/cordoned). Known means the reservation app lists the class: the node inventory omits a class with no schedulable node, so every app-known class is recorded explicitly, as zero when it has none. Fail-open when unknown — a label the app does not list, or no snapshot yet. |
+| 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained, cordoned or NotReady). Known means the reservation app lists the class: the node inventory omits a class with no schedulable node, so every app-known class is recorded explicitly, as zero when it has none. Fail-open when unknown — a label the app does not list, or no snapshot yet. |
 | 3 | `stuck_holder_interlock` | A reservation holder is stuck Pending on this class. |
 | 4 | `class_overcommitted` | App-side capacity exceeds physical (see §8). **Not applied to a best-effort candidate**, which consumes no app-side capacity to overcommit. |
 | 5 | `no_single_node_fit` | No single node has enough free GPUs for the ask, net of `claimed` (GPUs taken by earlier candidates this batch). Applies to a ≥2-GPU ask, and to **every** best-effort ask — see below. Fail-open when unknown. |
@@ -398,6 +398,7 @@ DEBUG only, unless noted.
 | DEBUG | `k8s.list_nodes` | `purpose` |
 | DEBUG | `k8s.node_inventory` | `clabel nodes total` — one line per class |
 | DEBUG | `k8s.node_capacity_forced` | `node total` — the node's `galends/force-node-capacity` annotation replaced its allocatable count |
+| DEBUG | `k8s.node_excluded` | `node reason` — a GPU node (one carrying a reservation taint) left out of the capacity snapshot; `reason` is `cordoned`, `deleting` or `not_ready` (its `Ready` condition is `False` or `Unknown`). Per snapshot, so it repeats while the node stays out |
 | DEBUG | `k8s.patch_pod` | `ns pod patch` + the patch's own fields |
 | DEBUG | `k8s.create_event` / `k8s.delete_pod` | `ns pod` (+ `reason`) |
 | DEBUG | `pod.already_gone` | `ns pod status` (404 on delete) |

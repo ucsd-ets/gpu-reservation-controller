@@ -105,14 +105,17 @@ def free_capacity_by_class(
 
     Only pods that are ``node_resident`` and not ``terminating`` count against
     capacity — a terminating pod's GPUs are already being recovered by
-    Kubernetes and are treated as free for planning purposes.  A class absent
-    from *capacity_by_class* (unknown physical capacity) is not included in
-    the result.  A returned value may be negative, signalling an
+    Kubernetes and are treated as free for planning purposes.  Nor does a pod
+    bound to a node the snapshot excluded (``node_excluded``): that node's GPUs
+    are not in *capacity_by_class*, so subtracting the pod as well would count
+    the same GPUs out twice and report a shortfall that is not there.  A class
+    absent from *capacity_by_class* (unknown physical capacity) is not included
+    in the result.  A returned value may be negative, signalling an
     over-committed class (more GPUs in use than the snapshot says exist).
     """
     used: dict[str, int] = {}
     for p in pods:
-        if not p.node_resident or p.terminating:
+        if not p.node_resident or p.terminating or p.node_excluded:
             continue
         if p.gpu_class not in capacity_by_class:
             continue
@@ -189,11 +192,11 @@ def node_counts_by_class(
     ``{gpu_class: node count}``.  Guard 1b reads this: a lease minted for a
     class with nowhere to run is an SU charge against a pod that cannot start.
 
-    ``snapshot_node_gpu_inventory`` excludes cordoned and terminating nodes and
-    lists a class only when at least one node survives that, so a class whose
-    nodes are all cordoned or gone is not ``0`` in the inventory — it is
-    *absent*.  Read as-is, that is indistinguishable from "no data", which guard
-    1b fails open on, so the guard could never fire.  Every class in
+    ``snapshot_node_gpu_inventory`` excludes cordoned, terminating and NotReady
+    nodes and lists a class only when at least one node survives that, so a
+    class whose nodes are all cordoned, down or gone is not ``0`` in the
+    inventory — it is *absent*.  Read as-is, that is indistinguishable from "no
+    data", which guard 1b fails open on, so the guard could never fire.  Every class in
     *known_classes* (the labels the reservation app knows) is therefore recorded
     explicitly, as ``0`` when the inventory has no node for it.  A label outside
     it stays absent — unknown, never blocking — as does everything before the
@@ -501,6 +504,13 @@ class PodRuntimeView:
     # across ticks, which is what makes the notice survive a controller restart
     # (the pod's own annotation is the only record that it was warned).
     termination_warning_at: Optional[datetime] = None
+    # Bound to a node the node snapshot excluded — cordoned, being deleted,
+    # NotReady, or not carrying this pod's class taint.  Such a pod neither
+    # occupies capacity the planners count nor, if killed, frees any they could
+    # use, so free capacity ignores it and no victim pool offers it.  Set only by
+    # callers that built the views against that snapshot (the preemption sweep
+    # and the forecast); ``False`` elsewhere means "not checked".
+    node_excluded: bool = False
 
 
 @dataclass
@@ -2386,8 +2396,10 @@ class ControllerState:
         Per GPU class: ``kills_needed = max(0, demand - free)``.  Eligible
         candidates are pods of that class admitted by this controller
         (``reservation_id`` set), physically running or about to
-        (``node_resident``), not already ``terminating``, requesting at least
-        one GPU, and past their runtime guarantee (``guarantee_end`` is
+        (``node_resident``) on a node the snapshot counts (not
+        ``node_excluded`` — killing a pod elsewhere frees nothing the booking
+        could use), not already ``terminating``, requesting at least one GPU,
+        and past their runtime guarantee (``guarantee_end`` is
         ``None`` — unresolvable, treated as already over — or ``<= now``).  A
         pod within its guarantee is never a candidate, regardless of shortfall.
         Only classes with a non-zero shortfall are included (their candidate
@@ -2412,6 +2424,7 @@ class ControllerState:
                 if p.gpu_class == gpu_class
                 and p.reservation_id is not None
                 and p.node_resident
+                and not p.node_excluded
                 and not p.terminating
                 and p.gpu_count > 0
                 and self._past_guarantee(p, now)
@@ -2458,11 +2471,11 @@ class ControllerState:
         """Pods of *gpu_class* that headroom is allowed to consider at all.
 
         Exactly ``plan_boundary_candidates``' eligibility predicate — live,
-        node-resident, admitted by this controller, and **past its runtime
-        guarantee**.  Kept as one helper because the two headroom entry points
-        below must agree on it: a pod warned by ``plan_headroom_warnings`` that
-        ``plan_headroom_candidates`` would never consider is a warning that can
-        never come true.
+        node-resident on a node the snapshot counts, admitted by this
+        controller, and **past its runtime guarantee**.  Kept as one helper
+        because the two headroom entry points below must agree on it: a pod
+        warned by ``plan_headroom_warnings`` that ``plan_headroom_candidates``
+        would never consider is a warning that can never come true.
         """
         return [
             p
@@ -2470,6 +2483,7 @@ class ControllerState:
             if p.gpu_class == gpu_class
             and p.reservation_id is not None
             and p.node_resident
+            and not p.node_excluded
             and not p.terminating
             and p.gpu_count > 0
             and self._past_guarantee(p, now)
@@ -2662,8 +2676,8 @@ class ControllerState:
         at the real now, chains intact, via *guarantee_end_by_uid*) against
         the boundary: eligible when ``guarantee_end is None or <= boundary``
         — the sweep's phase-B outcome for that instant.  Same physical gates
-        as ``plan_boundary_candidates`` (admitted, node-resident, not
-        terminating, at least one GPU).  Pure.
+        as ``plan_boundary_candidates`` (admitted, node-resident on a counted
+        node, not terminating, at least one GPU).  Pure.
         """
         demand = self.boundary_demand(boundary, pods, now)
         kills_needed = {
@@ -2677,6 +2691,7 @@ class ControllerState:
             if (
                 p.reservation_id is None
                 or not p.node_resident
+                or p.node_excluded
                 or p.terminating
                 or p.gpu_count <= 0
             ):

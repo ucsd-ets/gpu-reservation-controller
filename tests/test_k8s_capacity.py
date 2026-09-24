@@ -31,7 +31,13 @@ def _node(
     unschedulable: bool = False,
     deleting: bool = False,
     annotations: dict | None = None,
+    ready: str | None = None,
 ) -> SimpleNamespace:
+    """A node stub.  *ready* is the ``Ready`` condition's status (``"True"``,
+    ``"False"``, ``"Unknown"``); ``None`` reports no conditions at all, which the
+    snapshot keeps, so the stubs that predate readiness still read as schedulable.
+    """
+    conditions = None if ready is None else [SimpleNamespace(type="Ready", status=ready)]
     return SimpleNamespace(
         metadata=SimpleNamespace(
             name=name,
@@ -39,7 +45,7 @@ def _node(
             annotations=annotations,
         ),
         spec=SimpleNamespace(taints=taints, unschedulable=unschedulable),
-        status=SimpleNamespace(allocatable=allocatable),
+        status=SimpleNamespace(allocatable=allocatable, conditions=conditions),
     )
 
 
@@ -231,6 +237,102 @@ class TestSnapshotNodeGpuInventory:
             for gpu_class, per_node in inventory.items()
         }
         assert capacity == {"h100": 12, "a100": 2}
+
+
+# ---------------------------------------------------------------------------
+# Node readiness — a crashed node stops counting without anyone cordoning it
+# ---------------------------------------------------------------------------
+
+
+class TestNodeExclusionReason:
+    """The pure predicate, exercised without a snapshot around it."""
+
+    def test_ready_node_is_kept(self):
+        assert k8s_client.node_exclusion_reason(_node("n1", ready="True")) is None
+
+    def test_ready_false_is_not_ready(self):
+        # The kubelet is up and says the node is not ready (runtime down, PLEG).
+        assert k8s_client.node_exclusion_reason(_node("n1", ready="False")) == "not_ready"
+
+    def test_ready_unknown_is_not_ready(self):
+        # The kubelet stopped heartbeating: the crash case.
+        assert k8s_client.node_exclusion_reason(_node("n1", ready="Unknown")) == "not_ready"
+
+    def test_no_conditions_is_kept(self):
+        """Missing data never removes capacity — it would pause admission or
+        start a preemption on the strength of nothing."""
+        assert k8s_client.node_exclusion_reason(_node("n1")) is None
+
+    def test_other_conditions_without_ready_are_kept(self):
+        node = _node("n1")
+        node.status.conditions = [SimpleNamespace(type="MemoryPressure", status="True")]
+        assert k8s_client.node_exclusion_reason(node) is None
+
+    def test_status_without_a_conditions_attribute_is_kept(self):
+        node = _node("n1")
+        node.status = SimpleNamespace(allocatable={})
+        assert k8s_client.node_exclusion_reason(node) is None
+
+    def test_cordoned_and_deleting_keep_their_reasons(self):
+        assert k8s_client.node_exclusion_reason(
+            _node("n1", unschedulable=True, ready="True")
+        ) == "cordoned"
+        assert k8s_client.node_exclusion_reason(
+            _node("n1", deleting=True, ready="True")
+        ) == "deleting"
+
+
+class TestNotReadyNodesInInventory:
+    def test_not_ready_nodes_excluded(self, monkeypatch):
+        """Neither ``spec.unschedulable`` nor ``status.allocatable`` moves when a
+        node dies, so the Ready condition is the only thing that can drop it."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, ready="Unknown"),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, ready="False"),
+            _node("n3", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, ready="True"),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n3": 8}}
+        # And so the per-class total the capacity audit (guard 4) compares.
+        assert _run_snapshot(monkeypatch, nodes) == {"h100": 8}
+
+    def test_a_class_whose_nodes_are_all_down_is_absent(self, monkeypatch):
+        """The same shape a fully cordoned class takes, which guard 1b reads."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, ready="Unknown"),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {}
+
+    def test_forced_capacity_does_not_resurrect_a_not_ready_node(self, monkeypatch):
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"},
+                  annotations={k8s_client.FORCE_NODE_CAPACITY: "4"}, ready="Unknown"),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {}
+
+    def test_exclusions_are_logged_for_gpu_nodes_only(self, monkeypatch, caplog):
+        """At DEBUG, naming the node and why — the per-class inventory line
+        shows a smaller total but not which node went missing."""
+        nodes = [
+            _node("gpu-down", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, ready="Unknown"),
+            _node("gpu-cordoned", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, unschedulable=True),
+            _node("cpu-down", taints=[], ready="Unknown"),
+        ]
+        with caplog.at_level(logging.DEBUG, logger="app.k8s_client"):
+            _run_inventory(monkeypatch, nodes)
+        lines = sorted(
+            r.getMessage() for r in caplog.records
+            if "event=k8s.node_excluded " in r.getMessage() + " "
+        )
+        assert len(lines) == 2, lines
+        assert "node=gpu-cordoned" in lines[0] and "reason=cordoned" in lines[0]
+        assert "node=gpu-down" in lines[1] and "reason=not_ready" in lines[1]
 
 
 # ---------------------------------------------------------------------------

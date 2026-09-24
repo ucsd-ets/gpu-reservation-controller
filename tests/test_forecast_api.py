@@ -57,13 +57,14 @@ def _patch_snapshots(monkeypatch, main, *, pods, capacity):
             raise pods
         return pods
 
-    async def _snapshot_capacity(_key):
+    async def _snapshot_inventory(_key):
         if isinstance(capacity, Exception):
             raise capacity
-        return capacity
+        # One node per class; the pods here are unscheduled, so it is immaterial.
+        return {c: {f"{c}-node": n} for c, n in capacity.items()}
 
     monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot_pods)
-    monkeypatch.setattr(main, "snapshot_node_gpu_capacity", _snapshot_capacity)
+    monkeypatch.setattr(main, "snapshot_node_gpu_inventory", _snapshot_inventory)
 
 
 def _holder_pod(uid="uid-1", name="pod-1", reservation_id=1, gpu_count=1):
