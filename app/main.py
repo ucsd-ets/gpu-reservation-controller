@@ -1199,10 +1199,10 @@ async def _preflight_ondemand_candidate(
     # Guard 1b: the physical half of the same question.  1a concluded only that
     # *something* we might tolerate is in the way; confirm the class actually
     # has a node to land on before minting an SU-charged lease.  The inventory
-    # already excludes cordoned and terminating nodes, so a known count of zero
-    # means a fully drained class — hold, since nodes come back.  A class with
-    # no data is unknown and never blocks (fail-open, matching guard 5), so a
-    # snapshot gap cannot wedge admission.  (Zero is "known" for every class
+    # already excludes cordoned, terminating and NotReady nodes, so a known count
+    # of zero means a fully drained or down class — hold, since nodes come back.
+    # A class with no data is unknown and never blocks (fail-open, matching
+    # guard 5), so a snapshot gap cannot wedge admission.  (Zero is "known" for every class
     # the app knows; see node_counts_by_class.)
     #
     # Guards 1b, 3 and 4 are class-wide pauses the pod's owner can neither see
@@ -3374,9 +3374,18 @@ async def _run_queue_tick(
 # ---------------------------------------------------------------------------
 
 
-def _pod_view(p) -> PodRuntimeView:
+def _pod_view(
+    p, inventory: Optional[dict[str, dict[str, int]]] = None
+) -> PodRuntimeView:
     """Digest a ``k8s_client.ToleratedPodInfo`` into the plain view the pure
-    preemption-planning functions in controller.py operate on."""
+    preemption-planning functions in controller.py operate on.
+
+    Pass the node *inventory* the caller's capacity came from whenever that
+    capacity feeds free-capacity or victim planning: it is what marks a pod
+    bound to a node the snapshot left out (``node_excluded``).  Without it a pod
+    on a cordoned or NotReady node is subtracted from capacity that never
+    included its node.
+    """
     return PodRuntimeView(
         uid=p.uid,
         namespace=p.namespace,
@@ -3389,6 +3398,11 @@ def _pod_view(p) -> PodRuntimeView:
         group_label=p.group_label,
         node_name=p.node_name,
         termination_warning_at=_parse_utc_iso(p.termination_warning_at),
+        node_excluded=(
+            inventory is not None
+            and p.node_name is not None
+            and p.node_name not in inventory.get(p.gpu_class, {})
+        ),
     )
 
 
@@ -4069,15 +4083,20 @@ async def _run_preemption_sweep(
         log.warning("%s", kv(event="preempt.snapshot_failed", target="pods", err=exc), exc_info=True)
         return
     try:
-        capacity = await snapshot_node_gpu_capacity(TOLERATION_KEY)
+        inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
             event="preempt.snapshot_failed", target="node_capacity", err=exc,
         ), exc_info=True)
         return
+    # Per node rather than per class, so the views can be marked against the
+    # same node set the capacity counts: a pod on a cordoned or NotReady node
+    # must neither be subtracted from capacity that excludes its node nor be
+    # offered as a victim whose death frees nothing placeable.
+    capacity = gpu_capacity_by_class(inventory)
 
     async with state.reservation_lock:
-        pods = [_pod_view(p) for p in snapshot]
+        pods = [_pod_view(p, inventory) for p in snapshot]
         # Merge a JIT lease's pod into a now-open matching booking, then rescue
         # overstay pods whose user has re-booked capacity — both before planning
         # any kills.  A merged/adopted pod's occupancy re-homes to its booking
@@ -4954,7 +4973,7 @@ async def preemption_risk_forecast(
             detail="Cluster pod snapshot unavailable; forecast cannot be computed",
         )
     try:
-        capacity = await snapshot_node_gpu_capacity(TOLERATION_KEY)
+        inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
             event="forecast.snapshot_failed", target="node_capacity", err=exc,
@@ -4963,9 +4982,12 @@ async def preemption_risk_forecast(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Node capacity snapshot unavailable; forecast cannot be computed",
         )
+    # Per node for the same reason as the sweep: the views are marked against
+    # the node set the capacity counts.
+    capacity = gpu_capacity_by_class(inventory)
 
     async with state.reservation_lock:
-        pods = [_pod_view(p) for p in snapshot]
+        pods = [_pod_view(p, inventory) for p in snapshot]
         pending = list(state.ondemand_candidates.values())
         forecast = state.forecast_preemption_risk(
             capacity,

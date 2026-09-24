@@ -517,7 +517,7 @@ class TestCordonedClassEndToEnd:
     unable to hold anything without a test noticing.
     """
 
-    def _tick(self, monkeypatch, *, cordoned, app_knows_class=True):
+    def _tick(self, monkeypatch, *, cordoned, app_knows_class=True, ready=None):
         from tests.test_k8s_capacity import TAINT_KEY, _FakeCoreV1, _node, _taint
 
         m = _main_module(monkeypatch)
@@ -525,6 +525,7 @@ class TestCordonedClassEndToEnd:
             _node(
                 "gpu-1", taints=[_taint(TAINT_KEY, GPU_CLASS_LABEL)],
                 allocatable={"nvidia.com/gpu": "8"}, unschedulable=cordoned,
+                ready=ready,
             ),
         ]
         monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1(nodes))
@@ -564,6 +565,16 @@ class TestCordonedClassEndToEnd:
         # nowhere to run.
         assert client.requests == []
         assert "uid-1" in state.ondemand_candidates
+
+    def test_a_class_whose_only_node_is_not_ready_is_held_too(self, monkeypatch):
+        """A crashed node is never cordoned by anyone, and still reports its
+        allocatable GPUs; only its Ready condition says it is gone.  Before the
+        snapshot read it, guard 1b let a lease through for a class with nowhere
+        to run, and only guard 3 caught it — after the SU was charged."""
+        state, rec, client = self._tick(monkeypatch, cordoned=False, ready="Unknown")
+        assert state.class_node_counts == {GPU_CLASS_LABEL: 0}
+        assert [c["guard"] for c in rec.calls] == [1]
+        assert client.requests == []
 
     def test_a_schedulable_node_lets_it_through(self, monkeypatch):
         state, rec, client = self._tick(monkeypatch, cordoned=False)

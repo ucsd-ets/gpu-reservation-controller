@@ -1,7 +1,7 @@
 """Tests for main._run_preemption_sweep (the async preemption-loop tick).
 
 Drives the sweep directly via ``asyncio.run`` with ``snapshot_tolerated_pods``,
-``snapshot_node_gpu_capacity``, ``read_pod``, ``delete_pod``, and
+``snapshot_node_gpu_inventory``, ``read_pod``, ``delete_pod``, and
 ``emit_preempted_event`` monkeypatched at the ``app.main`` module level — the
 same convention ``test_admission.py`` uses for Kubernetes-boundary
 coroutines.  No real Kubernetes or HTTP calls are made.
@@ -39,7 +39,7 @@ def _pod(uid: str, *, booking_reference: str, reservation_id: int, gpu_count: in
           phase: str = "Running", scheduled_false: bool = False, deletion_timestamp=None,
           namespace: str = USERNAME, termination_warning_at=None,
           termination_warning_risk=None,
-          termination_warning_message=None) -> ToleratedPodInfo:
+          termination_warning_message=None, node_name=None) -> ToleratedPodInfo:
     return ToleratedPodInfo(
         namespace=namespace,
         name=f"pod-{uid}",
@@ -54,6 +54,7 @@ def _pod(uid: str, *, booking_reference: str, reservation_id: int, gpu_count: in
         termination_warning_at=termination_warning_at,
         termination_warning_risk=termination_warning_risk,
         termination_warning_message=termination_warning_message,
+        node_name=node_name,
     )
 
 
@@ -73,12 +74,26 @@ def _patch_warnings(monkeypatch, m):
     return writes, clears
 
 
-def _patch_snapshots(monkeypatch, m, *, pods, capacity, read_pod_ok=True):
+def _one_node_per_class(capacity: dict[str, int]) -> dict[str, dict[str, int]]:
+    """The per-node inventory the sweep snapshots, for a per-class *capacity*.
+
+    One node per class holds it all.  The sweep's pods here are unscheduled
+    (``node_name=None``), so which node carries the GPUs changes nothing.
+    """
+    return {gpu_class: {f"{gpu_class}-node": n} for gpu_class, n in capacity.items()}
+
+
+def _patch_snapshots(
+    monkeypatch, m, *, pods, capacity=None, inventory=None, read_pod_ok=True
+):
+    if inventory is None:
+        inventory = _one_node_per_class(capacity)
+
     async def _snapshot_pods(_key, _group_label_key=None, _group_label_default=None):
         return pods
 
-    async def _snapshot_capacity(_key):
-        return capacity
+    async def _snapshot_inventory(_key):
+        return inventory
 
     deleted: list[tuple[str, str]] = []
     events: list[tuple[str, str, str]] = []
@@ -95,7 +110,7 @@ def _patch_snapshots(monkeypatch, m, *, pods, capacity, read_pod_ok=True):
         events.append((namespace, name, message))
 
     monkeypatch.setattr(m, "snapshot_tolerated_pods", _snapshot_pods)
-    monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _snapshot_capacity)
+    monkeypatch.setattr(m, "snapshot_node_gpu_inventory", _snapshot_inventory)
     monkeypatch.setattr(m, "read_pod", _read_pod)
     monkeypatch.setattr(m, "delete_pod", _delete_pod)
     monkeypatch.setattr(m, "emit_preempted_event", _emit_preempted)
@@ -129,7 +144,7 @@ class TestNoBoundariesInScope:
             raise AssertionError("should not be called")
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)
-        monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _boom)
+        monkeypatch.setattr(m, "snapshot_node_gpu_inventory", _boom)
 
         asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
         assert called == []
@@ -166,7 +181,7 @@ class TestSnapshotFailureFailsSafe:
 
         deleted = []
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _ok_pods)
-        monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _boom)
+        monkeypatch.setattr(m, "snapshot_node_gpu_inventory", _boom)
         monkeypatch.setattr(m, "delete_pod", lambda *a, **k: deleted.append(a))
 
         now = S - timedelta(minutes=10)
@@ -756,7 +771,7 @@ class TestStaleWarningsClearedOnQuietTicks:
             raise AssertionError("should not be called")
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)
-        monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _boom)
+        monkeypatch.setattr(m, "snapshot_node_gpu_inventory", _boom)
         asyncio.run(m._run_preemption_sweep(state, config, now=S + timedelta(hours=2)))
         assert called == []
 
@@ -798,6 +813,6 @@ class TestStaleWarningsClearedOnQuietTicks:
             raise AssertionError("should not be called")
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)
-        monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _boom)
+        monkeypatch.setattr(m, "snapshot_node_gpu_inventory", _boom)
         asyncio.run(m._run_preemption_sweep(state, config, now=S + timedelta(hours=1)))
         assert called == []
