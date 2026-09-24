@@ -174,7 +174,7 @@ follow this grammar and are not expected to.
 |---|---|---|
 | `status` | int | HTTP status code |
 | `reason` | enum, scoped by `event=` | why — see §2 |
-| `detail` | quoted string | free-text denial detail (`HTTPException.detail`) |
+| `detail` | quoted string | free-text detail: a denial's `HTTPException.detail`, or (controller) the scheduler's verdict or a pod's node selector / affinity |
 | `retryable` | bool | on an admission denial, whether waiting can ever admit the *same* request — `false` means only an administrator, or a different ask, resolves it. Pairs with the `reason=` denial code; both are the response envelope's fields verbatim (RESERVATION-API.md §4) |
 | `err` | quoted string | exception text |
 | `kind` | `booking` \| `on_demand` | reservation flavour |
@@ -214,6 +214,7 @@ follow this grammar and are not expected to.
 | `deadline` | ISO-8601 UTC | no-show deadline |
 | `until` | ISO-8601 UTC | runtime-guarantee end instant |
 | `at` | ISO-8601 UTC | projected termination-warning kill instant |
+| `peak_at` | ISO-8601 UTC | first instant of a window at which `committed` peaks |
 | `locked_until` | ISO-8601 | account lockout expiry |
 | `date` | ISO-8601 date | the single calendar date a line is about (the effective date under a debug date shift) |
 | `days` | int | signed whole-day count a value is shifted by (the debug effective-date offset) |
@@ -237,6 +238,7 @@ follow this grammar and are not expected to.
 | `node_free` | int | largest single-node free GPUs for a class |
 | `claimed` | int | GPUs already claimed earlier in the same admission batch, netted off `node_free` (emitted only when non-zero) |
 | `demand` | int | GPUs demanded at a boundary, per class |
+| `committed` | int | peak GPUs a class's reservations commit, placed or not, over a window (on-demand guard 4) |
 | `kills` | int | victims selected at a boundary |
 | `short` | int | GPUs still short after preempting every eligible overstayer |
 | `sweep` | `A` \| `B` | preemption sweep phase (`phase=` is the pod lifecycle phase) |
@@ -324,7 +326,7 @@ both sides, whereas everywhere else an absent value means "not known".
 | `dropped` | int | watch events discarded so far by the bounded queue (running total) |
 | `tol_key` / `tol_value` | string | the toleration being applied |
 | `resource` / `value` | string / string | the Kubernetes resource name and the malformed value, on an unparseable allocatable |
-| `nodes` | int | nodes carrying a GPU class, in a node-inventory line |
+| `nodes` | int | nodes carrying a GPU class, in a node-inventory or JIT-guard line |
 
 ### Entity naming and provenance
 
