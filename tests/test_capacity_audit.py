@@ -353,6 +353,8 @@ class _NoGrantClient:
 
 
 def test_overcommitted_class_pauses_ondemand_admission(monkeypatch):
+    # ONDEMAND_OVERCOMMIT_FIT=false: the original blanket pause.  The fitting
+    # default is covered in test_overcommit_fit.py.
     m = _main_module(monkeypatch)
     state = ControllerState()
     state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
@@ -373,6 +375,7 @@ def test_overcommitted_class_pauses_ondemand_admission(monkeypatch):
         ondemand_lease_buffer_minutes=10,
         scheduling_gate_name=None,
         ondemand_pause_event_enabled=False,
+        ondemand_overcommit_fit=False,
     )
     result = asyncio.run(
         m._try_request_lease(state, client, config, "uid-1", candidate)

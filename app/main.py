@@ -1064,9 +1064,12 @@ async def _preflight_ondemand_candidate(
        ``UnknownGpuClass`` Event (``_emit_unknown_class_event``).
     4. Guard 1 (Pending for a reason a lease can fix, and the class has nodes).
     5. Guard 3 (stuck reservation-holder safety interlock).
-    6. Guard 4 (over-committed gpu-class admission pause) — not applied to a
-       best-effort candidate, which consumes no app-side capacity to overcommit.
-       A pod held by guard 1b, 3 or 4 is told so with an
+    6. Guard 4 (a gpu-class the app over-counts): the lease must fit in the
+       physical GPUs for its whole duration, alongside every reservation
+       already booked in that time (``ONDEMAND_OVERCOMMIT_FIT``, the default),
+       or, with that off, the whole class is paused.  Not applied to a
+       best-effort candidate, which consumes no app-side capacity to
+       overcommit.  A pod held by guard 1b, 3 or 4 is told so with an
        ``OnDemandAdmissionPaused`` Event (``_emit_admission_paused_event``).
     7. Guard 5 (per-node feasibility: no single node can host the ask) — applied
        to a multi-GPU ask, and to **every** best-effort ask regardless of count,
@@ -1074,18 +1077,21 @@ async def _preflight_ondemand_candidate(
     8. Size the ask.
 
     *claimed_by_class* is the GPUs already granted earlier in the current
-    admission batch, so guard 5 measures each candidate against what is left
-    rather than each against the same opening.
+    admission batch, so guards 4 and 5 measure each candidate against what is
+    left rather than each against the same room.
 
     Returns one of:
     - ``(_PREFLIGHT_REMOVE, None)`` — drop the candidate (gone/terminal, routed
       to the reserved queue, or blocked by something no lease can fix).
     - ``(_PREFLIGHT_RETRY, None)`` — keep it; ``candidate.next_attempt_at`` has
       been pushed forward (transient read error, conditions not yet set, a
-      drained gpu-class, guard-3 interlock, or unknown gpu-class id).
+      drained gpu-class, guard-3 interlock, a guard-4 or guard-5 hold, or
+      unknown gpu-class id).
     - ``(_PREFLIGHT_READY, ask)`` — the candidate is a valid on-demand ask.
     """
     now = datetime.now(timezone.utc)
+    # Describes this attempt only; guard 4 sets it again if it still holds.
+    candidate.held_by_overcommit = False
     try:
         fresh_pod = await read_pod(candidate.pod_name, candidate.pod_namespace)
     except Exception as exc:  # noqa: BLE001
@@ -1225,11 +1231,27 @@ async def _preflight_ondemand_candidate(
         await _emit_admission_paused_event(config, state, uid, candidate, 3, now)
         return _PREFLIGHT_RETRY, None
 
-    # Guard 4: capacity overcommit — hold JIT requests for any GPU class whose
-    # app-side count exceeds observed physical capacity (set by the hourly
-    # capacity audit; recomputed each tick so it clears when the deficiency is
-    # resolved).  Admitting on-demand jobs onto a class the app believes is
-    # larger than it physically is would mint leases that can never schedule.
+    # A best-effort admission reserves no window, so there is nothing to size.
+    # The field is required by the delegation schema (shared with the lease
+    # path), so it carries 0 -- which is also what the app would price it at.
+    duration_seconds = (
+        0 if candidate.best_effort
+        else candidate.min_runtime_seconds + config.ondemand_lease_buffer_minutes * 60
+    )
+
+    # Guard 4: capacity overcommit — a GPU class whose app-side count exceeds
+    # observed physical capacity (set by the hourly capacity audit; recomputed
+    # each tick so it clears when the deficiency is resolved).  The app sells a
+    # lease only if it fits in its calendar against its *own* count, so on such
+    # a class it can sell GPUs that do not exist.  With ONDEMAND_OVERCOMMIT_FIT
+    # (the default) the controller re-runs that check against the physical
+    # count, over the lease's whole duration -- a booking that starts mid-lease
+    # counts, since its holder would otherwise find the lease pod on the GPU it
+    # paid for, beyond the reach of boundary preemption -- so a node outage on
+    # a lightly loaded class does not stop on-demand work.  *claimed_by_class*
+    # nets off the asks already passed earlier in this batch; a lease granted
+    # by an earlier batch is in state.reservations already.  With the flag off,
+    # the whole class is paused.
     # A best-effort candidate is exempt: overcommit means the *app's* per-class
     # count exceeds physical capacity, and a best-effort stub consumes no
     # app-side count at all, so the mismatch says nothing about whether one can
@@ -1239,14 +1261,36 @@ async def _preflight_ondemand_candidate(
         not candidate.best_effort
         and candidate.gpu_class_label in state.overcommitted_gpu_classes
     ):
-        log.info("%s", kv(
-            event="ondemand.candidate_held", guard=4, reason="class_overcommitted",
-            ns=candidate.pod_namespace, pod=candidate.pod_name,
-            clabel=candidate.gpu_class_label,
-        ))
-        candidate.next_attempt_at = _short_retry_at(now)
-        await _emit_admission_paused_event(config, state, uid, candidate, 4, now)
-        return _PREFLIGHT_RETRY, None
+        if config.ondemand_overcommit_fit:
+            physical = state.physical_gpu_capacity.get(candidate.gpu_class_label, 0)
+            claimed = (claimed_by_class or {}).get(candidate.gpu_class_label, 0)
+            committed, peak_at = state.peak_committed_gpus(
+                candidate.gpu_class_label, now,
+                now + timedelta(seconds=duration_seconds),
+            )
+            held = committed + claimed + candidate.gpu_requested > physical
+            if held:
+                log.info("%s", kv(
+                    event="ondemand.candidate_held", guard=4,
+                    reason="overcommit_no_fit",
+                    ns=candidate.pod_namespace, pod=candidate.pod_name,
+                    clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+                    phys_gpus=physical, committed=committed, peak_at=peak_at,
+                    claimed=claimed or None,
+                ))
+        else:
+            held = True
+            log.info("%s", kv(
+                event="ondemand.candidate_held", guard=4,
+                reason="class_overcommitted",
+                ns=candidate.pod_namespace, pod=candidate.pod_name,
+                clabel=candidate.gpu_class_label,
+            ))
+        if held:
+            candidate.held_by_overcommit = True
+            candidate.next_attempt_at = _short_retry_at(now)
+            await _emit_admission_paused_event(config, state, uid, candidate, 4, now)
+            return _PREFLIGHT_RETRY, None
 
     # Guard 5: per-node feasibility — a multi-GPU (>=2) pod can only schedule if
     # some single node has enough free GPUs, and node-scoped extended resources
@@ -1287,13 +1331,6 @@ async def _preflight_ondemand_candidate(
                 candidate.next_attempt_at = _short_retry_at(now)
                 return _PREFLIGHT_RETRY, None
 
-    # A best-effort admission reserves no window, so there is nothing to size.
-    # The field is required by the delegation schema (shared with the lease
-    # path), so it carries 0 -- which is also what the app would price it at.
-    duration_seconds = (
-        0 if candidate.best_effort
-        else candidate.min_runtime_seconds + config.ondemand_lease_buffer_minutes * 60
-    )
     ask = OnDemandAdmissionCandidate(
         pod_uid=uid,
         # Evidence about the pod, alongside the ask itself.  The creation time is
@@ -2048,7 +2085,25 @@ def _admission_paused_message(guard: int, gpu_class: str, config: Config) -> str
     It must not change while the gate stands.  It is the throttle key
     (``_post_pending_status``), so a count or a timestamp in it would turn every
     retry into a "changed" status and restate the Event each time.
+
+    Guard 4 under ``ONDEMAND_OVERCOMMIT_FIT`` is not a pause of the class --
+    other jobs of it are still being started -- so its message says "limited"
+    and, since this job's own size is now part of the answer, that a smaller or
+    shorter one may start sooner.
     """
+    if guard == 4 and config.ondemand_overcommit_fit:
+        return (
+            f"On-demand GPU admission for gpu-class {gpu_class} is limited: fewer "
+            f"{gpu_class} GPUs are online in the cluster than the reservation "
+            f"service expects (for example, a GPU node is down or under "
+            f"maintenance), and the ones that are online are already reserved "
+            f"for part of the time this job would run, so it is not started "
+            f"until enough of them are free for its whole minimum runtime. "
+            f"Nothing about this pod needs to change; it stays Pending and the "
+            f"controller keeps retrying on its own. A job asking for fewer GPUs "
+            f"or a shorter galends/minimum-runtime-seconds may start sooner. If "
+            f"this persists, {_support_phrase(config)}"
+        )
     if guard == 4:
         cause = (
             f"the reservation service expects more {gpu_class} GPUs than are "
@@ -2087,13 +2142,14 @@ async def _emit_admission_paused_event(
 ) -> None:
     """Tell the pod's owner that on-demand admission for its GPU class is paused.
 
-    Guards 1b, 3 and 4 hold every on-demand candidate of a class until something
+    Guards 1b, 3 and 4 hold on-demand candidates of a class until something
     outside the pod changes -- a node of the class comes back, a stuck
     reservation holder schedules, or an operator reconciles app-side and
-    physical capacity -- so the app is never asked and there is no denial to
-    relay.  The operator gets ``ondemand.gated`` every minute; the owner, who
-    cannot read the controller's log, otherwise gets nothing but a pod that
-    stays Pending.  Guard 5 is not told: it is per-ask fragmentation that clears
+    physical capacity (or, under ``ONDEMAND_OVERCOMMIT_FIT``, enough of the
+    remaining GPUs come free) -- so the app is never asked and there is no
+    denial to relay.  The operator gets ``ondemand.gated`` every minute; the
+    owner, who cannot read the controller's log, otherwise gets nothing but a
+    pod that stays Pending.  Guard 5 is not told: it is per-ask fragmentation that clears
     as other jobs finish, i.e. a full cluster rather than a fault.
 
     Throttled by ``_post_pending_status`` on the same cadence as a lease denial,
@@ -2345,10 +2401,16 @@ async def _run_ondemand_admission_once(
     opening rather than against the same snapshot every time.  Without it a
     burst of best-effort pods would all clear a one-GPU opening in the same
     batch — the app cannot catch that, since a best-effort stub holds no
-    capacity for it to count.  It is deliberately optimistic: it accrues at
-    preflight, before the app has granted anything, because a candidate the app
-    later defers costs only a slightly conservative guard for the rest of *this*
-    batch, whereas accruing after the grant would not bound the batch at all.
+    capacity for it to count.  Guard 4 nets it off an over-counted class's
+    physical GPUs the same way: every lease in the batch is judged before any
+    is granted, so none of them is in ``state.reservations`` yet.  (It counts
+    each earlier ask as covering the whole window, and a best-effort ask too,
+    though guard 4 otherwise counts only reservations -- both slight
+    overestimates, bounded by one batch.)  It is deliberately optimistic: it
+    accrues at preflight, before the app has granted anything, because a
+    candidate the app later defers costs only a slightly conservative guard for
+    the rest of *this* batch, whereas accruing after the grant would not bound
+    the batch at all.
     """
     now = datetime.now(timezone.utc)
     ordered = sorted(
@@ -4182,8 +4244,10 @@ async def _run_capacity_audit(
     ``GpuClassDetail.audit_gpus``).  Physical capacity is snapshotted live from
     Kubernetes node taints.  Any difference is logged at WARNING; any class the
     app believes is larger than it physically is (``app_side > physical``) is
-    added to ``state.overcommitted_gpu_classes``, which pauses new on-demand
-    admissions for that class only.  The pause set itself is also recomputed
+    added to ``state.overcommitted_gpu_classes``, where guard 4 holds new
+    on-demand admissions for that class only -- those that do not fit in its
+    physical GPUs (``ONDEMAND_OVERCOMMIT_FIT``), or all of them with that off.
+    The pause set itself is also recomputed
     every queue-processor tick (``_refresh_overcommit_pause``); this audit is
     what reports the mismatches.
 
@@ -4280,19 +4344,38 @@ def _ondemand_gate_detail(gate: OnDemandGate, config: Config) -> str:
             " Best-effort pods (galends/runtime-guarantee: none) are not affected."
             if config.best_effort_enabled else ""
         )
+        fit = gate.reason == "overcommit_no_fit"
+        head = (
+            f"On-demand GPU jobs for GPU class '{c}' are limited: the controller "
+            f"grants a new on-demand reservation for a pod labelled gpu-class={c} "
+            f"only if it fits in the GPUs physically present for its whole "
+            f"duration, alongside every reservation already booked in that time, "
+            f"and {gate.waiting} pending pod(s) do not (ONDEMAND_OVERCOMMIT_FIT)."
+            if fit else paused
+        )
+        why = (
+            "Leases are therefore checked against the physical count rather than "
+            "the app's, since leases sold against GPUs that do not exist could "
+            "never run."
+            if fit else
+            "Leases sold against GPUs that do not exist could never run."
+        )
+        clears = (
+            "Clears automatically within one queue tick (every "
+            f"{config.queue_processor_interval}s, QUEUE_PROCESSOR_INTERVAL) once the "
+            "counts agree"
+            + (", and for each pod as soon as its lease fits." if fit else ".")
+        )
         return (
-            f"{paused} Cause: capacity mismatch. The reservation app believes this "
+            f"{head} Cause: capacity mismatch. The reservation app believes this "
             f"class has {app} GPUs today, but schedulable Kubernetes nodes tainted "
             f"{TOLERATION_KEY}={c} provide {phys} (allocatable nvidia.com/gpu, or "
-            f"the node's galends/force-node-capacity annotation). Leases sold "
-            f"against GPUs that do not exist could never run. To fix: check for "
-            f"cordoned, NotReady or missing GPU nodes and a failing NVIDIA device "
-            f"plugin (kubectl get nodes; kubectl describe node <node>), or, if the "
-            f"hardware is really gone, lower the class's GPU count or add a capacity "
-            f"override for today in the reservation app.{best_effort} Clears "
-            f"automatically within one queue tick (every "
-            f"{config.queue_processor_interval}s, QUEUE_PROCESSOR_INTERVAL) once the "
-            f"counts agree."
+            f"the node's galends/force-node-capacity annotation). {why} To fix: "
+            f"check for cordoned, NotReady or missing GPU nodes and a failing "
+            f"NVIDIA device plugin (kubectl get nodes; kubectl describe node "
+            f"<node>), or, if the hardware is really gone, lower the class's GPU "
+            f"count or add a capacity override for today in the reservation "
+            f"app.{best_effort} {clears}"
         )
     if gate.guard == 3:
         return (
@@ -4321,9 +4404,11 @@ def _ondemand_gate_detail(gate: OnDemandGate, config: Config) -> str:
 
 
 def _warn_ondemand_gates(state: ControllerState, config: Config) -> None:
-    """Emit one ``ondemand.gated`` WARNING per class-wide gate in force."""
+    """Emit one ``ondemand.gated`` WARNING per class gate in force."""
     now = datetime.now(timezone.utc)
-    for gate in state.plan_ondemand_gates(now):
+    for gate in state.plan_ondemand_gates(
+        now, overcommit_fit=config.ondemand_overcommit_fit
+    ):
         log.warning("%s", kv(
             event="ondemand.gated", clabel=gate.label, guard=gate.guard,
             reason=gate.reason, dur_s=int((now - gate.since).total_seconds()),
@@ -4337,13 +4422,15 @@ async def ondemand_gate_warning_loop(
     state: ControllerState, config: Config
 ) -> None:
     """Every ``ONDEMAND_GATE_WARNING_INTERVAL_S`` s, restate at WARNING every
-    class-wide gate pausing JIT on-demand admission (guards 1b, 3, 4).
+    gate pausing or limiting JIT on-demand admission for a class (guards 1b, 3,
+    4 -- the last only while it holds a pod, under ``ONDEMAND_OVERCOMMIT_FIT``).
 
     The transition lines (``capacity_audit.paused``, ``interlock.activated``)
     fire once and are easy to scroll past, and the per-candidate
     ``ondemand.candidate_held`` lines are per pod, partly DEBUG, and silent
     when nobody is waiting.  This repeats for as long as the gate stands —
-    whether or not a pod is currently held by it — and says what to do.
+    for a class-wide pause, whether or not a pod is currently held by it — and
+    says what to do.
     Reads in-memory state only; no API calls.
     """
     while True:

@@ -218,6 +218,12 @@ class Config:
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
     capacity_check_interval: int = 3600  # seconds between app-side vs physical capacity audits
+    # How guard 4 treats a class the app over-counts.  True: admit an on-demand
+    # lease only if, for its whole duration, it fits in the *physical* GPUs
+    # alongside every reservation the app has already booked -- so a node outage
+    # on a lightly loaded class does not stop on-demand work.  False: the
+    # original blanket pause of every on-demand candidate of the class.
+    ondemand_overcommit_fit: bool = True
     headroom_target_percent: int = 0  # % of each class's physical GPUs to hold free; 0 = disabled
     headroom_notice_minutes: int = 15  # notice a headroom victim gets before it becomes killable
     headroom_check_interval: int = 600  # seconds between headroom evaluations (throttles the sweep)
@@ -308,6 +314,7 @@ class Config:
                 "ONDEMAND_LEASE_BUFFER_MINUTES", 10, minimum=0
             ),
             capacity_check_interval=_env_int("CAPACITY_CHECK_INTERVAL", 3600),
+            ondemand_overcommit_fit=_env_bool("ONDEMAND_OVERCOMMIT_FIT", True),
             # A percentage floors at 0 ("hold nothing", the disabled default) and
             # caps at 100; a notice of 0 means "no notice gate, kill on sight";
             # but an evaluation interval of 0 is a busy loop, so that floors at 1.

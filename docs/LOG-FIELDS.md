@@ -214,6 +214,7 @@ follow this grammar and are not expected to.
 | `deadline` | ISO-8601 UTC | no-show deadline |
 | `until` | ISO-8601 UTC | runtime-guarantee end instant |
 | `at` | ISO-8601 UTC | projected termination-warning kill instant |
+| `peak_at` | ISO-8601 UTC | first instant of a window at which `committed` peaks |
 | `locked_until` | ISO-8601 | account lockout expiry |
 | `date` | ISO-8601 date | the single calendar date a line is about (the effective date under a debug date shift) |
 | `days` | int | signed whole-day count a value is shifted by (the debug effective-date offset) |
@@ -237,6 +238,7 @@ follow this grammar and are not expected to.
 | `node_free` | int | largest single-node free GPUs for a class |
 | `claimed` | int | GPUs already claimed earlier in the same admission batch, netted off `node_free` (emitted only when non-zero) |
 | `demand` | int | GPUs demanded at a boundary, per class |
+| `committed` | int | peak GPUs a class's reservations commit, placed or not, over a window (on-demand guard 4) |
 | `kills` | int | victims selected at a boundary |
 | `short` | int | GPUs still short after preempting every eligible overstayer |
 | `sweep` | `A` \| `B` | preemption sweep phase (`phase=` is the pod lifecycle phase) |

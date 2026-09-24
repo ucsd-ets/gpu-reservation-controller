@@ -172,7 +172,7 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | INFO | `ondemand.candidate_added` | `ns pod poduid clabel gpus group` (+ `min_runtime_s` \| `best_effort`) | `min_runtime_s` is absent for a **best-effort** candidate, which sizes nothing; `best_effort` is emitted only when true. |
 | DEBUG | `ondemand.candidate_removed` | `ns pod poduid` | |
 | INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for something no lease can fix (`detail` carries the scheduler's verdict). |
-| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free claimed nodes`) | **The guard number is the field** — see below. `claimed` (guard 5) is the GPUs already taken by earlier candidates in the same batch. A guard 1 `no_class_nodes`, 3 or 4 hold is also told to the pod's owner as an `OnDemandAdmissionPaused` Event — see below. |
+| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free claimed nodes phys_gpus committed peak_at`) | **The guard number is the field** — see below. `claimed` (guards 4 and 5) is the GPUs already taken by earlier candidates in the same batch. A guard 1 `no_class_nodes`, 3 or 4 hold is also told to the pod's owner as an `OnDemandAdmissionPaused` Event — see below. |
 | WARNING | `ondemand.gated` | `clabel guard reason dur_s candidates detail` (+ `app_gpus phys_gpus` \| `pods`) | **Every 60 s, one line per GPU class whose on-demand admission is paused**, for as long as it stays paused — see below. |
 | ERROR | `ondemand.gate_warning_failed` | `err` | The warning pass raised; retried next minute. |
 | DEBUG | `ondemand.schedule_verdict` | `ns pod` | Scheduler verdict arrived; re-attempting immediately. |
@@ -196,7 +196,8 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | 1 | `schedule_verdict_pending` | No `PodScheduled` verdict yet, so there is nothing to classify. Transient — the MODIFIED fast path shortens it to ~1 s. |
 | 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained/cordoned). Known means the reservation app lists the class: the node inventory omits a class with no schedulable node, so every app-known class is recorded explicitly, as zero when it has none. Fail-open when unknown — a label the app does not list, or no snapshot yet. |
 | 3 | `stuck_holder_interlock` | A reservation holder is stuck Pending on this class. |
-| 4 | `class_overcommitted` | App-side capacity exceeds physical (see §8). **Not applied to a best-effort candidate**, which consumes no app-side capacity to overcommit. |
+| 4 | `overcommit_no_fit` | App-side capacity exceeds physical (see §8), and this lease would not fit in the physical GPUs (`phys_gpus`) for its whole duration: `committed` — the most GPUs reservations of the class hold at any instant of it, first reached at `peak_at` — plus `claimed` plus the ask (`gpus`) exceeds them. The default (`ONDEMAND_OVERCOMMIT_FIT`); an ask that fits is admitted. **Not applied to a best-effort candidate**, which consumes no app-side capacity to overcommit. |
+| 4 | `class_overcommitted` | The same, with `ONDEMAND_OVERCOMMIT_FIT=false`: every on-demand candidate of the class is held, however much of it is idle. |
 | 5 | `no_single_node_fit` | No single node has enough free GPUs for the ask, net of `claimed` (GPUs taken by earlier candidates this batch). Applies to a ≥2-GPU ask, and to **every** best-effort ask — see below. Fail-open when unknown. |
 | — | `class_id_unknown` | The app does not list the pod's `gpu-class` label — a typo, or a class with no `label_value` — or no class list has been fetched yet. Checked **before** guard 1, since no guard's verdict matters for a class that can never be granted. Once the app's full class list is known, the pod's owner is told (`UnknownGpuClass`, listing the classes that do exist). |
 
@@ -220,7 +221,11 @@ and what lifts it.  It repeats whether or not any pod is waiting (`candidates=`
 is how many are held right now, best-effort candidates excluded under guard 4,
 which does not apply to them), because the pause is in force either way and the
 one-shot transition lines (`capacity_audit.paused`, `interlock.activated`) are
-easy to scroll past.  `dur_s` is how long this controller has seen the gate
+easy to scroll past.  Guard 4 `overcommit_no_fit` (the default) is the exception:
+it holds only asks that do not fit, so the class is reported only while it holds
+at least one (`candidates=` counts those), with a `detail` saying admission is
+*limited* rather than paused — a class that is still admitting on-demand work is
+not a pause, and its mismatch keeps the hourly `capacity_audit.mismatch` line.  `dur_s` is how long this controller has seen the gate
 (reset by a restart).  Guard 4 carries both sides of the mismatch
 (`app_gpus`, `phys_gpus`, the latter from the last audit or queue tick); guard 3 carries the
 stuck holder pods in `pods`.  Guard 5 is deliberately not reported: it is
@@ -229,7 +234,10 @@ only when `ONDEMAND_LEASE_ENABLED` is on.  `grep 'event=ondemand.gated'` empty i
 the healthy state.
 
 `grep 'event=ondemand.candidate_held guard=4'` answers "how often is the capacity
-audit blocking admission" without matching on message text.
+audit blocking admission" without matching on message text.  Under
+`overcommit_no_fit`, `peak_at` says *when* the class is full: an instant in the
+future is a booking the lease would have collided with, which is why a class
+that looks idle right now can still hold a long ask.
 
 **Every pending-pod Event shares one throttle, kept per pod uid** (the denial,
 the pause below, `OnDemandLeaseRejected` / `UnknownGpuClass` / `NoReservation`,
@@ -251,6 +259,8 @@ denial to relay.
 Each hold puts a `Warning` Event on the pod (`reason=OnDemandAdmissionPaused`,
 logged as `k8s.event_emitted` with `guard=`) saying the class is paused, why in
 plain terms, and to contact support if it persists (`SUPPORT_CONTACT` names who).
+A guard-4 `overcommit_no_fit` hold says admission is *limited* instead, and that
+a smaller or shorter job may start sooner.
 It deliberately omits what `ondemand.gated` carries for an operator — the counts,
 and the stuck holders, which are other users' pods.  It shares one per-pod
 throttle with `OnDemandLeaseDenied`: a changed status is emitted at once, an
@@ -316,8 +326,8 @@ were deliberately given different keys.
 
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
-| WARNING | `capacity_audit.mismatch` | `clabel app_gpus phys_gpus overcommitted` | **`overcommitted=true` is the direction that pauses admission**; `false` is under-provisioning, logged but harmless. |
-| INFO | `capacity_audit.paused` / `capacity_audit.resumed` | `clabels` | Classes entering/leaving the JIT pause set. Emitted by the hourly audit **and** by any queue-processor tick that moves the set (`trace=queue-…`), so a pause lifts within one `QUEUE_PROCESSOR_INTERVAL` of the counts agreeing. |
+| WARNING | `capacity_audit.mismatch` | `clabel app_gpus phys_gpus overcommitted` | **`overcommitted=true` is the direction that gates admission** (guard 4 — only asks that do not fit, unless `ONDEMAND_OVERCOMMIT_FIT=false`); `false` is under-provisioning, logged but harmless. |
+| INFO | `capacity_audit.paused` / `capacity_audit.resumed` | `clabels` | Classes entering/leaving the guard-4 set (paused outright only with `ONDEMAND_OVERCOMMIT_FIT=false`; otherwise limited to what fits). Emitted by the hourly audit **and** by any queue-processor tick that moves the set (`trace=queue-…`), so a pause lifts within one `QUEUE_PROCESSOR_INTERVAL` of the counts agreeing. |
 | WARNING | `capacity_audit.snapshot_failed` | `target err` | Audit skipped; **the existing pause set is left unchanged** — a transient failure must never silently lift a pause. |
 | ERROR | `capacity_audit.failed` | `err` | |
 

@@ -106,6 +106,8 @@ spec:
               value: {{ .Values.config.preemptionCheckInterval | quote }}
             - name: CAPACITY_CHECK_INTERVAL
               value: {{ .Values.config.capacityCheckInterval | quote }}
+            - name: ONDEMAND_OVERCOMMIT_FIT
+              value: {{ .Values.config.ondemandOvercommitFit | quote }}
             - name: POD_ADOPTION_ENABLED
               value: {{ .Values.config.podAdoptionEnabled | quote }}
             - name: ONDEMAND_MERGE_ENABLED
