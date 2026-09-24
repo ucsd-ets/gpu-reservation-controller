@@ -64,8 +64,8 @@ app/
 | `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; retries the pods waiting on a reservation a deleted/terminated pod held; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; moves a queued pod to an open reservation with room; tells each pod still queued what it waits on; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee: reactively, when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**), and — throttled to `HEADROOM_CHECK_INTERVAL` — anticipatorily, to hold a fixed fraction of each class free for on-demand jobs that have not arrived yet (see **Anticipatory headroom preemption**) |
-| `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
-| `ondemand_gate_warning_loop` | every 60 s (only when `ONDEMAND_LEASE_ENABLED`) | Restates at WARNING (`ondemand.gated`) every GPU class whose JIT admission is paused by a class-wide gate — guard 1b, 3 or 4 — with a plain-English cause and remedy for an operator (see **Operator warning for paused on-demand admission**) |
+| `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and gates on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation** and **Guard 4: admitting what fits on an over-counted class**) |
+| `ondemand_gate_warning_loop` | every 60 s (only when `ONDEMAND_LEASE_ENABLED`) | Restates at WARNING (`ondemand.gated`) every GPU class whose JIT admission is paused by a class-wide gate — guard 1b, 3 or 4 (guard 4 only while it holds a pod, under `ONDEMAND_OVERCOMMIT_FIT`) — with a plain-English cause and remedy for an operator (see **Operator warning for paused on-demand admission**) |
 | `lease_guard_loop` | every 20 s (only when `SINGLETON_LEASE_ENABLED`) | Renews the singleton `coordination.k8s.io` Lease; terminates the process if another live instance takes it (see **Singleton lease guard**) |
 
 Every task is **supervised**: `_on_task_done` records an unhandled exception in
@@ -834,7 +834,8 @@ two-step **preflight → delegate → grant** pipeline.
   than the pod being dropped by guard 1a before the class is ever looked at —
   then applies guard 1 (`is_gpu_gated_pending` + `class_node_counts` — see
   **Guard 1: what the scheduler can and cannot tell us** below), guard 3
-  (`stuck_holder_gpu_classes`), guard 4 (`overcommitted_gpu_classes`), and guard 5
+  (`stuck_holder_gpu_classes`), guard 4 (`overcommitted_gpu_classes` — see
+  **Guard 4: admitting what fits on an over-counted class**), and guard 5
   (per-node feasibility — see **Per-node capacity accounting** below).  Survivors become an
   `OnDemandAdmissionCandidate` — the exact "ask" (username, group, class id, gpu
   count, and `duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES
@@ -1158,8 +1159,10 @@ label the app does not list, and everything before the first successful
 snapshot.  `TestCordonedClassEndToEnd` runs the real snapshot over a cordoned
 node so this cannot regress silently again.  Two side effects follow from the
 guard now working: a drained class that the app still counts GPUs for is
-reported under **both** guard 1 and guard 4 in `ondemand.gated` (it is held at
-1b, which runs first), and an app-known class with no schedulable node is
+reported under **both** guard 1 and guard 4 in `ondemand.gated` when
+`ONDEMAND_OVERCOMMIT_FIT` is off (it is held at 1b, which runs first; with the
+flag on, guard 4 is reported only while it is itself holding a pod, so the drain
+is reported alone), and an app-known class with no schedulable node is
 reported under guard 1 every minute even when nobody is waiting — which is the
 documented contract of that warning, but is new for a class that never had
 hardware.
@@ -1261,11 +1264,13 @@ startup):
 3. Logs every diff at **WARNING**; sets `ControllerState.overcommitted_gpu_classes`
    to the over-committed set (logging INFO as classes enter/leave it).
 
-**Per-class on-demand pause.**  `_preflight_ondemand_candidate` gates JIT
-admission on `overcommitted_gpu_classes` as **guard 4** (mirroring the guard-3
-`stuck_holder_gpu_classes` interlock): a candidate whose `gpu-class` is
-over-committed is short-retried rather than granted, so it stays queued and
-resumes automatically once the class leaves the set.  Only
+**Per-class on-demand gate.**  `_preflight_ondemand_candidate` gates JIT
+admission on `overcommitted_gpu_classes` as **guard 4**: a held candidate is
+short-retried rather than granted, so it stays queued and is re-evaluated on
+later attempts.  By default only an ask that does not fit in the physical GPUs
+is held (see the next section); with `ONDEMAND_OVERCOMMIT_FIT=false` every
+candidate of the class is, mirroring the guard-3 `stuck_holder_gpu_classes`
+interlock, until the class leaves the set.  Only
 the JIT/on-demand path is gated; reserved-path admission under a real user
 booking is untouched (a booking already implies the app granted real calendar
 capacity).  **RBAC**: none new — the audit reuses the existing `nodes: list`
@@ -1284,11 +1289,86 @@ the audit's hourly cadence rather than repeating every tick.  The fail-safe is
 unchanged: a failed pod or node snapshot skips the refresh, leaving the pause
 set as it was.
 
+### Guard 4: admitting what fits on an over-counted class
+
+Pausing every on-demand candidate of an over-counted class was right about the
+risk and wrong about the scope.  The app sells a lease only if it fits in its
+calendar against its *own* per-class count, so on such a class it will sell
+GPUs that do not exist — but one failed GPU then stopped on-demand work for the
+whole class, however idle it was.  `ONDEMAND_OVERCOMMIT_FIT` (default on) narrows
+guard 4 to the asks that could actually land on a missing GPU, by re-running the
+app's own check against the physical count:
+
+```
+hold  ⟺  peak committed(t) over [now, now + lease duration)  +  claimed  +  ask  >  physical
+```
+
+- **`committed(t)`** (`ControllerState.peak_committed_gpus`, pure) is the GPUs
+  of every `booking` and `on_demand` reservation of the class open at `t`,
+  whether or not a pod runs under it — a booking whose holder has not arrived
+  yet is exactly what a lease must not crowd out.  A declared no-show is left
+  out, as in `boundary_demand`; best-effort stubs hold nothing.
+- **Over the lease's whole duration, not just now.**  The duration is the one
+  the lease would get (minimum runtime + `ONDEMAND_LEASE_BUFFER_MINUTES`).  A
+  check at `now` alone would admit a three-hour lease into a class that fills
+  up in an hour; that booking's holder would find the lease pod on its GPU —
+  beyond boundary preemption, which never touches a pod inside its guarantee —
+  and, stuck Pending, trip guard 3 for the whole class.  The count can only
+  rise where a reservation starts, so it is evaluated at `now` and at each
+  start inside the window.
+- **`physical`** is `physical_gpu_capacity`, from the same snapshot that put the
+  class in `overcommitted_gpu_classes` (a label there with no entry has no
+  schedulable node: `0`).
+- **`claimed`** is the batch tally guard 5 already keeps: every lease in a batch
+  is judged before any is granted.  A lease granted by an *earlier* batch is
+  already in `state.reservations` (`_grant_and_admit` upserts it), so the
+  arithmetic is current between queue ticks — which a pod-snapshot "free GPUs"
+  count, up to one `QUEUE_PROCESSOR_INTERVAL` stale, would not be.
+- **Scope**: only classes in `overcommitted_gpu_classes`.  Elsewhere the app's
+  own check is already against the right number, so the flag can only ever
+  admit more than the blanket pause did, never less.
+
+Three things are left out on purpose:
+
+- **Overstayers are not counted.**  They hold physical GPUs but no reservation,
+  and a booking boundary preempts them.  Counting them would make an
+  over-counted class stricter than a healthy one, where a lease is granted and
+  waits behind them — the existing asymmetry that JIT leases trigger no
+  preemption (see **Just-in-time (JIT) on-demand leases**), which is its own fix.
+- **No headroom margin.**  `HEADROOM_TARGET_PERCENT` is capacity held *for*
+  on-demand arrivals; subtracting it here would forbid on-demand from using the
+  very GPUs headroom preemption frees for it.
+- **Bookings sold later can still overrun.**  The app keeps selling bookings
+  against its own count after a lease is granted.  That is bookings
+  over-selling bookings, which the blanket pause never prevented either — the
+  worst case is the same with or without the lease — and the fix is the
+  app-side capacity override the hourly mismatch WARNING already asks for.
+
+**Known limitations.**  A lease asked for while its owner's own booking is about
+to open counts both, though merge would fold the lease into the booking at open,
+so it is held slightly conservatively; `claimed` likewise treats each earlier ask
+as covering the whole window.  Physical capacity still counts a NotReady node
+(the snapshot drops only cordoned and deleting ones), so a crashed but
+uncordoned node is invisible to guard 4 in either mode.
+
+**Reporting.**  A hold logs `ondemand.candidate_held guard=4
+reason=overcommit_no_fit` with `committed`, `peak_at`, `phys_gpus`, `gpus` (and
+`claimed` when non-zero), and tells the pod's owner through the same
+`OnDemandAdmissionPaused` Event, reworded: admission is *limited*, and a job
+asking for fewer GPUs or a shorter minimum runtime may start sooner.
+`ondemand.gated` reports the class only while a candidate is held by it
+(`OnDemandCandidate.held_by_overcommit`, reset at the top of every preflight): a
+class still admitting on-demand work is not paused, and the mismatch keeps its
+own hourly `capacity_audit.mismatch` WARNING.  `ONDEMAND_OVERCOMMIT_FIT=false`
+restores the blanket pause (`reason=class_overcommitted`) and its reporting
+exactly.  **RBAC**: none new — in-memory arithmetic only.
+
 ### Operator warning for paused on-demand admission
 
-Three JIT guards pause admission for a **whole GPU class** until something
-changes: guard 1b (no schedulable node), guard 3 (stuck holder interlock) and
-guard 4 (app-side overcommit).  Each announces itself once on transition
+Three JIT guards hold admission for a GPU class until something changes:
+guard 1b (no schedulable node), guard 3 (stuck holder interlock) and guard 4
+(app-side overcommit — for the whole class with `ONDEMAND_OVERCOMMIT_FIT` off,
+otherwise only the asks that do not fit).  Each announces itself once on transition
 (`interlock.activated`, `capacity_audit.paused`), and the per-candidate
 `ondemand.candidate_held` lines are per pod, partly DEBUG, and silent when nobody
 is waiting — so a pause could stand for days with nothing in the log saying so.
@@ -1296,7 +1376,8 @@ is waiting — so a pause could stand for days with nothing in the log saying so
 `ondemand_gate_warning_loop` closes that: every 60 s
 (`ONDEMAND_GATE_WARNING_INTERVAL_S`, fixed — a knob to quieten it would be the
 wrong fix) it logs one `ondemand.gated` WARNING per gated class, whether or not a
-pod is currently waiting.  `ControllerState.plan_ondemand_gates` (pure bar its
+pod is currently waiting — except guard 4 under `ONDEMAND_OVERCOMMIT_FIT`, which
+is reported only while it is holding a pod, with `candidates=` counting those.  `ControllerState.plan_ondemand_gates` (pure bar its
 `ondemand_gate_since` bookkeeping) reads exactly the state the preflight reads,
 including guard 1b's fail-open and guard 4's best-effort exemption, so the warning
 cannot describe a gate the preflight is not applying.  The `detail` field is
@@ -1352,8 +1433,11 @@ set, with no full stop after it so it copies cleanly out of `kubectl describe`.
   and the stuck holders' names, which are *other users'* pods (a namespace is a
   username).  An operator correlates a quoted Event with `ondemand.gated` by
   `clabel`.
-- **Scope is the class-wide gates: 1b, 3 and 4** — the same three
-  `ondemand.gated` reports.  Guard 5 is fragmentation that clears as jobs finish,
+- **Scope is the class gates: 1b, 3 and 4** — the same three
+  `ondemand.gated` reports.  Under `ONDEMAND_OVERCOMMIT_FIT` a guard-4 hold is
+  per ask, so its message says admission is *limited* rather than paused, and
+  that a smaller or shorter job may start sooner — still without a count or an
+  instant, which would break the throttle key.  Guard 5 is fragmentation that clears as jobs finish,
   a full cluster rather than a fault.  A best-effort candidate is exempt from
   guard 4, so it is never told about one; guard 1b has no such exemption (a pod
   that wants no guarantee still needs a node).
@@ -1643,7 +1727,7 @@ LIST the sweep and queue tick already issue.
 
 The interaction worth knowing is with **App-side vs physical capacity
 reconciliation**: forcing a class below the app's `effective_gpus_today` makes it
-read over-committed, which pauses JIT admission for it (guard 4) and logs the
+read over-committed, which gates JIT admission for it (guard 4) and logs the
 hourly mismatch WARNING — usually the point of forcing capacity down.  Forcing it
 *up* to silence that audit conceals a real shortage instead of fixing it.
 
@@ -1913,7 +1997,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's refusal of a JIT lease onto the waiting pod as a `Warning` Event — its **409** denial reason (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class it does not recognise (`reason=OnDemandLeaseRejected`) — so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
-| `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
+| `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused (or, for a guard-4 hold under `ONDEMAND_OVERCOMMIT_FIT`, limited) and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
 | `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of the "contact support" suggestion in that Event and the pod-problem Events. Unset = the suggestion names no one |
 | `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), or one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**). Throttled with the denial Event, on its cadence; `false` disables |
 | `RESERVATION_WAIT_EVENT_ENABLED` | `true` | Put an Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`WaitingForReservation`, `Normal`), the owner's other pods hold its GPUs (`ReservationFull`, naming them) or it holds fewer GPUs than the pod requests (`ReservationTooSmall`) (see **Telling the pod's owner what its reservation is waiting on**). Throttled with the denial Event, on its cadence; `false` disables |
@@ -1926,7 +2010,8 @@ the claimed set and the grace re-arm path above applies.
 | `DEFAULT_USAGE_GROUP` | *(absent)* | Usage group assumed for a pod that names none — standing in for the `REQUIRED_GROUP_LABEL` label when that feature is on (and therefore for the reserved-path match too), else for the `galends/usage-group` annotation. Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
-| `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and pauses on-demand admission for classes the app over-counts (the pause itself is also re-checked every queue-processor tick) (see **App-side vs physical capacity reconciliation**) |
+| `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and gates on-demand admission for classes the app over-counts (the gated set itself is also re-checked every queue-processor tick) (see **App-side vs physical capacity reconciliation**) |
+| `ONDEMAND_OVERCOMMIT_FIT` | `true` | How guard 4 gates a class the app over-counts: admit an on-demand lease only if it fits in the physical GPUs for its whole duration, alongside every reservation already booked in that time, so a node outage on a lightly loaded class does not stop on-demand jobs (see **Guard 4: admitting what fits on an over-counted class**). `false` restores the blanket pause of every on-demand admission for the class until the counts agree |
 | `HEADROOM_TARGET_PERCENT` | `0` | Percentage of each GPU class's physical capacity to hold free for on-demand jobs that have not arrived yet, reclaimed from pods past their runtime guarantee (see **Anticipatory headroom preemption**). `0` disables the feature; a pod inside its guarantee is never a headroom victim |
 | `HEADROOM_NOTICE_MINUTES` | `15` | Notice a headroom victim gets before it becomes killable — it is stamped with a `galends/termination-warning-at` deadline first and only becomes eligible once that deadline elapses. `0` = no notice. Requires `TERMINATION_WARNING_ENABLED`; with warnings off the gate is bypassed |
 | `HEADROOM_CHECK_INTERVAL` | `600` | Seconds between headroom evaluations. Headroom rides the preemption sweep but is throttled to this slower cadence so an idle cluster is not LISTed on `PREEMPTION_CHECK_INTERVAL`. Kill latency is therefore `HEADROOM_NOTICE_MINUTES` to `HEADROOM_NOTICE_MINUTES + this` after a pod is warned |

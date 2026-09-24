@@ -5,7 +5,7 @@
 #
 # A change here means the SAME file and the SAME manifest must land in the
 # sibling repo.  See docs/SHARED-ARTIFACTS.md.
-d68dc4c90d037156a47119dbb31eb2fad949bcd7999f421cb78b6bf10cd629e6  LOG-FIELDS.md
+5c96d76a894d56e10562a465c622de1349561f54965819d4cb18df2b73117778  LOG-FIELDS.md
 0d7fe2753144668d5c4b9daf9ece309d4da32a2e095775607c25a6960fa151df  RESERVATION-API.md
 b118077709f7a4fb3fcdecea00115d9a69c743e6ec24ae9bcccc8c6d8a628030  SCHEDULING.md
 66d486dc0470636d0924e0202530c29b6ab7ab089ebc1d638ef79eb386dabe35  log_fields.py
