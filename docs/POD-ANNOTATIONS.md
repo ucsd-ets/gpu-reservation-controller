@@ -546,8 +546,9 @@ a deletion no warning announces (below),
 `OnDemandLeaseDenied` when a lease request is refused — §5.1 —
 `OnDemandAdmissionPaused` when on-demand admission for the pod's GPU class is
 on hold — §5.2 — `OnDemandLeaseRejected`, `UnknownGpuClass`,
-`NoReservation` and `AnnotationIgnored` when something about the pod itself
-needs fixing — §5.3 — and `WaitingForReservation`, `ReservationFull` and
+`NoReservation`, `AnnotationIgnored` and `NoMatchingNode` when something about
+the pod itself needs fixing, and `WaitingForNode` while it waits for room on the
+nodes it asked for — §5.3 — and `WaitingForReservation`, `ReservationFull` and
 `ReservationTooSmall` while the pod waits for one of your reservations — §5.4).
 These are richer
 than the annotations but need Kubernetes API access to read, so they are for
@@ -693,7 +694,7 @@ begins.
 
 ### 5.3 When the pod itself needs fixing
 
-§5.1 and §5.2 report things outside the pod.  These four report the pod: the
+§5.1 and §5.2 report things outside the pod.  These five report the pod: the
 controller cannot act on it *as written*, and waiting will not change that —
 the pod has to be corrected (usually: fix it and recreate it) or, if it looks
 right, reported to support.
@@ -704,6 +705,7 @@ right, reported to support.
 | `UnknownGpuClass` | The pod's `gpu-class` label is not a GPU class the reservation service knows, so no reservation can match it and it cannot be admitted on demand. The Event lists the classes that do exist. |
 | `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
 | `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, or the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis.  A pod that waits for its reservation instead of being admitted now because of one is told in its §5.4 Event instead. |
+| `NoMatchingNode` | The pod's `nodeSelector`, or the required part of its node affinity, rules out every schedulable node of its GPU class — a mistyped host name, a hardware label the class does not have, or a node that is cordoned or down — so it could not start there and no on-demand lease is requested for it. The Event quotes the constraint, and names any other GPU class whose nodes it *does* match, since asking for one class's hardware under another's `gpu-class` label is a common cause. The controller keeps checking on its queue interval (5 minutes by default), so a pod waiting on a cordoned or down node goes ahead once the node is back. |
 
 ```console
 $ kubectl describe pod my-training-job
@@ -728,6 +730,22 @@ Events:
   `NoReservation` are only reported once the controller has the reservation
   service's full class list and reservation list — so a pod created while the
   service is unreachable is told nothing rather than something false.
+  `NoMatchingNode` likewise waits for the controller's first look at the
+  cluster's nodes, and a constraint it cannot evaluate (an operator Kubernetes
+  itself would reject) is treated as no constraint at all.
+
+**A pod that narrows its nodes but can run on some of them** is not a problem
+to fix, so it is told with a `Normal` Event instead:
+
+| Event | Type | What it means |
+|---|---|---|
+| `WaitingForNode` | `Normal` | None of the nodes the pod's `nodeSelector` or node affinity allows has the GPUs it requests free right now, so no on-demand lease is requested yet — one would be charged while the pod waited. It is re-checked on the controller's queue interval (5 minutes by default), and a lease is requested once one of those nodes has room. Other nodes of the class may well be free: widening or removing the constraint lets the pod use them. |
+
+A constraint that allows **every** node of the class (a `nodeSelector` on the
+class's own hardware label, say) narrows nothing and changes nothing.  Only
+on-demand admission checks placement: a pod waiting for one of your bookings
+(§5.4) is admitted when the booking opens, and then waits for its nodes the
+ordinary way, with kube-scheduler's `FailedScheduling` saying why.
 
 ### 5.4 While the pod waits for your reservation
 
@@ -812,7 +830,7 @@ is expected in these cases:
 - **The scheduler has not ruled on it yet** — the first few seconds after it is
   created.
 - **The scheduler named something no reservation can fix** — `Insufficient cpu`
-  or `memory`, a node selector nothing matches, a volume that cannot bind. The
+  or `memory`, a volume that cannot bind. The
   controller steps aside and kube-scheduler's own `FailedScheduling` Event is
   the one that says what is wrong; the controller looks at the pod again at its
   next resync, roughly every 10 minutes.
@@ -820,7 +838,8 @@ is expected in these cases:
   best-effort pod — waits quietly while its class's free GPUs are spread across
   nodes with none holding enough on its own (a pod cannot span nodes). It is
   retried on the controller's queue interval (5 minutes by default) until one
-  node does.
+  node does. (A pod whose own node selector or affinity is what rules the free
+  nodes out is told, with `WaitingForNode` — §5.3.)
 - **A lease was granted but the pod could not be admitted under it** (a
   transient Kubernetes error, say): the lease is cancelled at once (reason
   `controller-revoked`) and a fresh one requested 2–5 minutes later.

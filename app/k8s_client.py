@@ -36,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
-from typing import AsyncIterator, Callable, NamedTuple, Optional, TypeVar
+from typing import AsyncIterator, Callable, Iterable, NamedTuple, Optional, TypeVar
 
 from kubernetes import client as k8s_client, config as k8s_config, watch
 from kubernetes.client.rest import ApiException
@@ -721,6 +721,10 @@ def is_gpu_gated_pending(pod, taint_key: str) -> Optional[bool]:
     report it.  Such a pod classifies ``True``, is granted a lease, and stays
     Pending under it.  The backstops are guard 3 (a stuck holder freezes the
     class), the lease's own short expiry, and ``_teardown_ondemand_lease``.
+    The pod's own node selector and required node affinity are the one second
+    constraint the controller checks for itself, against node labels
+    (``get_pod_node_placement``), since the scheduler cannot report on them
+    here either.
     """
     if get_pod_phase(pod) != "Pending":
         return None
@@ -764,6 +768,194 @@ def is_gpu_gated_pending(pod, taint_key: str) -> Optional[bool]:
         return False
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Node placement: a pod's node selector and required node affinity
+# ---------------------------------------------------------------------------
+#
+# A pod may narrow where it runs beyond its GPU class: a node selector naming
+# one host, or a required affinity on a hardware label.  Guard 1a cannot see
+# that.  Before admission every node of the pod's class is rejected on our
+# taint, and TaintToleration runs ahead of NodeAffinity, so a pod pinned to one
+# busy node -- or to hardware its class does not have -- produces the same
+# scheduler message as one that is not.  The controller therefore evaluates the
+# constraints itself, against the node labels it already LISTs.  Only the hard
+# constraints are digested; preferred affinity never stops a pod scheduling.
+
+_LABEL_OPERATORS = frozenset({"In", "NotIn", "Exists", "DoesNotExist", "Gt", "Lt"})
+# The API server accepts only these two for matchFields, and only on
+# metadata.name.
+_FIELD_OPERATORS = frozenset({"In", "NotIn"})
+_NODE_NAME_FIELD = "metadata.name"
+# What Go's strconv.ParseInt(s, 10, 64) accepts for a Gt/Lt operand.  Python's
+# int() is looser -- it takes surrounding whitespace and "1_000" -- which would
+# match nodes the scheduler does not.
+_GO_INT_RE = re.compile(r"[+-]?[0-9]+")
+
+
+@dataclass(frozen=True)
+class NodeRequirement:
+    """One ``matchExpressions`` (label) or ``matchFields`` (node name) entry."""
+
+    key: str
+    operator: str
+    values: tuple[str, ...] = ()
+
+    def matches(self, value: Optional[str]) -> bool:
+        """Whether a node whose value for ``key`` is *value* satisfies this.
+
+        *value* is ``None`` when the node has no such label.  The semantics are
+        Kubernetes' own: ``NotIn`` and ``DoesNotExist`` hold for a node without
+        the label, and ``Gt``/``Lt`` need both the label and the single bound to
+        be integers, failing otherwise.
+        """
+        op = self.operator
+        if op == "In":
+            return value is not None and value in self.values
+        if op == "NotIn":
+            return value is None or value not in self.values
+        if op == "Exists":
+            return value is not None
+        if op == "DoesNotExist":
+            return value is None
+        if value is None or len(self.values) != 1:
+            return False
+        if not (_GO_INT_RE.fullmatch(value) and _GO_INT_RE.fullmatch(self.values[0])):
+            return False
+        have, bound = int(value), int(self.values[0])
+        return have > bound if op == "Gt" else have < bound
+
+    def describe(self) -> str:
+        values = ", ".join(self.values)
+        return {
+            "In": f"{self.key} in ({values})",
+            "NotIn": f"{self.key} not in ({values})",
+            "Exists": f"{self.key} exists",
+            "DoesNotExist": f"{self.key} absent",
+            "Gt": f"{self.key} > {values}",
+            "Lt": f"{self.key} < {values}",
+        }[self.operator]
+
+
+@dataclass(frozen=True)
+class NodeSelectorTerm:
+    """One required node-affinity term: every requirement in it must hold."""
+
+    match_expressions: tuple[NodeRequirement, ...] = ()
+    match_fields: tuple[NodeRequirement, ...] = ()
+
+    def matches(self, node_name: str, labels: dict[str, str]) -> bool:
+        # An empty term matches no node, as in Kubernetes.
+        if not self.match_expressions and not self.match_fields:
+            return False
+        return all(r.matches(labels.get(r.key)) for r in self.match_expressions) and all(
+            r.matches(node_name) for r in self.match_fields
+        )
+
+    def describe(self) -> str:
+        return " and ".join(
+            r.describe() for r in (*self.match_expressions, *self.match_fields)
+        )
+
+
+@dataclass(frozen=True)
+class NodePlacement:
+    """A pod's hard node constraints, digested to plain data.
+
+    ``spec.nodeSelector`` (every label must equal) and the terms of
+    ``spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution``
+    (at least one must match).  A node must satisfy both.  *affinity_terms* is
+    ``None`` when the pod has no required node affinity at all.
+    """
+
+    node_selector: tuple[tuple[str, str], ...] = ()
+    affinity_terms: Optional[tuple[NodeSelectorTerm, ...]] = None
+
+    def matches(self, node_name: str, labels: dict[str, str]) -> bool:
+        if any(labels.get(k) != v for k, v in self.node_selector):
+            return False
+        if self.affinity_terms is None:
+            return True
+        return any(t.matches(node_name, labels) for t in self.affinity_terms)
+
+    def matching_nodes(
+        self, node_names: Iterable[str], labels_by_node: dict[str, dict[str, str]]
+    ) -> frozenset[str]:
+        """The subset of *node_names* this placement allows."""
+        return frozenset(
+            n for n in node_names if self.matches(n, labels_by_node.get(n, {}))
+        )
+
+    def describe(self) -> str:
+        """The constraints in a line, for a log field or an Event message."""
+        parts = []
+        if self.node_selector:
+            parts.append(
+                "node selector " + ", ".join(f"{k}={v}" for k, v in self.node_selector)
+            )
+        if self.affinity_terms is not None:
+            terms = [t.describe() for t in self.affinity_terms]
+            if len(terms) > 1:
+                terms = [f"({t})" for t in terms]
+            parts.append("required node affinity " + " or ".join(terms))
+        return "; ".join(parts)
+
+
+def _node_requirements(
+    raw, operators: frozenset[str], key: Optional[str] = None
+) -> Optional[tuple[NodeRequirement, ...]]:
+    """Digest a ``matchExpressions`` / ``matchFields`` list, or ``None`` when an
+    entry uses an operator (or, for fields, a key) this module cannot evaluate."""
+    out = []
+    for r in raw or []:
+        operator = getattr(r, "operator", None)
+        req_key = getattr(r, "key", None)
+        if operator not in operators or not req_key or (key is not None and req_key != key):
+            return None
+        out.append(NodeRequirement(
+            key=str(req_key), operator=operator,
+            values=tuple(str(v) for v in (getattr(r, "values", None) or [])),
+        ))
+    return tuple(out)
+
+
+def get_pod_node_placement(pod) -> Optional[NodePlacement]:
+    """Return *pod*'s node selector and required node affinity, or ``None``.
+
+    ``None`` when the pod carries neither, and also when its affinity uses
+    something this module cannot evaluate (an operator or ``matchFields`` key
+    the API server would not accept in the first place).  Callers treat
+    ``None`` as "no constraint", so a placement the controller cannot read
+    never holds a pod back -- the same fail-open posture as guards 1b and 5.
+    """
+    spec = getattr(pod, "spec", None)
+    selector = getattr(spec, "node_selector", None) or {}
+    affinity = getattr(spec, "affinity", None)
+    node_affinity = getattr(affinity, "node_affinity", None)
+    required = getattr(
+        node_affinity, "required_during_scheduling_ignored_during_execution", None
+    )
+    if not selector and required is None:
+        return None
+    terms: Optional[tuple[NodeSelectorTerm, ...]] = None
+    if required is not None:
+        digested = []
+        for term in getattr(required, "node_selector_terms", None) or []:
+            expressions = _node_requirements(
+                getattr(term, "match_expressions", None), _LABEL_OPERATORS
+            )
+            fields = _node_requirements(
+                getattr(term, "match_fields", None), _FIELD_OPERATORS, _NODE_NAME_FIELD
+            )
+            if expressions is None or fields is None:
+                return None
+            digested.append(NodeSelectorTerm(expressions, fields))
+        terms = tuple(digested)
+    return NodePlacement(
+        node_selector=tuple(sorted((str(k), str(v)) for k, v in selector.items())),
+        affinity_terms=terms,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1042,10 @@ class ToleratedPodInfo:
     reservation_end: Optional[str] = None
     reservation_gpu_count: Optional[str] = None
     gpu_class_name: Optional[str] = None
+    # The pod's node selector and required node affinity, or None when it has
+    # neither (see get_pod_node_placement).  Carried so guard 3 can tell a
+    # holder stuck on its own placement from one stuck on the class.
+    placement: Optional[NodePlacement] = None
 
 
 async def snapshot_tolerated_pods(
@@ -918,6 +1114,7 @@ async def snapshot_tolerated_pods(
                 reservation_end=res_end,
                 reservation_gpu_count=res_gpus,
                 gpu_class_name=res_class,
+                placement=get_pod_node_placement(pod),
             )
         )
     log.debug("%s", kv(event="k8s.list_pods_done", purpose="tolerated_snapshot", count=len(out)))
@@ -1013,7 +1210,10 @@ def node_exclusion_reason(node) -> Optional[str]:
 
 
 async def snapshot_node_gpu_inventory(
-    taint_key: str, gpu_resource: str = "nvidia.com/gpu"
+    taint_key: str,
+    gpu_resource: str = "nvidia.com/gpu",
+    *,
+    labels_out: Optional[dict[str, dict[str, str]]] = None,
 ) -> dict[str, dict[str, int]]:
     """Return allocatable GPUs per GPU-class label, broken down **per node**.
 
@@ -1038,6 +1238,11 @@ async def snapshot_node_gpu_inventory(
     to per-class totals for consumers that only need the aggregate, while
     per-node accounting (whether any *single* node can host a multi-GPU pod)
     reads the breakdown directly.
+
+    When *labels_out* is given, it is filled with ``{node_name: labels}`` for
+    every node the inventory records, from the same LIST, so a pod's node
+    selector can be checked against exactly the nodes counted here without a
+    second one.
     """
     log.debug("%s", kv(event="k8s.list_nodes", purpose="gpu_inventory"))
     node_list = await _run(_core_v1.list_node)
@@ -1078,6 +1283,10 @@ async def snapshot_node_gpu_inventory(
             gpus = forced
         for gpu_class in classes:
             inventory.setdefault(gpu_class, {})[node.metadata.name] = gpus
+        if labels_out is not None:
+            labels_out[node.metadata.name] = dict(
+                getattr(node.metadata, "labels", None) or {}
+            )
     # The inventory is a nested map, so it is fanned out to one line per class
     # rather than emitted as a dict inside a single field.
     for _cls, _nodes in sorted(inventory.items()):
@@ -1625,15 +1834,17 @@ async def emit_admission_paused_event(
 # Events telling a pending pod's owner why it is not running yet, whose
 # message ``main`` renders -- the siblings of OnDemandLeaseDenied and
 # OnDemandAdmissionPaused, which report the app refusing or a class being
-# paused.  The first four say something *about the pod* stops the controller
-# admitting it; the last three, that it is queued for a reservation and what
-# that reservation is waiting on.  Each reason maps to the Event's type, its
-# ``action`` (what the controller was attempting) and its ``generateName``
-# prefix.
+# paused.  The first five say something *about the pod* stops the controller
+# admitting it; the rest, that it is waiting -- for a reservation it is queued
+# on, or for room on the nodes it asked for.  Each reason maps to the Event's
+# type, its ``action`` (what the controller was attempting) and its
+# ``generateName`` prefix.
 LEASE_REJECTED_REASON = "OnDemandLeaseRejected"
 UNKNOWN_GPU_CLASS_REASON = "UnknownGpuClass"
 NO_RESERVATION_REASON = "NoReservation"
 ANNOTATION_IGNORED_REASON = "AnnotationIgnored"
+NO_MATCHING_NODE_REASON = "NoMatchingNode"
+WAITING_FOR_NODE_REASON = "WaitingForNode"
 WAITING_FOR_RESERVATION_REASON = "WaitingForReservation"
 RESERVATION_FULL_REASON = "ReservationFull"
 RESERVATION_TOO_SMALL_REASON = "ReservationTooSmall"
@@ -1643,6 +1854,10 @@ _PENDING_POD_EVENTS: dict[str, tuple[str, str, str]] = {
     UNKNOWN_GPU_CLASS_REASON: ("Warning", "AdmitPod", "gpu-unknown-class-"),
     NO_RESERVATION_REASON: ("Warning", "AdmitPod", "gpu-no-reservation-"),
     ANNOTATION_IGNORED_REASON: ("Warning", "ReadAnnotations", "gpu-annotation-ignored-"),
+    NO_MATCHING_NODE_REASON: ("Warning", "RequestOnDemandLease", "gpu-no-matching-node-"),
+    # Normal, like WaitingForReservation: the owner chose the nodes, and they
+    # are busy -- nothing is wrong.
+    WAITING_FOR_NODE_REASON: ("Normal", "RequestOnDemandLease", "gpu-node-wait-"),
     # Normal: a pod waiting for a window its owner chose to book is the system
     # working as intended, not something to act on.
     WAITING_FOR_RESERVATION_REASON: ("Normal", "AdmitPod", "gpu-reservation-wait-"),
@@ -1667,7 +1882,7 @@ async def emit_pending_pod_event(
 ) -> None:
     """Create an Event telling a pending pod's owner why it is not running yet.
 
-    *reason* is one of the seven above.  Something about the pod stops the
+    *reason* is one of the nine above.  Something about the pod stops the
     controller admitting it as written (``Warning``):
 
     - ``OnDemandLeaseRejected`` -- the reservation app answered the pod's lease
@@ -1680,6 +1895,14 @@ async def emit_pending_pod_event(
       qualify for on-demand admission either.
     - ``AnnotationIgnored`` -- one of its ``galends/*`` job-input annotations
       was invalid, or asks for something this deployment does not offer.
+    - ``NoMatchingNode`` -- its node selector or required node affinity allows
+      none of its GPU class's schedulable nodes, so no lease is requested.
+
+    Or it is waiting for room on the nodes its node selector or affinity allows
+    (``Normal``):
+
+    - ``WaitingForNode`` -- none of them has the GPUs it asks for free, so no
+      lease is requested yet.
 
     Or it is queued for one of its owner's reservations:
 

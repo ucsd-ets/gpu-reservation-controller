@@ -21,7 +21,7 @@ import math
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Literal, NamedTuple, Optional
+from typing import Collection, Iterable, Literal, NamedTuple, Optional
 
 from .log_fields import kv
 from .schemas import ReservationResponse
@@ -166,6 +166,47 @@ def largest_node_free_by_class(
         gpu_class: max(nodes.values(), default=0)
         for gpu_class, nodes in free_by_node_class.items()
     }
+
+
+def placement_stall_reason(
+    gpu_count: int,
+    class_free_by_node: dict[str, int],
+    placement_nodes: Optional[Collection[str]],
+) -> Optional[str]:
+    """Why an admitted pod's being stuck Pending is its own placement's doing.
+
+    Guard 3 pauses on-demand admission for a whole class while any admitted pod
+    of it is stuck Pending, because that normally means the class has less room
+    than the controller's accounting believes.  A pod whose node selector or
+    affinity (*placement_nodes*: the nodes of its class it allows) keeps it off
+    the nodes that do have room says nothing of the sort, and must not pause
+    the class for everyone else -- one user's pod pinned to a busy host, or to
+    hardware the class does not have, would otherwise hold every on-demand job
+    of the class for as long as it waited:
+
+    - ``"no_matching_node"`` -- it allows none of the class's nodes, so it
+      cannot start here at any occupancy.
+    - ``"matching_nodes_full"`` -- no node it allows has *gpu_count* GPUs free,
+      but another node of the class does: without the constraint it would run.
+
+    ``None`` otherwise, and the pod counts towards guard 3 as before: it is
+    unconstrained (*placement_nodes* is ``None``), or the class is short on
+    every node (a pod without the constraint would be stuck too), or a node it
+    allows has room (it is stuck for a reason nothing here explains).  Pure.
+    """
+    if placement_nodes is None:
+        return None
+    if not placement_nodes:
+        return "no_matching_node"
+    if any(class_free_by_node.get(n, 0) >= gpu_count for n in placement_nodes):
+        return None
+    if any(
+        free >= gpu_count
+        for n, free in class_free_by_node.items()
+        if n not in placement_nodes
+    ):
+        return "matching_nodes_full"
+    return None
 
 
 def gpu_capacity_by_class(
@@ -960,6 +1001,16 @@ class ControllerState:
         # (fail-open), and a failed snapshot leaves the prior map intact
         # (fail-safe).  Empty = no data yet.
         self.class_node_counts: dict[str, int] = {}
+
+        # Node placement (guards 1 and 5 for a pod with a node selector or
+        # required node affinity): free GPUs per node, per class, and each
+        # node's labels, from the same inventory snapshot.  node_free_by_class
+        # is the collapse of the first; a pod that may run on only some of a
+        # class's nodes is measured against those nodes instead.  Same
+        # lifecycle: refreshed each tick, left intact on a failed snapshot, and
+        # a class or node absent from either is unknown and never blocks.
+        self.node_free_by_node_class: dict[str, dict[str, int]] = {}
+        self.node_labels: dict[str, dict[str, str]] = {}
 
         # No-show tracking:
         # Maps reservation_id → deadline by which a matching pod must appear.
