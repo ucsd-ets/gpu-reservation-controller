@@ -39,7 +39,7 @@ import socket
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Awaitable, Callable, NamedTuple, Optional, Sequence
+from typing import AsyncIterator, Awaitable, Callable, Iterable, NamedTuple, Optional, Sequence
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -69,6 +69,7 @@ from .controller import (
     gpu_capacity_by_class,
     largest_node_free_by_class,
     node_counts_by_class,
+    placement_stall_reason,
     reconcile_capacity,
     select_victims_locally,
     slot_end,
@@ -79,6 +80,7 @@ from .k8s_client import (
     LEASE_NAME,
     LEASE_REJECTED_REASON,
     MIN_RUNTIME_ANNOTATION,
+    NO_MATCHING_NODE_REASON,
     NO_RESERVATION_REASON,
     RESERVATION_FULL_REASON,
     RESERVATION_TOO_SMALL_REASON,
@@ -87,8 +89,10 @@ from .k8s_client import (
     TERMINAL_PHASES,
     UNKNOWN_GPU_CLASS_REASON,
     USAGE_GROUP_ANNOTATION,
+    WAITING_FOR_NODE_REASON,
     WAITING_FOR_RESERVATION_REASON,
     AnnotationProblem,
+    NodePlacement,
     PodWatcher,
     ReservationFacts,
     acquire_singleton_lease,
@@ -116,6 +120,7 @@ from .k8s_client import (
     get_pod_gpu_count,
     get_pod_guarantee_status,
     get_pod_min_runtime_seconds,
+    get_pod_node_placement,
     get_pod_runtime_guarantee_request,
     get_pod_phase,
     get_pod_usage_group,
@@ -1062,7 +1067,9 @@ async def _preflight_ondemand_candidate(
     3. Resolve the pod's gpu-class label to the app's numeric class id; a label
        the app does not know holds the candidate, and its owner is told with an
        ``UnknownGpuClass`` Event (``_emit_unknown_class_event``).
-    4. Guard 1 (Pending for a reason a lease can fix, and the class has nodes).
+    4. Guard 1 (Pending for a reason a lease can fix, the class has nodes, and
+       the pod's node selector / required affinity allows at least one of
+       them -- told to its owner as ``NoMatchingNode`` when it allows none).
     5. Guard 3 (stuck reservation-holder safety interlock).
     6. Guard 4 (over-committed gpu-class admission pause) — not applied to a
        best-effort candidate, which consumes no app-side capacity to overcommit.
@@ -1070,7 +1077,9 @@ async def _preflight_ondemand_candidate(
        ``OnDemandAdmissionPaused`` Event (``_emit_admission_paused_event``).
     7. Guard 5 (per-node feasibility: no single node can host the ask) — applied
        to a multi-GPU ask, and to **every** best-effort ask regardless of count,
-       since nothing app-side bounds how many of those are admitted.
+       since nothing app-side bounds how many of those are admitted; and to
+       every ask whose node placement narrows the class, over only the nodes
+       it allows (told to its owner as ``WaitingForNode``).
     8. Size the ask.
 
     *claimed_by_class* is the GPUs already granted earlier in the current
@@ -1213,6 +1222,42 @@ async def _preflight_ondemand_candidate(
         await _emit_admission_paused_event(config, state, uid, candidate, 1, now)
         return _PREFLIGHT_RETRY, None
 
+    # Guard 1, the pod's own half of 1b: the class has nodes, but does the pod
+    # allow any of them?  A node selector or required node affinity is as
+    # invisible to 1a as a GPU shortage -- the scheduler rejected the class's
+    # nodes on our taint before weighing affinity -- so it is checked here,
+    # against the labels of the nodes the inventory counted.  A pod allowing
+    # none is held rather than dropped (the node it names may only be cordoned)
+    # and its owner told: a lease would be charged for a pod that cannot start,
+    # and once admitted and stuck it would trip guard 3 for the whole class.
+    # Unknown stays open: no inventory yet, or a placement it cannot read.
+    placement = get_pod_node_placement(fresh_pod)
+    class_free_by_node = state.node_free_by_node_class.get(candidate.gpu_class_label)
+    placement_nodes = _placement_nodes(placement, class_free_by_node, state.node_labels)
+    if placement_nodes is not None and not placement_nodes:
+        assert placement is not None and class_free_by_node is not None
+        log.info("%s", kv(
+            event="ondemand.candidate_held", guard=1, reason="no_matching_node",
+            ns=candidate.pod_namespace, pod=candidate.pod_name,
+            clabel=candidate.gpu_class_label, nodes=len(class_free_by_node),
+            detail=_placement_text(placement),
+        ))
+        candidate.next_attempt_at = _jittered_retry_at(now)
+        other_classes = tuple(sorted(
+            label for label, nodes in state.node_free_by_node_class.items()
+            if label != candidate.gpu_class_label
+            and placement.matching_nodes(nodes, state.node_labels)
+        ))
+        await _emit_placement_event(
+            config, state, uid, candidate, NO_MATCHING_NODE_REASON,
+            _no_matching_node_message(
+                candidate.gpu_class_label, placement, len(class_free_by_node),
+                other_classes, config,
+            ),
+            now,
+        )
+        return _PREFLIGHT_RETRY, None
+
     # Guard 3: safety interlock — hold JIT requests for any GPU class that has
     # a stuck reservation-holder pod.  Other classes are unaffected.
     if candidate.gpu_class_label in state.stuck_holder_gpu_classes:
@@ -1272,8 +1317,28 @@ async def _preflight_ondemand_candidate(
     # ticks (the snapshot refreshes on QUEUE_PROCESSOR_INTERVAL), which is
     # acceptable precisely because a best-effort over-admission is cheap: no SU
     # is charged, no capacity is held, and the pod simply waits.
-    if candidate.gpu_requested >= 2 or candidate.best_effort:
-        largest_free = state.node_free_by_class.get(candidate.gpu_class_label)
+    #
+    # A pod whose node placement narrows the class is checked at every GPU
+    # count too, against only the nodes it allows: pinned to one busy host, a
+    # 1-GPU pod is exactly as unable to start as a fragmented 4-GPU one, and
+    # the class's free GPUs elsewhere are no use to it.  Its owner is told
+    # (WaitingForNode), since the scheduler's own message names only our taint.
+    # The batch tally is per class, not per node, so for such a pod it is
+    # conservative: a GPU claimed by an earlier candidate is netted off these
+    # nodes even if it will land elsewhere, costing at most a short retry.
+    narrowing = placement if placement_nodes is not None else None
+    if (
+        narrowing is not None
+        or candidate.gpu_requested >= 2
+        or candidate.best_effort
+    ):
+        if placement_nodes is not None:
+            assert class_free_by_node is not None
+            largest_free: Optional[int] = max(
+                class_free_by_node.get(n, 0) for n in placement_nodes
+            )
+        else:
+            largest_free = state.node_free_by_class.get(candidate.gpu_class_label)
         if largest_free is not None:
             claimed = (claimed_by_class or {}).get(candidate.gpu_class_label, 0)
             if largest_free - claimed < candidate.gpu_requested:
@@ -1283,8 +1348,20 @@ async def _preflight_ondemand_candidate(
                     ns=candidate.pod_namespace, pod=candidate.pod_name,
                     clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
                     node_free=largest_free, claimed=claimed or None,
+                    # Present only when node_free is over the nodes the pod's
+                    # placement allows rather than the whole class.
+                    detail=_placement_text(narrowing) if narrowing else None,
                 ))
                 candidate.next_attempt_at = _short_retry_at(now)
+                if narrowing is not None:
+                    await _emit_placement_event(
+                        config, state, uid, candidate, WAITING_FOR_NODE_REASON,
+                        _waiting_for_node_message(
+                            candidate.gpu_class_label, narrowing,
+                            candidate.gpu_requested,
+                        ),
+                        now,
+                    )
                 return _PREFLIGHT_RETRY, None
 
     # A best-effort admission reserves no window, so there is nothing to size.
@@ -1646,6 +1723,113 @@ async def _emit_unknown_class_event(
         lambda: emit_pending_pod_event(
             uid, pod_name, namespace, message,
             reason=UNKNOWN_GPU_CLASS_REASON, gpu_class=gpu_class,
+        ),
+    )
+
+
+def _placement_nodes(
+    placement: Optional[NodePlacement],
+    class_nodes: Optional[Iterable[str]],
+    node_labels: dict[str, dict[str, str]],
+) -> Optional[frozenset[str]]:
+    """The nodes of a GPU class a pod's node placement allows, if it narrows them.
+
+    ``None`` -- treat the pod as unconstrained -- when it has no placement,
+    when the class's nodes are not known yet, when any of them has no recorded
+    labels (a pod is never held on data the controller lacks, as with guards 1b
+    and 5), or when the placement allows every node of the class (a node
+    selector that restates the GPU class, say).  Otherwise the allowed subset,
+    which may be empty.
+    """
+    if placement is None or class_nodes is None:
+        return None
+    nodes = tuple(class_nodes)
+    if any(n not in node_labels for n in nodes):
+        return None
+    allowed = placement.matching_nodes(nodes, node_labels)
+    return None if len(allowed) == len(nodes) else allowed
+
+
+# A pod's placement is quoted back to its owner and logged, and nothing bounds
+# how many affinity terms a pod may carry.
+_PLACEMENT_MAX_CHARS = 200
+
+
+def _placement_text(placement: NodePlacement) -> str:
+    """*placement* in a line fit for an Event message or a log field."""
+    text = scrub(placement.describe())
+    if len(text) > _PLACEMENT_MAX_CHARS:
+        text = text[:_PLACEMENT_MAX_CHARS] + "…"
+    return text
+
+
+def _no_matching_node_message(
+    gpu_class: str,
+    placement: NodePlacement,
+    class_nodes: int,
+    other_classes: tuple[str, ...],
+    config: Config,
+) -> str:
+    """What the owner of a pod whose node constraints rule out its whole GPU
+    class reads.
+
+    Names the GPU classes whose nodes the constraints *do* match, since asking
+    for one class's hardware under another's label is the likeliest mistake
+    after a mistyped host name.
+    """
+    elsewhere = (
+        f" It does match nodes of GPU class {_listed(other_classes)}, so the "
+        f"pod's gpu-class label may be what is wrong."
+        if other_classes else ""
+    )
+    return (
+        f"This pod's {_placement_text(placement)} matches none of the "
+        f"{class_nodes} schedulable node(s) of GPU class {_plain(gpu_class)}, so "
+        f"it could not start on any of them and no on-demand lease is being "
+        f"requested for it.{elsewhere} Correct the node selector or affinity and "
+        f"recreate the pod; if it is right, the nodes it names may be cordoned or "
+        f"out of service, so {_support_phrase(config)}"
+    )
+
+
+def _waiting_for_node_message(
+    gpu_class: str, placement: NodePlacement, gpus: int
+) -> str:
+    """What the owner of a pod waiting for room on the nodes it allows reads.
+
+    Carries no free-GPU count: the message is the throttle key, and a count
+    would make every change in occupancy a new Event.
+    """
+    return (
+        f"No node of GPU class {_plain(gpu_class)} that this pod's "
+        f"{_placement_text(placement)} allows has {gpus} GPU(s) free, so no "
+        f"on-demand lease is being requested yet: one would be charged while the "
+        f"pod waited. It is retried until one of those nodes has room. Widening "
+        f"or removing the node selector or affinity would let it use the class's "
+        f"other nodes."
+    )
+
+
+async def _emit_placement_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    candidate: OnDemandCandidate,
+    reason: str,
+    message: str,
+    now: datetime,
+) -> None:
+    """Tell the owner of a JIT candidate that its own node placement holds it
+    (``NoMatchingNode``, ``WaitingForNode``), on the pending-status throttle."""
+    if not config.pod_problem_event_enabled:
+        return
+    await _post_pending_status(
+        config, state, uid, candidate.pod_name, candidate.pod_namespace,
+        (reason, message), now,
+        lambda: emit_pending_pod_event(
+            uid, candidate.pod_name, candidate.pod_namespace, message,
+            reason=reason, gpu_class=candidate.gpu_class_label,
+            gpu_count=candidate.gpu_requested,
         ),
     )
 
@@ -3155,13 +3339,57 @@ async def _run_queue_tick(
     # merged lease never lingers holding capacity / accruing SU.
     await _drain_pending_merge_cancels(state, client)
 
-    # Guard 3: refresh safety interlock from the same snapshot.
+    # One node inventory per tick feeds guards 1b, 3, 4 and 5.  It is joined
+    # with this tick's tolerated `snapshot`, deliberately reused rather than
+    # re-fetched alongside `inventory` (avoids a second wide pod LIST this
+    # tick); the two calls are not atomic, so a pod that finishes scheduling in
+    # the gap is briefly invisible here, making the per-node free count
+    # optimistic for the node it actually landed on.  Accepted: guard 3 and the
+    # compensating cancel in _grant_and_admit backstop any grant this skew lets
+    # through.  Fail-safe: if either snapshot is missing, leave every prior map
+    # intact — never open admission for a class based on unknown physical state.
+    inventory: Optional[dict[str, dict[str, int]]] = None
+    node_labels: dict[str, dict[str, str]] = {}
+    free_by_node: Optional[dict[str, dict[str, int]]] = None
     if config.ondemand_lease_enabled and snapshot is not None:
-        stuck = [
-            (p.namespace, p.name, p.gpu_class)
-            for p in snapshot
-            if p.phase == "Pending" and p.scheduled_false and p.gpu_class
-        ]
+        try:
+            inventory = await snapshot_node_gpu_inventory(
+                TOLERATION_KEY, labels_out=node_labels
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s", kv(
+                event="queue.snapshot_failed", target="node_inventory", err=exc,
+            ), exc_info=True)
+        else:
+            free_by_node = free_gpus_by_node_class(
+                inventory, [_pod_view(p) for p in snapshot]
+            )
+
+    # Guard 3: refresh safety interlock from the same snapshot.  A holder kept
+    # Pending by its own node selector or affinity -- it allows none of the
+    # class's nodes, or only full ones while another has room -- is left out:
+    # it says nothing about the class, and counting it would let one pod pinned
+    # to a busy host pause on-demand admission for everyone on the class.  With
+    # no inventory this tick every stuck holder counts, as it always did.
+    if config.ondemand_lease_enabled and snapshot is not None:
+        stuck = []
+        for p in snapshot:
+            if not (p.phase == "Pending" and p.scheduled_false and p.gpu_class):
+                continue
+            class_free = free_by_node.get(p.gpu_class) if free_by_node is not None else None
+            if class_free is not None and p.placement is not None:
+                excused = placement_stall_reason(
+                    p.gpu_count, class_free,
+                    _placement_nodes(p.placement, class_free, node_labels),
+                )
+                if excused is not None:
+                    log.debug("%s", kv(
+                        event="interlock.holder_excluded", ns=p.namespace,
+                        pod=p.name, clabel=p.gpu_class, guard=3, reason=excused,
+                        detail=_placement_text(p.placement),
+                    ))
+                    continue
+            stuck.append((p.namespace, p.name, p.gpu_class))
         new_classes = {gpu_class for _, _, gpu_class in stuck}
         old_classes = state.stuck_holder_gpu_classes
         state.stuck_holder_gpu_classes = new_classes
@@ -3179,45 +3407,29 @@ async def _run_queue_tick(
         for gpu_class in old_classes - new_classes:
             log.info("%s", kv(event="interlock.cleared", clabel=gpu_class, guard=3))
 
-    # Guards 1b and 5: refresh per-node feasibility (largest single-node free
-    # GPUs per class, and the node count behind each class) from a node-inventory
-    # snapshot joined with this tick's tolerated `snapshot`, deliberately reused
-    # rather than re-fetched alongside `inventory` (avoids a second wide pod LIST
-    # this tick); the two calls are not atomic, so a pod that finishes scheduling
-    # in the gap is briefly invisible here, making the per-node free count
-    # optimistic for the node it actually landed on.  Accepted: guard 3 and the
-    # compensating cancel in _grant_and_admit backstop any grant this skew lets
-    # through.  Fail-safe: if either snapshot is missing, leave both prior maps
-    # intact — never open admission for a class based on unknown physical state.
+    # Guards 1b, 4 and 5: refresh per-node feasibility (largest single-node free
+    # GPUs per class, the node count behind each class, and the per-node detail
+    # a pod with a node placement is measured against) from the same inventory.
     # Consulted synchronously by _preflight_ondemand_candidate.
-    if config.ondemand_lease_enabled and snapshot is not None:
-        try:
-            inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("%s", kv(
-                event="queue.snapshot_failed", target="node_inventory", err=exc,
-            ), exc_info=True)
-        else:
-            state.node_free_by_class = largest_node_free_by_class(
-                free_gpus_by_node_class(
-                    inventory, [_pod_view(p) for p in snapshot]
-                )
-            )
-            # Guard 1b reads the node *count* from the same inventory: free
-            # GPUs cannot distinguish "class is full" from "class has no nodes
-            # left", and those want opposite treatment (grant and wait, versus
-            # do not mint a lease at all).  The classes the app knows are passed
-            # in because a drained class is absent from the inventory, not zero.
-            state.class_node_counts = node_counts_by_class(inventory, state.gpu_class_ids)
-            # Guard 4: re-check the overcommit pause from the same inventory, so
-            # it lifts (or engages) on this tick's cadence instead of waiting
-            # for the hourly audit.
-            _refresh_overcommit_pause(state, gpu_capacity_by_class(inventory))
-            for _cls, _free in sorted(state.node_free_by_class.items()):
-                log.debug("%s", kv(
-                    event="queue.node_feasibility", clabel=_cls, node_free=_free,
-                    nodes=state.class_node_counts.get(_cls, 0),
-                ))
+    if inventory is not None and free_by_node is not None:
+        state.node_free_by_node_class = free_by_node
+        state.node_labels = node_labels
+        state.node_free_by_class = largest_node_free_by_class(free_by_node)
+        # Guard 1b reads the node *count* from the same inventory: free
+        # GPUs cannot distinguish "class is full" from "class has no nodes
+        # left", and those want opposite treatment (grant and wait, versus
+        # do not mint a lease at all).  The classes the app knows are passed
+        # in because a drained class is absent from the inventory, not zero.
+        state.class_node_counts = node_counts_by_class(inventory, state.gpu_class_ids)
+        # Guard 4: re-check the overcommit pause from the same inventory, so
+        # it lifts (or engages) on this tick's cadence instead of waiting
+        # for the hourly audit.
+        _refresh_overcommit_pause(state, gpu_capacity_by_class(inventory))
+        for _cls, _free in sorted(state.node_free_by_class.items()):
+            log.debug("%s", kv(
+                event="queue.node_feasibility", clabel=_cls, node_free=_free,
+                nodes=state.class_node_counts.get(_cls, 0),
+            ))
 
     to_remove: list[str] = []
 

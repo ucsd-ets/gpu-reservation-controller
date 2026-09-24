@@ -25,7 +25,7 @@ stateDiagram-v2
     R --> Q : own booking open or opening within 30 min with room, or any later booking if not on-demand eligible (WaitingForReservation, ReservationFull, ReservationTooSmall)
     R --> J : on-demand eligible and no booking can take it within 30 min
     R --> L : nothing matches and not on-demand eligible (NoReservation, UnknownGpuClass)
-    J --> J : lease denied or class paused, retried (OnDemandLeaseDenied, OnDemandAdmissionPaused)
+    J --> J : lease denied, class paused or its nodes ruled out or full, retried (OnDemandLeaseDenied, OnDemandAdmissionPaused, NoMatchingNode, WaitingForNode)
     J --> Q : a booking with room comes within 30 min
     Q --> R : booking ended, cancelled or no longer able to take it, re-routed at the next resync
     L --> R : re-routed at the next resync, e.g. after the owner books

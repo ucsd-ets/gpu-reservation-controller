@@ -229,8 +229,11 @@ config:
   # Put a Warning Kubernetes Event on a pod the controller cannot act on as
   # written, telling its owner what to fix: its gpu-class label names no class
   # the reservation app knows (reason=UnknownGpuClass), no reservation matches it
-  # and it does not qualify for on-demand admission (reason=NoReservation), or
-  # one of its galends/* annotations was ignored (reason=AnnotationIgnored).
+  # and it does not qualify for on-demand admission (reason=NoReservation), one
+  # of its galends/* annotations was ignored (reason=AnnotationIgnored), or its
+  # node selector / required node affinity allows none of its class's nodes
+  # (reason=NoMatchingNode) -- plus a Normal Event while the nodes it allows are
+  # all full (reason=WaitingForNode).
   # Restated on the ondemandDenialEventRepeatMinutes cadence above.
   # Set to false to disable.
   podProblemEventEnabled: true

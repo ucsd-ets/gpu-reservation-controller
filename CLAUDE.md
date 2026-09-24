@@ -52,7 +52,7 @@ app/
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
 ├── log_fields.py         kv() — renders log message bodies as key=value fields (see docs/LOG-FIELDS.md)
 ├── trace.py              Per-unit-of-work trace ids + X-Client-Trace propagation (see **Trace ids**)
-├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node, honouring the galends/force-node-capacity node annotation) / snapshot_node_gpu_capacity (per-class collapse of it)
+├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node, honouring the galends/force-node-capacity node annotation; optionally node labels too) / snapshot_node_gpu_capacity (per-class collapse of it), get_pod_node_placement (a pod's nodeSelector + required node affinity, as a matchable NodePlacement)
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning, preemption-risk forecast
 ```
 
@@ -833,7 +833,8 @@ two-step **preflight → delegate → grant** pipeline.
   ahead of the guards is what lets its owner be told (`UnknownGpuClass`) rather
   than the pod being dropped by guard 1a before the class is ever looked at —
   then applies guard 1 (`is_gpu_gated_pending` + `class_node_counts` — see
-  **Guard 1: what the scheduler can and cannot tell us** below), guard 3
+  **Guard 1: what the scheduler can and cannot tell us** below — plus the pod's
+  own node placement, see **Pods that narrow their nodes**), guard 3
   (`stuck_holder_gpu_classes`), guard 4 (`overcommitted_gpu_classes`), and guard 5
   (per-node feasibility — see **Per-node capacity accounting** below).  Survivors become an
   `OnDemandAdmissionCandidate` — the exact "ask" (username, group, class id, gpu
@@ -1170,8 +1171,10 @@ unrelated taint, an unbindable volume — is invisible, because those nodes neve
 get past the taint filter to report it.  Such a pod classifies `True`, is granted
 a lease, and stays Pending under it.  Backstops: guard 3 (a stuck holder freezes
 the class), the lease's short natural expiry, and `_teardown_ondemand_lease` when
-the pod goes away.  **RBAC / config**: none new — 1b reuses the node LIST the
-queue tick already issues for guard 5.
+the pod goes away.  The pod's own node selector and required node affinity are
+the exception — the controller checks those itself, against node labels (see
+**Pods that narrow their nodes**).  **RBAC / config**: none new — 1b reuses the
+node LIST the queue tick already issues for guard 5.
 
 ### Defaults for pods that declare neither
 
@@ -1451,7 +1454,8 @@ Four properties are load-bearing:
   caught.
 
 **RBAC / config**: none new.  `POD_PROBLEM_EVENT_ENABLED=false`
-disables `UnknownGpuClass`, `NoReservation` and `AnnotationIgnored`;
+disables `UnknownGpuClass`, `NoReservation` and `AnnotationIgnored` (and the
+two placement Events of **Pods that narrow their nodes**);
 `OnDemandLeaseRejected` rides `ONDEMAND_DENIAL_EVENT_ENABLED`.  User-facing
 documentation is `docs/POD-ANNOTATIONS.md` §5.3.
 
@@ -1585,7 +1589,8 @@ short-retried rather than granted — the controller does not mint an SU-charged
 lease the pod could never schedule under.  **Fail-open on unknown**: a class absent
 from `node_free_by_class` (no data yet, or a snapshot gap) never blocks, so a stale
 map cannot wedge admission; the reactive guard-3 interlock and the compensating
-cancel in `_grant_and_admit` remain the backstop.  The 1-GPU path is unaffected.
+cancel in `_grant_and_admit` remain the backstop.  The 1-GPU path is unaffected,
+except for a pod whose own node placement narrows the class (next section).
 
 Two node-aware consumers are **deliberately deferred** to a follow-up: preemption
 victim-targeting (concentrating kills on one node so a reserved multi-GPU booking
@@ -1594,6 +1599,97 @@ preemption-risk forecast's shortfall (still per-class).  Guard 5 is a per-candid
 feasibility check against a snapshot, not batch-level bin-packing: two ≥2-GPU
 candidates can both pass against the same single-node opening in one batch, with
 guard 3 backstopping the loser.
+
+### Pods that narrow their nodes
+
+Users sometimes narrow where a GPU pod may run beyond its class: a
+`nodeSelector` naming one host, or a required node affinity on a hardware label.
+Before this, the controller could not see it, and the consequences went well
+beyond the one pod.  Before admission kube-scheduler rejects every node of the
+pod's class on our taint, and `TaintToleration` runs ahead of `NodeAffinity`, so
+a pod pinned to a busy host — or to hardware its class does not have, or to a
+non-GPU node — produced the same message as one that was not, and guard 1a
+passed it.  It was granted an SU-charged lease whose guarantee clock ran while
+it sat Pending; nothing reclaimed the lease (no-show tracking covers bookings
+only); and once admitted and stuck it tripped guard 3, pausing on-demand
+admission for **every** pod of the class for as long as it waited — forever,
+for a constraint nothing could satisfy.
+
+**Evaluated by the controller itself**, against node labels it already has:
+
+- `k8s_client.get_pod_node_placement` digests `spec.nodeSelector` and the
+  required half of `spec.affinity.nodeAffinity` into a plain `NodePlacement`
+  whose `matches(node_name, labels)` follows Kubernetes' semantics (selector
+  ANDed with affinity; terms ORed, requirements within a term ANDed; an empty
+  term matches nothing; `NotIn`/`DoesNotExist` hold for a node without the
+  label; `Gt`/`Lt` need integers; `matchFields` on `metadata.name`).  Preferred
+  affinity is ignored — it never stops a pod scheduling.  Anything it cannot
+  evaluate (an operator or `matchFields` key the API server would reject) makes
+  the whole placement `None`, i.e. unconstrained: **fail-open**.
+- `snapshot_node_gpu_inventory(labels_out=)` fills node labels from the **same**
+  node LIST the queue tick already takes, so they describe exactly the nodes
+  counted.  The tick keeps `ControllerState.node_labels` and the per-node free
+  map `node_free_by_node_class` (which `node_free_by_class` is now the collapse
+  of), on the same refresh and fail-safe as the other guard maps.
+- `main._placement_nodes` turns a placement into "the nodes of this class it
+  allows", or `None` — unconstrained — when there is no placement, no inventory
+  for the class, a class node with no recorded labels (never hold on data the
+  controller lacks), or the placement allows **every** node of the class (a
+  selector restating the class's own hardware narrows nothing, so it must change
+  nothing — in particular a 1-GPU ask still skips guard 5).
+
+**Before a lease is requested** (`_preflight_ondemand_candidate`, so the app is
+never asked for a pod held here):
+
+- **Guard 1, the pod's own half of 1b** — placed right after 1b, ahead of
+  guards 3 and 4: a pod allowing **none** of the class's nodes is held
+  (`ondemand.candidate_held guard=1 reason=no_matching_node`, the placement in
+  `detail`), cooled down 2–5 min, and its owner told with a `Warning`
+  `NoMatchingNode` Event naming the constraint and any other class whose nodes it
+  does match (asking for one class's hardware under another's label is the
+  likeliest mistake).  Held, not dropped, because the node it names may only be
+  cordoned — the inventory excludes cordoned nodes.  Ahead of the class-wide
+  pauses because it is the pod's own problem, which a lifted pause would not fix.
+- **Guard 5 over the allowed nodes only**, at **every** GPU count: the largest
+  free opening among the nodes the pod allows, not the class.  A pod pinned to
+  one busy host is exactly as unable to start as a fragmented 4-GPU one.  Held
+  with the short retry and its owner told with a `Normal` `WaitingForNode` Event
+  (the scheduler's own message names only our taint, so the pod would otherwise
+  wait silently).  The in-batch `claimed` tally is per class, so for such a pod it
+  is **conservative** — a GPU claimed by another candidate this batch counts
+  against these nodes even if it lands elsewhere; the cost is a retry.
+
+Both Events use `_post_pending_status` (the `hold` topic) and
+`POD_PROBLEM_EVENT_ENABLED`.  Their messages carry no free-GPU counts, which
+would make every occupancy change a new Event.
+
+**Guard 3 no longer counts a holder its own placement explains.**  The queue
+tick now takes the node inventory *before* computing guard 3 and passes each
+stuck holder (Pending, `PodScheduled=False`) through the pure
+`controller.placement_stall_reason`:
+
+| Result | When | Guard 3 |
+|---|---|---|
+| `no_matching_node` | its placement allows none of the class's nodes | left out |
+| `matching_nodes_full` | no node it allows has its GPUs free, but another node of the class does | left out |
+| `None` | unconstrained; or the class is short on **every** node (a pod without the constraint would be stuck too); or an allowed node has room (stuck for a reason nothing here explains) | counts, as before |
+
+A left-out holder logs `interlock.holder_excluded` at DEBUG every tick.  With no
+inventory that tick every stuck holder counts, as it always did.
+`ToleratedPodInfo.placement` carries the placement from `snapshot_tolerated_pods`.
+
+**What is deliberately not covered**: the reserved path (a pod queued for its
+owner's booking is admitted when the window opens and then waits for its nodes
+the ordinary way — the booking already holds the capacity, so there is no lease
+to withhold; guard 3 now ignores it if its placement explains the wait); pod
+affinity/anti-affinity, topology spread and non-GPU resources on the chosen node
+(still invisible, per the guard-1 known limitation); `spec.nodeName` set directly
+(bypasses the scheduler, and the kubelet does not enforce `NoSchedule` taints);
+and node-aware preemption, still count-based per class.  The snapshot can be up
+to one `QUEUE_PROCESSOR_INTERVAL` old, so a node that filled since can still let
+a lease through — which is the case the narrowed guard 3 exists for.  **RBAC /
+config**: none new — node labels arrive with the node LIST already issued.
+User-facing documentation is `docs/POD-ANNOTATIONS.md` §5.3.
 
 ### Forcing a node's GPU capacity
 
@@ -1915,7 +2011,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
 | `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of the "contact support" suggestion in that Event and the pod-problem Events. Unset = the suggestion names no one |
-| `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), or one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**). Throttled with the denial Event, on its cadence; `false` disables |
+| `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**), or its node selector / required node affinity allows none of its class's nodes (`NoMatchingNode`) — plus a `Normal` `WaitingForNode` while the nodes it allows are all full (see **Pods that narrow their nodes**). Throttled with the denial Event, on its cadence; `false` disables |
 | `RESERVATION_WAIT_EVENT_ENABLED` | `true` | Put an Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`WaitingForReservation`, `Normal`), the owner's other pods hold its GPUs (`ReservationFull`, naming them) or it holds fewer GPUs than the pod requests (`ReservationTooSmall`) (see **Telling the pod's owner what its reservation is waiting on**). Throttled with the denial Event, on its cadence; `false` disables |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period before a booking whose window is already open is declared a no-show: one mid-window when the controller starts, or one vacated mid-window when its last holder pod ends (re-armed by `update_noshow_tracking` on the next refresh — see **In-memory state only**) |

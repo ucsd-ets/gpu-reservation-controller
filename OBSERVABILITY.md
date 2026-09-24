@@ -140,7 +140,7 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | INFO | `pod.toleration_applied` | `ns pod tol_key tol_value booking_ref` | The patch landed. |
 | INFO | `pod.admitted` | `ns pod rid clabel gpus free reserved until` | The one line to grep for a successful admission. |
 | INFO | `pod.guarantee_recorded` | `ns pod guarantee_s until` | Informational annotations; Kubernetes enforces nothing. |
-| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus` \| `clabel guard` \| `clabel`) | `reason=RuntimeGuaranteed` \| `BestEffortAdmitted` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `ReservationRelinked` \| `OnDemandLeaseDenied` \| `OnDemandLeaseRejected` \| `OnDemandAdmissionPaused` \| `UnknownGpuClass` \| `NoReservation` \| `AnnotationIgnored` \| `WaitingForReservation` \| `ReservationFull` \| `ReservationTooSmall`. `BestEffortAdmitted` replaces `RuntimeGuaranteed` for a pod admitted with no runtime guarantee (a `RuntimeGuaranteed` message would read "guaranteed for 0m00s, until \<the instant the pod started\>"). The nine from `OnDemandLeaseDenied` on are a still-Pending pod's status, on one shared per-pod throttle (§5) — `Warning`-type, except `WaitingForReservation`, which is `Normal`; they and `BestEffortAdmitted` are addressed to the pod's *owner* rather than to an operator. `AnnotationIgnored` carries no `clabel`. |
+| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus` \| `clabel guard` \| `clabel`) | `reason=RuntimeGuaranteed` \| `BestEffortAdmitted` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `ReservationRelinked` \| `OnDemandLeaseDenied` \| `OnDemandLeaseRejected` \| `OnDemandAdmissionPaused` \| `UnknownGpuClass` \| `NoReservation` \| `AnnotationIgnored` \| `NoMatchingNode` \| `WaitingForNode` \| `WaitingForReservation` \| `ReservationFull` \| `ReservationTooSmall`. `BestEffortAdmitted` replaces `RuntimeGuaranteed` for a pod admitted with no runtime guarantee (a `RuntimeGuaranteed` message would read "guaranteed for 0m00s, until \<the instant the pod started\>"). The eleven from `OnDemandLeaseDenied` on are a still-Pending pod's status, on one shared per-pod throttle (§5) — `Warning`-type, except `WaitingForNode` and `WaitingForReservation`, which are `Normal`; they and `BestEffortAdmitted` are addressed to the pod's *owner* rather than to an operator. `AnnotationIgnored` carries no `clabel`. |
 | INFO | `pod.dequeued` | `ns pod reason` | e.g. `toleration_already_present`. |
 | INFO | `pod.queue_dropped` | `ns pod` + `rid reason` \| `phase reason` | Window expired, reservation cancelled with no replacement, or the pod went terminal. |
 | INFO | `pod.requeued` | `ns pod reason old.rid new.rid` | `reason=reservation_cancelled`: re-matched after its reservation was cancelled. `reason=open_reservation_with_room`: moved by the queue tick to one of its owner's reservations open now with room, from one that could not take it now (not yet open, full, too small, or ended); attempted on the same tick. |
@@ -195,9 +195,10 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 |---|---|---|
 | 1 | `schedule_verdict_pending` | No `PodScheduled` verdict yet, so there is nothing to classify. Transient — the MODIFIED fast path shortens it to ~1 s. |
 | 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained/cordoned). Known means the reservation app lists the class: the node inventory omits a class with no schedulable node, so every app-known class is recorded explicitly, as zero when it has none. Fail-open when unknown — a label the app does not list, or no snapshot yet. |
+| 1 | `no_matching_node` | The class has nodes, but the pod's own `nodeSelector` / required node affinity (in `detail`) allows none of them; `nodes` is how many the class has. Cooled down 2–5 min (it waits on a person, not on occupancy) and told to the pod's owner (`NoMatchingNode`). The scheduler cannot report this before admission — it rejects the class's nodes on our taint before weighing affinity — so the controller matches the constraint against node labels itself. Fail-open when the inventory or a node's labels are unknown, or the constraint uses something the controller cannot evaluate. |
 | 3 | `stuck_holder_interlock` | A reservation holder is stuck Pending on this class. |
 | 4 | `class_overcommitted` | App-side capacity exceeds physical (see §8). **Not applied to a best-effort candidate**, which consumes no app-side capacity to overcommit. |
-| 5 | `no_single_node_fit` | No single node has enough free GPUs for the ask, net of `claimed` (GPUs taken by earlier candidates this batch). Applies to a ≥2-GPU ask, and to **every** best-effort ask — see below. Fail-open when unknown. |
+| 5 | `no_single_node_fit` | No single node has enough free GPUs for the ask, net of `claimed` (GPUs taken by earlier candidates this batch). Applies to a ≥2-GPU ask, and to **every** best-effort ask — see below. Also to **every** ask whose node placement narrows the class: then `detail` carries the placement, `node_free` is over only the nodes it allows, and the pod's owner is told (`WaitingForNode`). Fail-open when unknown. |
 | — | `class_id_unknown` | The app does not list the pod's `gpu-class` label — a typo, or a class with no `label_value` — or no class list has been fetched yet. Checked **before** guard 1, since no guard's verdict matters for a class that can never be granted. Once the app's full class list is known, the pod's owner is told (`UnknownGpuClass`, listing the classes that do exist). |
 
 Guard 1 is the only one that also **drops** rather than holds: a candidate the
@@ -232,8 +233,9 @@ the healthy state.
 audit blocking admission" without matching on message text.
 
 **Every pending-pod Event shares one throttle, kept per pod uid** (the denial,
-the pause below, `OnDemandLeaseRejected` / `UnknownGpuClass` / `NoReservation`,
-which report the pod itself as the problem, and `WaitingForReservation` /
+the pause below, `OnDemandLeaseRejected` / `UnknownGpuClass` / `NoReservation` /
+`NoMatchingNode`, which report the pod itself as the problem, `WaitingForNode`
+for a pod waiting on the nodes its own placement allows, and `WaitingForReservation` /
 `ReservationFull` / `ReservationTooSmall` for a pod queued on one of its owner's
 reservations): a changed status goes out at once, an unchanged one at most once
 per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES`, so the newest one on a pod is what
@@ -257,7 +259,8 @@ throttle with `OnDemandLeaseDenied`: a changed status is emitted at once, an
 unchanged one at most once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default
 30), so the newest Event on a pod is always the thing holding it now.  A user
 quoting that Event maps straight to the `ondemand.gated` line for the same
-`clabel`.  Guard 5 is not told.  A fully drained class usually reads as
+`clabel`.  Guard 5 is not told, except for a pod whose own node placement is
+what rules the free nodes out (`WaitingForNode`).  A fully drained class usually reads as
 overcommitted too (the app still counts its GPUs); guard 1 runs first, so the
 pod is told about the drain.  `ONDEMAND_PAUSE_EVENT_ENABLED=false` turns it off;
 a failed write logs `k8s.event_failed reason=OnDemandAdmissionPaused` and
@@ -332,6 +335,7 @@ were deliberately given different keys.
 | WARNING | `queue.snapshot_failed` | `target err` | `target=pods` or `node_inventory`; prior state kept. |
 | WARNING | `interlock.activated` | `clabel guard count pods` | Guard-3 interlock on; JIT held for that class. |
 | INFO | `interlock.cleared` | `clabel guard` | |
+| DEBUG | `interlock.holder_excluded` | `ns pod clabel guard reason detail` | **Every tick**, per admitted pod stuck Pending that guard 3 leaves out because its own node placement (in `detail`) explains it: `reason=no_matching_node` (it allows none of the class's nodes) or `matching_nodes_full` (none it allows has room, while another node of the class does). Counting it would let one pod pinned to a busy host pause on-demand admission for the whole class. A pinned pod on a class full everywhere, or whose allowed node has room, still counts. With no node inventory that tick, every stuck holder counts. Its owner sees kube-scheduler's own `FailedScheduling`, which after admission names the real reason. |
 | DEBUG | `queue.node_feasibility` | `clabel node_free nodes` | One line per class: largest single-node opening (guard 5) and how many nodes back the class (guard 1). |
 
 ---
