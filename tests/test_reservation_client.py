@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from app.config import Config
-from app.reservation_client import ReservationClient, _response_detail
+from app.reservation_client import AdmissionSelection, ReservationClient, _response_detail
 from app.schemas import (
     OnDemandAdmissionCandidate,
     OnDemandAdmissionRequest,
@@ -342,11 +342,78 @@ def test_select_ondemand_admissions_200_returns_granted_uids():
         assert second["pod_created_at"] == "2026-08-21T17:05:00Z"
         # A pod declaring no galends annotation serialises an empty map, never null.
         assert second["pod_annotations"] == {}
+        # Which create would follow a grant rides along too.
+        assert first["best_effort"] is False
         return httpx.Response(200, json={"granted_pod_uids": ["pod-uid-2"]})
 
     client = _client_with_handler(_config(), handler)
     result = asyncio.run(client.select_ondemand_admissions(_admission_request()))
-    assert result == ["pod-uid-2"]
+    # An app predating ``withheld`` reads as withholding nothing it explained.
+    assert result == AdmissionSelection(granted=["pod-uid-2"], withheld={})
+    asyncio.run(client.aclose())
+
+
+def test_select_ondemand_admissions_keeps_the_app_order():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"granted_pod_uids": ["pod-uid-2", "pod-uid-1"], "withheld": []},
+        )
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.select_ondemand_admissions(_admission_request()))
+    assert result.granted == ["pod-uid-2", "pod-uid-1"]
+    asyncio.run(client.aclose())
+
+
+def test_select_ondemand_admissions_reads_each_withheld_envelope():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "granted_pod_uids": [],
+            "withheld": [
+                {"pod_uid": "pod-uid-1", "detail": "Fits on its own, but not after...",
+                 "code": "outranked", "retryable": True},
+                {"pod_uid": "pod-uid-2", "detail": "This lease costs 4 SU but ...",
+                 "code": "su_budget_member", "retryable": True,
+                 "not_before": "2026-08-24T07:00:00Z"},
+            ],
+        })
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.select_ondemand_admissions(_admission_request()))
+    outranked = result.withheld["pod-uid-1"]
+    assert outranked.outranked and outranked.app_retryable is True
+    budget = result.withheld["pod-uid-2"]
+    assert not budget.outranked
+    assert budget.code == "su_budget_member"
+    assert budget.not_before == datetime(2026, 8, 24, 7, 0, tzinfo=timezone.utc)
+    # As the 409 the create would have returned, to reuse the denial path.
+    denial = budget.as_denial()
+    assert denial.status == 409 and denial.retryable and not denial.structural
+    asyncio.run(client.aclose())
+
+
+def test_select_ondemand_admissions_skips_an_unreadable_withheld_entry():
+    """One malformed entry must not discard the app's grants with it."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "granted_pod_uids": ["pod-uid-1"],
+            "withheld": [
+                "not an object",
+                {"detail": "names no pod"},
+                {"pod_uid": "pod-uid-2", "code": 7, "retryable": "no",
+                 "not_before": "never", "detail": "x" * 5000},
+            ],
+        })
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.select_ondemand_admissions(_admission_request()))
+    assert result.granted == ["pod-uid-1"]
+    assert set(result.withheld) == {"pod-uid-2"}
+    entry = result.withheld["pod-uid-2"]
+    # Wrong types are dropped, not trusted: read as retryable, per the contract.
+    assert entry.code is None and entry.app_retryable is None and entry.not_before is None
+    assert len(entry.detail) <= 201
+    assert entry.as_denial().retryable
     asyncio.run(client.aclose())
 
 
@@ -356,7 +423,8 @@ def test_select_ondemand_admissions_empty_list_is_respected():
 
     client = _client_with_handler(_config(), handler)
     # Empty (grant none) is a valid decision — distinct from None (fall back).
-    assert asyncio.run(client.select_ondemand_admissions(_admission_request())) == []
+    result = asyncio.run(client.select_ondemand_admissions(_admission_request()))
+    assert result is not None and result.granted == []
     asyncio.run(client.aclose())
 
 

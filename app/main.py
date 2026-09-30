@@ -89,6 +89,7 @@ from .k8s_client import (
     TERMINAL_PHASES,
     UNKNOWN_GPU_CLASS_REASON,
     USAGE_GROUP_ANNOTATION,
+    WAITING_FOR_CAPACITY_REASON,
     WAITING_FOR_NODE_REASON,
     WAITING_FOR_RESERVATION_REASON,
     AnnotationProblem,
@@ -142,8 +143,11 @@ from .k8s_client import (
     utc_iso,
 )
 from .reservation_client import (
+    CAPACITY_DENIAL_CODES,
     LEASE_DENIED_STATUS,
     LEASE_NOT_FOUND_STATUS,
+    AdmissionWithheld,
+    LeaseAttempt,
     ReservationClient,
 )
 from .schemas import (
@@ -1048,12 +1052,26 @@ _PREFLIGHT_RETRY = "retry"    # keep it; candidate.next_attempt_at already pushe
 _PREFLIGHT_READY = "ready"    # candidate is a valid on-demand ask (2nd tuple element set)
 
 
+class _FitInputs(NamedTuple):
+    """What guards 4 and 5 read about one candidate, kept so it can be judged again.
+
+    Preflight judges every candidate of a batch on its own; the grant loop
+    judges each again in grant order, against the GPUs the grants ahead of it
+    took (``_hold_on_fit``).  The placement comes off the pod preflight read,
+    which the grant loop does not re-read.
+    """
+
+    placement: Optional[NodePlacement]
+    placement_nodes: Optional[frozenset[str]]
+    class_free_by_node: Optional[dict[str, int]]
+    duration_seconds: int
+
+
 async def _preflight_ondemand_candidate(
     state: ControllerState,
     config: Config,
     uid: str,
     candidate: OnDemandCandidate,
-    claimed_by_class: Optional[dict[str, int]] = None,
 ) -> tuple[str, Optional[OnDemandAdmissionCandidate]]:
     """Vet a JIT candidate before it is offered to the app for admission.
 
@@ -1085,9 +1103,9 @@ async def _preflight_ondemand_candidate(
        it allows (told to its owner as ``WaitingForNode``).
     8. Size the ask.
 
-    *claimed_by_class* is the GPUs already granted earlier in the current
-    admission batch, so guards 4 and 5 measure each candidate against what is
-    left rather than each against the same room.
+    Guards 4 and 5 judge the candidate on its own here.  The admission batch
+    judges a granted candidate again at grant time, in grant order, against
+    what the grants ahead of it took (``_hold_on_fit``).
 
     Returns one of:
     - ``(_PREFLIGHT_REMOVE, None)`` — drop the candidate (gone/terminal, routed
@@ -1097,6 +1115,21 @@ async def _preflight_ondemand_candidate(
       drained gpu-class, guard-3 interlock, a guard-4 or guard-5 hold, or
       unknown gpu-class id).
     - ``(_PREFLIGHT_READY, ask)`` — the candidate is a valid on-demand ask.
+    """
+    status, ask, _fit = await _preflight_with_fit(state, config, uid, candidate)
+    return status, ask
+
+
+async def _preflight_with_fit(
+    state: ControllerState,
+    config: Config,
+    uid: str,
+    candidate: OnDemandCandidate,
+) -> tuple[str, Optional[OnDemandAdmissionCandidate], Optional[_FitInputs]]:
+    """:func:`_preflight_ondemand_candidate`, also returning what guards 4 and 5 read.
+
+    The third element is set exactly when the candidate is READY, so the batch
+    can judge it again at grant time without re-reading the pod.
     """
     now = datetime.now(timezone.utc)
     # Describes this attempt only; guard 4 sets it again if it still holds.
@@ -1109,7 +1142,7 @@ async def _preflight_ondemand_candidate(
             pod=candidate.pod_name, err=exc,
         ))
         candidate.next_attempt_at = _jittered_retry_at(now)
-        return _PREFLIGHT_RETRY, None
+        return _PREFLIGHT_RETRY, None, None
 
     phase = get_pod_phase(fresh_pod)
     if phase in TERMINAL_PHASES or phase == "Unknown":
@@ -1117,7 +1150,7 @@ async def _preflight_ondemand_candidate(
             event="ondemand.candidate_dropped", ns=candidate.pod_namespace,
             pod=candidate.pod_name, phase=phase, reason="terminal_phase",
         ))
-        return _PREFLIGHT_REMOVE, None
+        return _PREFLIGHT_REMOVE, None, None
 
     # Step 2: a matching reservation may have appeared since this candidate
     # was queued (or since its last attempt) — prefer it over requesting a
@@ -1159,7 +1192,7 @@ async def _preflight_ondemand_candidate(
             # than at the next tick.
             if uid in state.task_queue:
                 await _tell_queued_status(config, state, uid, entry, fast_path_now)
-        return _PREFLIGHT_REMOVE, None
+        return _PREFLIGHT_REMOVE, None, None
 
     # A gpu-class label the app does not know can never be granted anything,
     # whatever the scheduler or the guards below would say, so it is settled
@@ -1178,7 +1211,7 @@ async def _preflight_ondemand_candidate(
             config, state, uid, candidate.pod_name, candidate.pod_namespace,
             candidate.gpu_class_label, now,
         )
-        return _PREFLIGHT_RETRY, None
+        return _PREFLIGHT_RETRY, None, None
 
     # Guard 1a: is the pod Pending for something a lease could fix?  The
     # scheduler's verdict is read for the blockers it can still name — it
@@ -1196,14 +1229,14 @@ async def _preflight_ondemand_candidate(
             pod=candidate.pod_name, reason="blocked_not_by_gpu_gating",
             detail=get_unschedulable_message(fresh_pod),
         ))
-        return _PREFLIGHT_REMOVE, None
+        return _PREFLIGHT_REMOVE, None, None
     if gpu_gated is None:
         log.debug("%s", kv(
             event="ondemand.candidate_held", ns=candidate.pod_namespace,
             pod=candidate.pod_name, guard=1, reason="schedule_verdict_pending",
         ))
         candidate.next_attempt_at = _short_retry_at(now)
-        return _PREFLIGHT_RETRY, None
+        return _PREFLIGHT_RETRY, None, None
 
     # Guard 1b: the physical half of the same question.  1a concluded only that
     # *something* we might tolerate is in the way; confirm the class actually
@@ -1226,7 +1259,7 @@ async def _preflight_ondemand_candidate(
         ))
         candidate.next_attempt_at = _short_retry_at(now)
         await _emit_admission_paused_event(config, state, uid, candidate, 1, now)
-        return _PREFLIGHT_RETRY, None
+        return _PREFLIGHT_RETRY, None, None
 
     # Guard 1, the pod's own half of 1b: the class has nodes, but does the pod
     # allow any of them?  A node selector or required node affinity is as
@@ -1263,7 +1296,7 @@ async def _preflight_ondemand_candidate(
             ),
             now,
         )
-        return _PREFLIGHT_RETRY, None
+        return _PREFLIGHT_RETRY, None, None
 
     # Guard 3: safety interlock — hold JIT requests for any GPU class that has
     # a stuck reservation-holder pod.  Other classes are unaffected.
@@ -1275,7 +1308,7 @@ async def _preflight_ondemand_candidate(
         ))
         candidate.next_attempt_at = _short_retry_at(now)
         await _emit_admission_paused_event(config, state, uid, candidate, 3, now)
-        return _PREFLIGHT_RETRY, None
+        return _PREFLIGHT_RETRY, None, None
 
     # A best-effort admission reserves no window, so there is nothing to size.
     # The field is required by the delegation schema (shared with the lease
@@ -1285,6 +1318,61 @@ async def _preflight_ondemand_candidate(
         else candidate.min_runtime_seconds + config.ondemand_lease_buffer_minutes * 60
     )
 
+    # Guards 4 and 5 judge whether the ask could physically land -- see
+    # _hold_on_fit.  Judged here on its own, and again in the grant loop, in the
+    # order the grants are made.
+    fit = _FitInputs(
+        placement=placement,
+        placement_nodes=placement_nodes,
+        class_free_by_node=class_free_by_node,
+        duration_seconds=duration_seconds,
+    )
+    if await _hold_on_fit(state, config, uid, candidate, fit, now):
+        return _PREFLIGHT_RETRY, None, None
+
+    ask = OnDemandAdmissionCandidate(
+        pod_uid=uid,
+        # Evidence about the pod, alongside the ask itself.  The creation time is
+        # the candidate's own FIFO key, so the app orders by exactly what the
+        # controller orders by; the annotations come off *fresh_pod* rather than
+        # the candidate, so a pod re-annotated while it waited is offered as it
+        # is now, not as it was when first seen.
+        pod_created_at=candidate.pod_created_at,
+        pod_annotations=get_pod_galends_annotations(fresh_pod),
+        username=candidate.pod_namespace,
+        group_name=candidate.usage_group,
+        gpu_class_id=gpu_class_id,
+        gpu_count=candidate.gpu_requested,
+        duration_seconds=duration_seconds,
+        best_effort=candidate.best_effort,
+    )
+    return _PREFLIGHT_READY, ask, fit
+
+
+async def _hold_on_fit(
+    state: ControllerState,
+    config: Config,
+    uid: str,
+    candidate: OnDemandCandidate,
+    fit: _FitInputs,
+    now: datetime,
+    *,
+    node_claimed: int = 0,
+) -> bool:
+    """Guards 4 and 5: hold an ask whose GPUs could not physically land.
+
+    Judged twice for a candidate that is granted: at preflight, on its own,
+    and in the grant loop, in the order the grants are made.  The second is
+    what lets the app's order decide who gets the scarcest physical capacity;
+    a tally accrued at preflight, in creation order, would have chosen before
+    the app was asked.  Guard 4 needs no tally for it -- a lease granted
+    earlier in the batch is upserted into ``state.reservations`` before the
+    next grant is judged -- but guard 5 reads a node snapshot no grant
+    updates, so *node_claimed* is the GPUs the batch's earlier grants took.
+
+    Returns ``True`` when held: ``candidate.next_attempt_at`` has been pushed
+    forward, and the hold logged and told to the pod's owner.
+    """
     # Guard 4: capacity overcommit — a GPU class whose app-side count exceeds
     # observed physical capacity (set by the hourly capacity audit; recomputed
     # each tick so it clears when the deficiency is resolved).  The app sells a
@@ -1294,10 +1382,9 @@ async def _preflight_ondemand_candidate(
     # count, over the lease's whole duration -- a booking that starts mid-lease
     # counts, since its holder would otherwise find the lease pod on the GPU it
     # paid for, beyond the reach of boundary preemption -- so a node outage on
-    # a lightly loaded class does not stop on-demand work.  *claimed_by_class*
-    # nets off the asks already passed earlier in this batch; a lease granted
-    # by an earlier batch is in state.reservations already.  With the flag off,
-    # the whole class is paused.
+    # a lightly loaded class does not stop on-demand work.  A lease granted
+    # earlier in the batch, or by an earlier batch, is in state.reservations
+    # already.  With the flag off, the whole class is paused.
     # A best-effort candidate is exempt: overcommit means the *app's* per-class
     # count exceeds physical capacity, and a best-effort stub consumes no
     # app-side count at all, so the mismatch says nothing about whether one can
@@ -1309,12 +1396,11 @@ async def _preflight_ondemand_candidate(
     ):
         if config.ondemand_overcommit_fit:
             physical = state.physical_gpu_capacity.get(candidate.gpu_class_label, 0)
-            claimed = (claimed_by_class or {}).get(candidate.gpu_class_label, 0)
             committed, peak_at = state.peak_committed_gpus(
                 candidate.gpu_class_label, now,
-                now + timedelta(seconds=duration_seconds),
+                now + timedelta(seconds=fit.duration_seconds),
             )
-            held = committed + claimed + candidate.gpu_requested > physical
+            held = committed + candidate.gpu_requested > physical
             if held:
                 log.info("%s", kv(
                     event="ondemand.candidate_held", guard=4,
@@ -1322,7 +1408,6 @@ async def _preflight_ondemand_candidate(
                     ns=candidate.pod_namespace, pod=candidate.pod_name,
                     clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
                     phys_gpus=physical, committed=committed, peak_at=peak_at,
-                    claimed=claimed or None,
                 ))
         else:
             held = True
@@ -1336,7 +1421,7 @@ async def _preflight_ondemand_candidate(
             candidate.held_by_overcommit = True
             candidate.next_attempt_at = _short_retry_at(now)
             await _emit_admission_paused_event(config, state, uid, candidate, 4, now)
-            return _PREFLIGHT_RETRY, None
+            return True
 
     # Guard 5: per-node feasibility — a multi-GPU (>=2) pod can only schedule if
     # some single node has enough free GPUs, and node-scoped extended resources
@@ -1356,12 +1441,13 @@ async def _preflight_ondemand_candidate(
     # under.  Nothing else closes that; this is the only physical bound on
     # best-effort admission.
     #
-    # *claimed_by_class* is the running tally of GPUs already granted earlier in
-    # this same batch, so a burst of candidates cannot each be measured against
-    # the same single-node opening.  It does not close the window between queue
-    # ticks (the snapshot refreshes on QUEUE_PROCESSOR_INTERVAL), which is
-    # acceptable precisely because a best-effort over-admission is cheap: no SU
-    # is charged, no capacity is held, and the pod simply waits.
+    # *node_claimed* is the GPUs the batch's earlier grants took, which the
+    # node snapshot does not show, so a burst of candidates cannot each be
+    # measured against the same single-node opening.  It does not close the
+    # window between queue ticks (the snapshot refreshes on
+    # QUEUE_PROCESSOR_INTERVAL), which is acceptable precisely because a
+    # best-effort over-admission is cheap: no SU is charged, no capacity is
+    # held, and the pod simply waits.
     #
     # A pod whose node placement narrows the class is checked at every GPU
     # count too, against only the nodes it allows: pinned to one busy host, a
@@ -1371,28 +1457,27 @@ async def _preflight_ondemand_candidate(
     # The batch tally is per class, not per node, so for such a pod it is
     # conservative: a GPU claimed by an earlier candidate is netted off these
     # nodes even if it will land elsewhere, costing at most a short retry.
-    narrowing = placement if placement_nodes is not None else None
+    narrowing = fit.placement if fit.placement_nodes is not None else None
     if (
         narrowing is not None
         or candidate.gpu_requested >= 2
         or candidate.best_effort
     ):
-        if placement_nodes is not None:
-            assert class_free_by_node is not None
+        if fit.placement_nodes is not None:
+            assert fit.class_free_by_node is not None
             largest_free: Optional[int] = max(
-                class_free_by_node.get(n, 0) for n in placement_nodes
+                fit.class_free_by_node.get(n, 0) for n in fit.placement_nodes
             )
         else:
             largest_free = state.node_free_by_class.get(candidate.gpu_class_label)
         if largest_free is not None:
-            claimed = (claimed_by_class or {}).get(candidate.gpu_class_label, 0)
-            if largest_free - claimed < candidate.gpu_requested:
+            if largest_free - node_claimed < candidate.gpu_requested:
                 log.info("%s", kv(
                     event="ondemand.candidate_held", guard=5,
                     reason="no_single_node_fit",
                     ns=candidate.pod_namespace, pod=candidate.pod_name,
                     clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
-                    node_free=largest_free, claimed=claimed or None,
+                    node_free=largest_free, claimed=node_claimed or None,
                     # Present only when node_free is over the nodes the pod's
                     # placement allows rather than the whole class.
                     detail=_placement_text(narrowing) if narrowing else None,
@@ -1407,24 +1492,8 @@ async def _preflight_ondemand_candidate(
                         ),
                         now,
                     )
-                return _PREFLIGHT_RETRY, None
-
-    ask = OnDemandAdmissionCandidate(
-        pod_uid=uid,
-        # Evidence about the pod, alongside the ask itself.  The creation time is
-        # the candidate's own FIFO key, so the app orders by exactly what the
-        # controller orders by; the annotations come off *fresh_pod* rather than
-        # the candidate, so a pod re-annotated while it waited is offered as it
-        # is now, not as it was when first seen.
-        pod_created_at=candidate.pod_created_at,
-        pod_annotations=get_pod_galends_annotations(fresh_pod),
-        username=candidate.pod_namespace,
-        group_name=candidate.usage_group,
-        gpu_class_id=gpu_class_id,
-        gpu_count=candidate.gpu_requested,
-        duration_seconds=duration_seconds,
-    )
-    return _PREFLIGHT_READY, ask
+                return True
+    return False
 
 
 async def _post_pending_status(
@@ -2357,6 +2426,123 @@ async def _emit_admission_paused_event(
     )
 
 
+def _schedule_after_denial(
+    candidate: OnDemandCandidate, attempt: LeaseAttempt, now: datetime
+) -> None:
+    """Set a candidate's next attempt after the app refused its ask.
+
+    Shared by a create's 409 and a gate-coded withhold from the admission
+    selection, which is the same refusal reached without the create.
+    *Contended*: capacity or a budget window may free up, so keep the ordinary
+    cadence -- or wait for ``not_before`` when the app knows when it clears.
+    *Structural* (``retryable: false``, e.g. more GPUs than the class allows):
+    every retry is refused alike, so back off like a fault rather than asking
+    every 2-5 min forever, but keep checking -- an administrator can change the
+    answer.
+
+    A contended **capacity** refusal also marks the candidate as waiting for
+    capacity, which a delegated batch offers again whatever its cooldown: the
+    app's order then decides who gets capacity as it frees, rather than each
+    pod's own retry clock (``_run_ondemand_admission_once``).
+    """
+    if attempt.structural:
+        candidate.lease_error_count += 1
+        candidate.next_attempt_at = _error_retry_at(now, candidate.lease_error_count)
+    else:
+        candidate.lease_error_count = 0
+        candidate.next_attempt_at = _denial_retry_at(now, attempt.not_before)
+    candidate.awaiting_capacity = (
+        not attempt.structural and attempt.code in CAPACITY_DENIAL_CODES
+    )
+
+
+def _capacity_wait_message(gpu_class: str) -> str:
+    """What the owner of a pod the admission selection passed over reads.
+
+    Generic on purpose: the message is the throttle key, and a count of the
+    requests ahead, or of the GPUs free, would make every batch a new Event.
+    """
+    return (
+        f"Waiting for GPU capacity in class {_plain(gpu_class)}; still retrying. "
+        f"The GPUs free this round went to on-demand requests ahead of this one. "
+        f"Nothing about this pod needs to change."
+    )
+
+
+async def _emit_capacity_wait_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    candidate: OnDemandCandidate,
+    now: datetime,
+) -> None:
+    """Tell a candidate's owner it was passed over for capacity (``WaitingForCapacity``).
+
+    Rides ``ONDEMAND_DENIAL_EVENT_ENABLED``, being the app's answer about the
+    ask, on the pending-status throttle -- keyed on the reason and a message
+    that does not change from batch to batch.
+    """
+    if not config.ondemand_denial_event_enabled:
+        return
+    message = _capacity_wait_message(candidate.gpu_class_label)
+    await _post_pending_status(
+        config, state, uid, candidate.pod_name, candidate.pod_namespace,
+        (WAITING_FOR_CAPACITY_REASON, message), now,
+        lambda: emit_pending_pod_event(
+            uid, candidate.pod_name, candidate.pod_namespace, message,
+            reason=WAITING_FOR_CAPACITY_REASON, gpu_class=candidate.gpu_class_label,
+            gpu_count=candidate.gpu_requested,
+        ),
+    )
+
+
+async def _handle_withheld(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    candidate: OnDemandCandidate,
+    verdict: Optional[AdmissionWithheld],
+    now: datetime,
+) -> None:
+    """Act on the app withholding a candidate from this admission batch.
+
+    A gate's refusal is exactly the 409 the create would have returned, so it
+    is handled as one -- the same backoff and the same ``OnDemandLeaseDenied``
+    Event carrying the app's reason -- without spending a create on it.
+    ``outranked`` (the capacity went to grants ahead of it), and a withhold
+    with no reason the controller can read, wait for capacity: offered again in
+    every delegated batch, and told with the generic ``WaitingForCapacity``
+    notice rather than a count.
+    """
+    if verdict is not None and verdict.code is not None and not verdict.outranked:
+        attempt = verdict.as_denial()
+        _schedule_after_denial(candidate, attempt, now)
+        log.info("%s", kv(
+            event="ondemand.withheld", ns=candidate.pod_namespace,
+            pod=candidate.pod_name, clabel=candidate.gpu_class_label,
+            gpus=candidate.gpu_requested, reason=attempt.code,
+            retryable=attempt.app_retryable, detail=attempt.detail,
+            retry_s=int((candidate.next_attempt_at - now).total_seconds()),
+        ))
+        await _emit_lease_denial_event(
+            config, state, uid, candidate, attempt.detail, now,
+            structural=attempt.structural, not_before=attempt.not_before,
+        )
+        return
+    candidate.lease_error_count = 0
+    candidate.awaiting_capacity = True
+    candidate.next_attempt_at = _jittered_retry_at(now)
+    log.info("%s", kv(
+        event="ondemand.withheld", ns=candidate.pod_namespace,
+        pod=candidate.pod_name, clabel=candidate.gpu_class_label,
+        gpus=candidate.gpu_requested,
+        reason=verdict.code if verdict is not None else None,
+        detail=verdict.detail if verdict is not None else None,
+        retry_s=int((candidate.next_attempt_at - now).total_seconds()),
+    ))
+    await _emit_capacity_wait_event(config, state, uid, candidate, now)
+
+
 async def _grant_and_admit(
     state: ControllerState,
     client: ReservationClient,
@@ -2410,23 +2596,14 @@ async def _grant_and_admit(
             )
         )
     if not attempt.granted:
+        # Whatever else follows, this attempt says the ask did not fail for
+        # want of capacity -- unless it is a capacity 409, which re-marks it.
+        candidate.awaiting_capacity = False
         if attempt.status == LEASE_DENIED_STATUS:
             # The app refused the ask (409), and its envelope says whether waiting
-            # can ever change that.  Contended: capacity or a budget window may
-            # free up, so keep the ordinary cadence -- or wait for ``not_before``
-            # when the app knows when it clears.  Structural (``retryable: false``,
-            # e.g. more GPUs than the class allows): every retry is refused alike,
-            # so back off like a fault rather than asking every 2-5 min forever,
-            # but keep checking -- an administrator can change the answer.  Both
-            # stay INFO: the pod's owner, not the operator, is the one to act.
-            if attempt.structural:
-                candidate.lease_error_count += 1
-                candidate.next_attempt_at = _error_retry_at(
-                    now, candidate.lease_error_count
-                )
-            else:
-                candidate.lease_error_count = 0
-                candidate.next_attempt_at = _denial_retry_at(now, attempt.not_before)
+            # can ever change that.  Both stay INFO: the pod's owner, not the
+            # operator, is the one to act.
+            _schedule_after_denial(candidate, attempt, now)
             log.info("%s", kv(
                 event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
                 clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
@@ -2474,6 +2651,7 @@ async def _grant_and_admit(
         return False
 
     candidate.lease_error_count = 0
+    candidate.awaiting_capacity = False
     lease = attempt.reservation
     log.info("%s", kv(
         event="lease.granted", rid=lease.id, ns=candidate.pod_namespace,
@@ -2541,31 +2719,41 @@ async def _try_request_lease(
     return status == _PREFLIGHT_REMOVE
 
 
-def _build_admission_request(
-    ready: list[tuple[str, OnDemandCandidate, OnDemandAdmissionCandidate]],
-) -> OnDemandAdmissionRequest:
+class _Ready(NamedTuple):
+    """A candidate preflight found ready, as the batch carries it to the grant."""
+
+    uid: str
+    candidate: OnDemandCandidate
+    ask: OnDemandAdmissionCandidate
+    fit: _FitInputs
+    # Its retry time had passed.  A candidate waiting for capacity is offered
+    # before then when delegation is on; if the app cannot be asked, only a due
+    # one is granted, so a failed call never multiplies the creates.
+    due: bool
+
+
+def _build_admission_request(ready: list[_Ready]) -> OnDemandAdmissionRequest:
     """Flatten preflight-approved candidates into an app request body."""
-    return OnDemandAdmissionRequest(candidates=[ask for _, _, ask in ready])
+    return OnDemandAdmissionRequest(candidates=[r.ask for r in ready])
 
 
-def _map_granted_uids(
-    ready: list[tuple[str, OnDemandCandidate, OnDemandAdmissionCandidate]],
-    granted: list[str],
-) -> set[str]:
-    """Resolve the app's granted uids to the offered set, dropping unknowns.
+def _map_granted_uids(ready: list[_Ready], granted: list[str]) -> list[str]:
+    """The app's granted uids, in its order, keeping only ones it was offered.
 
     Only pods the controller actually *offered* can be granted: an unknown uid
     is ignored (the app chooses among the candidates but can never introduce a
     new one), so a buggy or malicious response can never make the controller
-    admit a pod it did not independently deem eligible this round.
+    admit a pod it did not independently deem eligible this round.  The order
+    is the app's and is kept -- it is the ranking -- and a uid repeated is
+    granted once, where it first appears.
     """
-    offered = {uid for uid, _, _ in ready}
-    result: set[str] = set()
+    offered = {r.uid for r in ready}
+    result: list[str] = []
     for uid in granted:
-        if uid in offered:
-            result.add(uid)
-        else:
+        if uid not in offered:
             log.warning("%s", kv(event="ondemand.unknown_grant", poduid=uid))
+        elif uid not in result:
+            result.append(uid)
     return result
 
 
@@ -2574,78 +2762,104 @@ async def _run_ondemand_admission_once(
     client: ReservationClient,
     config: Config,
 ) -> None:
-    """Run one on-demand admission pass over all due candidates.
+    """Run one on-demand admission pass.
 
-    Preflights every due candidate (FIFO by creation time), offers the survivors
-    to the app for LAS prioritisation when delegation is enabled, and creates +
-    admits a reservation for each granted candidate.  A non-granted survivor
-    cools down for a normal-clock retry (same backoff as a denial).
+    Preflights every due candidate (FIFO by creation time) -- and, when
+    delegation is on, every candidate waiting for capacity, whatever its
+    cooldown -- offers the survivors to the app, and creates + admits a
+    reservation for each granted candidate **in the order the app returned**.
 
-    ``claimed`` tallies the GPUs each survivor would take, per class, so guard 5
-    measures a candidate against what is left of the class's largest single-node
-    opening rather than against the same snapshot every time.  Without it a
-    burst of best-effort pods would all clear a one-GPU opening in the same
-    batch — the app cannot catch that, since a best-effort stub holds no
-    capacity for it to count.  Guard 4 nets it off an over-counted class's
-    physical GPUs the same way: every lease in the batch is judged before any
-    is granted, so none of them is in ``state.reservations`` yet.  (It counts
-    each earlier ask as covering the whole window, and a best-effort ask too,
-    though guard 4 otherwise counts only reservations -- both slight
-    overestimates, bounded by one batch.)  It is deliberately optimistic: it
-    accrues at preflight, before the app has granted anything, because a
-    candidate the app later defers costs only a slightly conservative guard for
-    the rest of *this* batch, whereas accruing after the grant would not bound
-    the batch at all.
+    **Who is offered.**  Without delegation a candidate is tried when its
+    retry time comes.  With it, a candidate the app withheld for capacity, or
+    whose create a capacity gate refused, is offered in every batch until its
+    answer changes: the app ranks the waiters, so capacity freed between queue
+    ticks goes to the one it ranks first rather than to whichever pod's retry
+    clock happens to come round.  The app answers the whole batch in one
+    read-only call, so this costs no create per waiter.
+
+    **Guards 4 and 5 are judged twice.**  Preflight judges each candidate on
+    its own; the grant loop judges each again, in grant order, against what
+    the grants ahead of it took (``_hold_on_fit``) -- so on the scarcest
+    physical capacity it is the app's order, not creation order, that decides.
+    Guard 4 needs no tally there: a granted lease is upserted into
+    ``state.reservations`` before the next grant is judged.  Guard 5 nets the
+    GPUs of this batch's grants off the node snapshot, which nothing else
+    updates until the next queue tick.
+
+    **What is not granted.**  A candidate the app withheld is handled by its
+    reason (``_handle_withheld``).  If the app cannot be asked, every *due*
+    survivor is granted -- the behaviour without delegation -- and a waiter
+    offered early keeps its own retry time.
     """
     now = datetime.now(timezone.utc)
     ordered = sorted(
         # Not named `kv` — that is the log-field renderer imported module-wide.
         state.ondemand_candidates.items(), key=lambda item: item[1].pod_created_at
     )
-    ready: list[tuple[str, OnDemandCandidate, OnDemandAdmissionCandidate]] = []
-    claimed: dict[str, int] = {}
+    ready: list[_Ready] = []
     for uid, candidate in ordered:
-        if now < candidate.next_attempt_at:
+        due = now >= candidate.next_attempt_at
+        if not due and not (
+            candidate.awaiting_capacity and config.ondemand_delegate_admission
+        ):
             continue
-        status, ask = await _preflight_ondemand_candidate(
-            state, config, uid, candidate, claimed
-        )
+        status, ask, fit = await _preflight_with_fit(state, config, uid, candidate)
+        if status == _PREFLIGHT_READY:
+            assert ask is not None and fit is not None
+            ready.append(_Ready(uid, candidate, ask, fit, due))
+            continue
+        # Held or dropped by the controller's own checks: whatever it waits for
+        # now, it is not the app's capacity.
+        candidate.awaiting_capacity = False
         if status == _PREFLIGHT_REMOVE:
             state.remove_ondemand_candidate(uid)
-        elif status == _PREFLIGHT_READY:
-            assert ask is not None
-            ready.append((uid, candidate, ask))
-            claimed[candidate.gpu_class_label] = (
-                claimed.get(candidate.gpu_class_label, 0) + candidate.gpu_requested
-            )
         # _PREFLIGHT_RETRY: leave in place; next_attempt_at already stamped.
 
     if not ready:
         return
 
-    # Default (and fallback): grant every offered candidate — today's greedy
-    # per-pod behaviour.  When delegation is enabled and the app answers, its
-    # subset wins; an empty answer is respected (grant none this round).
-    granted = {uid for uid, _, _ in ready}
+    # Default: grant every candidate that was due, in creation order.  When
+    # delegation is enabled and the app answers, its order and its withholds
+    # win; an empty answer is respected (grant none this round).
+    granted = [r.uid for r in ready if r.due]
+    withheld: dict[str, AdmissionWithheld] = {}
+    answered = False
     if config.ondemand_delegate_admission:
-        result = await client.select_ondemand_admissions(_build_admission_request(ready))
-        if result is not None:
-            granted = _map_granted_uids(ready, result)
+        selection = await client.select_ondemand_admissions(_build_admission_request(ready))
+        if selection is not None:
+            answered = True
+            granted = _map_granted_uids(ready, selection.granted)
+            withheld = selection.withheld
         else:
             log.warning("%s", kv(
                 event="ondemand.selection_unavailable", fallback="grant_all",
                 candidates=len(ready),
             ))
 
+    by_uid = {r.uid: r for r in ready}
+    node_claimed: dict[str, int] = {}
+    for uid in granted:
+        r = by_uid[uid]
+        label = r.candidate.gpu_class_label
+        if await _hold_on_fit(
+            state, config, uid, r.candidate, r.fit, datetime.now(timezone.utc),
+            node_claimed=node_claimed.get(label, 0),
+        ):
+            r.candidate.awaiting_capacity = False
+            continue
+        if await _grant_and_admit(state, client, config, uid, r.candidate, r.ask):
+            state.remove_ondemand_candidate(uid)
+            node_claimed[label] = node_claimed.get(label, 0) + r.candidate.gpu_requested
+
+    if not answered:
+        return
     deferred_at = datetime.now(timezone.utc)
-    for uid, candidate, ask in ready:
-        if uid in granted:
-            if await _grant_and_admit(state, client, config, uid, candidate, ask):
-                state.remove_ondemand_candidate(uid)
-        else:
-            # The app deferred this pod this round — cool it down like a denial
-            # so it is re-offered on a later tick, not spun on every trigger.
-            candidate.next_attempt_at = _jittered_retry_at(deferred_at)
+    granted_set = set(granted)
+    for r in ready:
+        if r.uid not in granted_set:
+            await _handle_withheld(
+                config, state, r.uid, r.candidate, withheld.get(r.uid), deferred_at,
+            )
 
 
 async def _run_ondemand_admission(
@@ -2724,7 +2938,7 @@ async def reservation_fetch_loop(
 
 async def _teardown_ondemand_lease(
     state: ControllerState, client: ReservationClient, pod
-) -> None:
+) -> bool:
     """Cancel the JIT on-demand lease backing *pod* when the pod has gone away.
 
     A JIT lease exists solely to cover one pod (its ``idempotency_key`` is the
@@ -2744,23 +2958,30 @@ async def _teardown_ondemand_lease(
     (already-cancelled / gone ids are a harmless no-op), and a failure just logs
     — the next app poll reconciles.  Occupancy is released separately by the
     caller, independent of this cancel succeeding.
+
+    Returns ``True`` when a lease was cancelled, which returns its capacity to
+    the app's calendar: the caller then starts an admission batch, so a
+    candidate waiting on that capacity is offered it now rather than at the
+    next queue tick.
     """
     booking_id = parse_booking_reference(get_pod_booking_reference(pod))
     if booking_id is None:
-        return
+        return False
     # Hold the lock across the cancel + list edit, mirroring the compensating
     # cancel in _try_request_lease, so a concurrent fetch can't replace
     # state.reservations mid-operation.
     async with state.reservation_lock:
         res = next((r for r in state.reservations if r.id == booking_id), None)
         if res is None or res.status != "active" or res.kind != "on_demand":
-            return
+            return False
         log.info("%s", kv(
             event="lease.teardown", rid=booking_id, class_=res.gpu_class.name,
             reason="pod_gone",
         ))
         if await client.cancel_reservation(booking_id, "pod-terminated"):
             state.reservations = [r for r in state.reservations if r.id != booking_id]
+            return True
+    return False
 
 
 def _parse_utc_iso(value: Optional[str]) -> Optional[datetime]:
@@ -2923,10 +3144,14 @@ async def pod_watch_loop(
                     )
                     # If this pod was admitted under a JIT on-demand lease, release the
                     # lease too — it exists only to cover this pod (no-op for bookings).
-                    await _teardown_ondemand_lease(state, client, pod)
+                    lease_released = await _teardown_ondemand_lease(state, client, pod)
                     # Its GPUs are free: a pod waiting on the same reservation
                     # need not wait for the next tick to take them.
                     await _retry_waiters(state, config, released)
+                    if lease_released:
+                        # Nor need an on-demand candidate: the lease's capacity
+                        # is back in the app's calendar.
+                        await _run_ondemand_admission(state, client, config)
 
                 elif event_type in ("ADDED", "MODIFIED"):
                     phase = get_pod_phase(pod)
@@ -2952,10 +3177,14 @@ async def pod_watch_loop(
                         )
                         # A pod that finished on its own no longer needs its JIT lease;
                         # cancel it if that's what admitted this pod (no-op otherwise).
-                        await _teardown_ondemand_lease(state, client, pod)
+                        lease_released = await _teardown_ondemand_lease(state, client, pod)
                         # The next job queued on the same reservation starts now,
                         # not on the next tick.
                         await _retry_waiters(state, config, released)
+                        if lease_released:
+                            # And an on-demand candidate waiting on capacity is
+                            # offered the lease's now.
+                            await _run_ondemand_admission(state, client, config)
                         continue
 
                     if has_tol:

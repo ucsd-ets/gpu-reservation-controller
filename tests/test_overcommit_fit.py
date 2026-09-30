@@ -10,7 +10,8 @@ Three layers:
 
 - ``ControllerState.peak_committed_gpus`` -- the calendar arithmetic, pure.
 - ``main._preflight_ondemand_candidate`` / ``_run_ondemand_admission_once`` --
-  which asks are held, including across a batch and across batches.
+  which asks are held: on their own at preflight, and again at grant time,
+  after the leases granted ahead of them in the batch and in earlier ones.
 - ``plan_ondemand_gates`` / ``_warn_ondemand_gates`` -- the operator warning,
   which now reports guard 4 only while it is holding someone.
 """
@@ -122,7 +123,7 @@ class TestPeakCommittedGpus:
 # ---------------------------------------------------------------------------
 
 
-def _preflight(monkeypatch, m, state, candidate, *, claimed=None, **config):
+def _preflight(monkeypatch, m, state, candidate, **config):
     recorder = _Recorder()
 
     async def fake_read_pod(name, namespace):
@@ -131,7 +132,7 @@ def _preflight(monkeypatch, m, state, candidate, *, claimed=None, **config):
     monkeypatch.setattr(m, "read_pod", fake_read_pod)
     monkeypatch.setattr(m, "emit_admission_paused_event", recorder)
     status, _ask = asyncio.run(m._preflight_ondemand_candidate(
-        state, make_config(**config), candidate.pod_uid, candidate, claimed,
+        state, make_config(**config), candidate.pod_uid, candidate,
     ))
     return status, recorder
 
@@ -213,21 +214,6 @@ class TestPreflightFit:
         status, _rec = _preflight(monkeypatch, m, state, _candidate(gpu_requested=4))
         assert status == m._PREFLIGHT_RETRY
 
-    def test_asks_passed_earlier_in_the_batch_count(self, monkeypatch, caplog):
-        m = _main_module(monkeypatch)
-        state = _overcommitted(_now_state(), physical=4)
-        with caplog.at_level(logging.INFO, logger="app.main"):
-            status, _rec = _preflight(
-                monkeypatch, m, state, _candidate(gpu_requested=2),
-                claimed={GPU_CLASS_LABEL: 3},
-            )
-        assert status == m._PREFLIGHT_RETRY
-        [line] = [
-            kv_fields(r.getMessage()) for r in caplog.records
-            if "event=ondemand.candidate_held" in r.getMessage()
-        ]
-        assert line["claimed"] == "3"
-
     def test_a_class_with_no_physical_entry_has_no_gpus(self, monkeypatch):
         # Overcommitted with no physical entry means no schedulable node at all.
         m = _main_module(monkeypatch)
@@ -275,7 +261,12 @@ class TestPreflightFit:
 
 
 class TestAcrossBatches:
-    """``claimed`` bounds one batch; the upserted lease bounds the next."""
+    """The lease granted ahead bounds the rest of its batch, and the next.
+
+    Preflight judges each ask on its own, so both below pass it; the grant
+    loop judges each again after the lease ahead of it is upserted into
+    ``state.reservations``, which is what holds the second.
+    """
 
     def _run(self, monkeypatch, m, state, granted):
         async def fake_read_pod(name, namespace):
@@ -297,16 +288,23 @@ class TestAcrossBatches:
             state, None, make_config(ondemand_delegate_admission=False),
         ))
 
-    def test_only_what_fits_is_granted(self, monkeypatch):
+    def test_only_what_fits_is_granted(self, monkeypatch, caplog):
         m = _main_module(monkeypatch)
         state = _overcommitted(_state(), physical=4)
         for uid in ("uid-a", "uid-b"):
             state.ondemand_candidates[uid] = _candidate(uid, gpu_requested=3)
         granted: list[str] = []
 
-        self._run(monkeypatch, m, state, granted)
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            self._run(monkeypatch, m, state, granted)
         assert granted == ["uid-a"]
         assert state.ondemand_candidates["uid-b"].held_by_overcommit is True
+        # Held at grant time, counting uid-a's just-granted lease as committed.
+        [line] = [
+            kv_fields(r.getMessage()) for r in caplog.records
+            if "event=ondemand.candidate_held" in r.getMessage()
+        ]
+        assert line["committed"] == "3" and "claimed" not in line
 
         # The next batch sees the lease just granted, not an empty calendar.
         state.ondemand_candidates["uid-b"].next_attempt_at = datetime.now(timezone.utc)

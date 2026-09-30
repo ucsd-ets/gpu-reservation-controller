@@ -103,7 +103,8 @@ On the admission denials (`reservation.denied`, `lease.denied`,
 `preflight.denied`, `continue.denied`) the enum is the **published denial
 code** — the same closed vocabulary the client receives as `code` in the
 response body — so an app line and a controller line join on the exact
-string. It is `reason=` rather than a new key because the code *is* the
+string. `ondemand.withheld`, on both sides, carries the same codes plus
+`outranked`, the admission selection's one code that is not a gate. It is `reason=` rather than a new key because the code *is* the
 "why" this line already had a field for, and two keys for one concept is
 what this dictionary exists to prevent.
 
@@ -351,6 +352,7 @@ both sides, whereas everywhere else an absent value means "not known".
 |---|---|---|
 | `candidates` | int | size of a pool offered for selection (preemption victims, on-demand admission) |
 | `selected` / `granted` | int | how many of them were chosen |
+| `withheld` | int | how many offered on-demand candidates the admission selection did not grant |
 | `reservations` | int | reservations in the occupancy map |
 | `fallback` | string | what was used instead when a delegated call was unavailable |
 | `target` | string | which snapshot failed (`pods`, `node_capacity`) |

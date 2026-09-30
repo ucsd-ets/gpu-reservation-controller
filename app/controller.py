@@ -506,6 +506,14 @@ class OnDemandCandidate:
     # only the asks that do not fit, so an over-counted class is a gate only
     # while it is holding someone -- plan_ondemand_gates counts these.
     held_by_overcommit: bool = False
+    # The app's latest answer about this ask was "it fits, but not now, for want
+    # of capacity": a create refused by a capacity gate as contended, or the
+    # admission selection withholding it as outranked.  With delegation on, such
+    # a candidate is offered in every admission batch whatever its cooldown, so
+    # the app's order -- not each pod's retry clock -- decides who gets capacity
+    # as it frees.  Cleared by any other answer, and by a hold of the
+    # controller's own.  See main._run_ondemand_admission_once.
+    awaiting_capacity: bool = False
     # The pod declared galends/runtime-guarantee: none -- it wants no runtime
     # guarantee at all, and is admitted under a zero-length, zero-SU
     # kind="best_effort" reservation rather than a guaranteed lease.  It is

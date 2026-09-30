@@ -419,8 +419,7 @@ def _state(*, h1_free=0, h2_free=4, labels=True):
     return state
 
 
-def _preflight(monkeypatch, state, pod, *, candidate=None, config=None, claimed=None,
-               recorder=None):
+def _preflight(monkeypatch, state, pod, *, candidate=None, config=None, recorder=None):
     m = _main_module(monkeypatch)
     candidate = candidate or _candidate(gpus=int(
         pod.spec.containers[0].resources.requests["nvidia.com/gpu"]
@@ -433,7 +432,7 @@ def _preflight(monkeypatch, state, pod, *, candidate=None, config=None, claimed=
     monkeypatch.setattr(m, "read_pod", fake_read_pod)
     monkeypatch.setattr(m, "emit_pending_pod_event", recorder)
     status, ask = asyncio.run(m._preflight_ondemand_candidate(
-        state, config or make_config(), candidate.pod_uid, candidate, claimed,
+        state, config or make_config(), candidate.pod_uid, candidate,
     ))
     return m, status, ask, candidate, recorder
 
@@ -550,13 +549,26 @@ class TestPreflightWaitingForNode:
         assert rec.calls == []
 
     def test_the_batch_tally_is_netted_off_the_allowed_nodes(self, monkeypatch):
-        # Conservative by design: the tally is per class, so a GPU another
-        # candidate claimed this batch counts against these nodes too.
-        m, status, _a, _c, rec = _preflight(
-            monkeypatch, _state(h1_free=1, h2_free=4), _pod(node_selector={HOST: "h1"}),
-            claimed={GPU_CLASS_LABEL: 1},
+        # Conservative by design: the tally is per class, so a GPU a grant
+        # earlier in the batch took counts against these nodes too.  Preflight
+        # judges the pod on its own (h1 has its GPU); the grant loop, after
+        # that grant, holds it.
+        state = _state(h1_free=1, h2_free=4)
+        m, status, _a, candidate, rec = _preflight(
+            monkeypatch, state, _pod(node_selector={HOST: "h1"}),
         )
-        assert status == m._PREFLIGHT_RETRY
+        assert status == m._PREFLIGHT_READY
+
+        async def at_grant():
+            _s, _ask, fit = await m._preflight_with_fit(
+                state, make_config(), candidate.pod_uid, candidate,
+            )
+            return await m._hold_on_fit(
+                state, make_config(), candidate.pod_uid, candidate, fit,
+                datetime.now(timezone.utc), node_claimed=1,
+            )
+
+        assert asyncio.run(at_grant()) is True
         assert rec.reasons == [WAITING_FOR_NODE_REASON]
 
 

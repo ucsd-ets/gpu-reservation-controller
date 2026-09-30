@@ -1836,7 +1836,8 @@ async def emit_admission_paused_event(
 # OnDemandAdmissionPaused, which report the app refusing or a class being
 # paused.  The first five say something *about the pod* stops the controller
 # admitting it; the rest, that it is waiting -- for a reservation it is queued
-# on, or for room on the nodes it asked for.  Each reason maps to the Event's
+# on, for room on the nodes it asked for, or for GPU capacity the app gave to
+# requests ahead of it.  Each reason maps to the Event's
 # type, its ``action`` (what the controller was attempting) and its
 # ``generateName`` prefix.
 LEASE_REJECTED_REASON = "OnDemandLeaseRejected"
@@ -1845,6 +1846,7 @@ NO_RESERVATION_REASON = "NoReservation"
 ANNOTATION_IGNORED_REASON = "AnnotationIgnored"
 NO_MATCHING_NODE_REASON = "NoMatchingNode"
 WAITING_FOR_NODE_REASON = "WaitingForNode"
+WAITING_FOR_CAPACITY_REASON = "WaitingForCapacity"
 WAITING_FOR_RESERVATION_REASON = "WaitingForReservation"
 RESERVATION_FULL_REASON = "ReservationFull"
 RESERVATION_TOO_SMALL_REASON = "ReservationTooSmall"
@@ -1858,6 +1860,9 @@ _PENDING_POD_EVENTS: dict[str, tuple[str, str, str]] = {
     # Normal, like WaitingForReservation: the owner chose the nodes, and they
     # are busy -- nothing is wrong.
     WAITING_FOR_NODE_REASON: ("Normal", "RequestOnDemandLease", "gpu-node-wait-"),
+    # Normal: the app passed this ask over for capacity that went to requests
+    # ahead of it -- contention, with nothing wrong with the pod.
+    WAITING_FOR_CAPACITY_REASON: ("Normal", "RequestOnDemandLease", "gpu-capacity-wait-"),
     # Normal: a pod waiting for a window its owner chose to book is the system
     # working as intended, not something to act on.
     WAITING_FOR_RESERVATION_REASON: ("Normal", "AdmitPod", "gpu-reservation-wait-"),
@@ -1903,6 +1908,11 @@ async def emit_pending_pod_event(
 
     - ``WaitingForNode`` -- none of them has the GPUs it asks for free, so no
       lease is requested yet.
+
+    Or for on-demand capacity (``Normal``):
+
+    - ``WaitingForCapacity`` -- the reservation app's admission selection gave
+      the GPUs free this round to requests ahead of this one.
 
     Or it is queued for one of its owner's reservations:
 

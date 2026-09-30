@@ -61,7 +61,7 @@ app/
 | Task | Cadence | Responsibility |
 |------|---------|----------------|
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
-| `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; retries the pods waiting on a reservation a deleted/terminated pod held; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
+| `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease and starts an admission batch; retries the pods waiting on a reservation a deleted/terminated pod held; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; moves a queued pod to an open reservation with room; tells each pod still queued what it waits on; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee: reactively, when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**), and — throttled to `HEADROOM_CHECK_INTERVAL` — anticipatorily, to hold a fixed fraction of each class free for on-demand jobs that have not arrived yet (see **Anticipatory headroom preemption**) |
 | `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and gates on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation** and **Guard 4: admitting what fits on an over-counted class**) |
@@ -825,9 +825,11 @@ without the toleration,
    problem**).
 
 **Batch admission** (`main._run_ondemand_admission`, the single entry point for
-both the ADDED trigger and the queue-processor tick): gathers every **due**
-candidate (`now >= next_attempt_at`) in FIFO order and runs each through a
-two-step **preflight → delegate → grant** pipeline.
+the ADDED trigger, the queue-processor tick and a lease's release): gathers every
+**due** candidate (`now >= next_attempt_at`) in FIFO order — and, with
+delegation on, every candidate **waiting for capacity** whatever its cooldown
+(see **Ordered delegation** below) — and runs each through a
+**preflight → delegate → grant** pipeline.
 
 - **Preflight** (`_preflight_ondemand_candidate`): re-reads the pod (drops it
   if gone/terminal/Unknown), re-runs step 1 above (a matching reservation may
@@ -873,14 +875,17 @@ two-step **preflight → delegate → grant** pipeline.
 - **Delegate** (only when `ONDEMAND_DELEGATE_ADMISSION` is on): the whole
   survivor set is offered to the app in one call
   (`POST /api/reservations/ondemand-admission`,
-  `ReservationClient.select_ondemand_admissions`), which returns the subset of
-  `pod_uid`s to admit this round — the delegation point for **future LAS
-  prioritization**.  Mirrors the preemption-victims pattern: only offered uids
-  are honoured (`_map_granted_uids` drops unknowns), an **empty** answer is
-  respected (grant none), and a **call failure or the flag being off** falls
-  back to granting *every* survivor — the prior greedy per-pod behaviour, so the
-  change ships safely dark.
-- **Grant** (`_grant_and_admit`, per granted pod): calls `POST /api/reservations`
+  `ReservationClient.select_ondemand_admissions`).  The app answers with a dry
+  run of the creates — which to grant, **in the order to grant them**, and for
+  every other candidate the admission-denial envelope the create would have
+  returned, or `outranked` (see **Ordered delegation**).  Mirrors the
+  preemption-victims pattern: only offered uids are honoured
+  (`_map_granted_uids` drops unknowns and keeps the app's order), an **empty**
+  answer is respected (grant none), and a **call failure or the flag being
+  off** falls back to granting every *due* survivor in creation order — the
+  behaviour before delegation, so the change ships safely dark.
+- **Grant** (`_grant_and_admit`, per granted pod, **in the app's order**, each
+  judged first by guards 4 and 5 again — `_hold_on_fit`): calls `POST /api/reservations`
   with `on_demand=True` (the app relaxes policy limits — SU, caps, minimum
   duration — never physical calendar capacity), **idempotent by the pod's UID**
   (`idempotency_key`).  The client returns a `LeaseAttempt` carrying the HTTP
@@ -916,14 +921,61 @@ two-step **preflight → delegate → grant** pipeline.
   admission does not succeed** (budget race, transient patch error, or the pod
   having gone terminal), the controller issues a compensating cancel
   (`POST /api/reservations/{id}/cancel`, `reason="controller-revoked"`) so the
-  grant is never left dangling.  A **non-granted** survivor cools down like a
-  denial and is re-offered on a later tick.
+  grant is never left dangling.  A survivor the app **withheld** is handled by
+  its reason (`_handle_withheld`, below).
 
 The batch is coalesced by `ControllerState.ondemand_admission_lock`: only one
 runs at a time, and a trigger arriving mid-batch sets `ondemand_rerun_requested`
 so exactly one trailing pass follows — an ADDED burst collapses into at most one
 in-flight + one trailing batch.  The single-pod `_try_request_lease` remains as a
 thin `preflight → grant` wrapper (the non-delegated path and the unit-test seam).
+
+**Ordered delegation.**  With `ONDEMAND_DELEGATE_ADMISSION` on, the app — not
+creation order — decides who gets capacity that cannot cover everyone, and four
+things keep the controller from undoing that choice:
+
+- **Grants are made in the returned order** (`AdmissionSelection.granted`).  A
+  set would have let the controller re-impose creation order.
+- **Guards 4 and 5 are judged twice.**  Preflight judges each candidate on its
+  own; the grant loop judges each granted one again, in the app's order,
+  against what the grants ahead of it took (`_hold_on_fit`, fed the
+  `_FitInputs` preflight read).  A tally accrued at preflight in creation order
+  would have spent the scarcest physical capacity before the app was asked.
+  Guard 4 needs no tally for it — a granted lease is upserted into
+  `state.reservations` before the next grant is judged — while guard 5 nets the
+  batch's grants (`node_claimed`) off a node snapshot nothing else updates
+  between ticks.  A candidate held here keeps the preflight hold's retry and
+  Events.
+- **A candidate waiting for capacity is offered in every batch.**
+  `OnDemandCandidate.awaiting_capacity` is set when the app withholds it as
+  `outranked` (or without a readable reason), or a capacity gate refuses it as
+  contended — by withhold or by a create's `409` (`_schedule_after_denial`) —
+  and cleared by any other answer and by any hold of the controller's own.
+  Such a candidate is preflighted and offered whatever its cooldown, so
+  capacity freed between queue ticks goes to the one the app ranks first rather
+  than to whichever pod's retry clock comes round; an app grant overrides the
+  cooldown.  It costs no create per waiter, since the app answers the batch in
+  one read-only call; and if that call fails, only *due* candidates are granted,
+  so a failure never multiplies the creates.
+- **A lease's release starts a batch.**  `_teardown_ondemand_lease` returns
+  whether it cancelled a lease, and `pod_watch_loop` then runs
+  `_run_ondemand_admission` (outside `reservation_lock`, which teardown holds
+  across its cancel): the lease's capacity is back in the app's calendar, and a
+  waiter should not wait for the next tick to be offered it.  A booking's pod
+  ending starts nothing — the booking keeps its window.
+
+**What a withhold does** (`_handle_withheld`).  A withhold carrying a **gate
+code** is exactly the `409` the create would have returned, reached without
+spending a create, and is handled as one: the same backoff by `retryable` /
+`not_before` (`_schedule_after_denial`, shared with `_grant_and_admit`) and the
+same `OnDemandLeaseDenied` Event carrying the app's `detail`.  **`outranked`** —
+it fits on its own, but the capacity went to grants ahead of it — and a withhold
+with no readable reason wait for capacity: a 2–5 min cooldown (moot while
+delegation offers it anyway), `awaiting_capacity`, and a generic `Normal`
+`WaitingForCapacity` Event ("Waiting for GPU capacity …; still retrying") on the
+pending-status throttle, whose message carries no count so a pod passed over
+batch after batch is told once per repeat interval.  Each logs
+`ondemand.withheld` with the code as `reason`.
 
 **Surviving the fetch that hasn't seen the grant yet.**  The grant upserts the
 lease locally, but the periodic `reservation_fetch_loop` takes its
@@ -951,7 +1003,8 @@ is preempted, the lease is no longer needed and the controller cancels it
 (`POST /api/reservations/{id}/cancel`, `reason="pod-terminated"`), releasing the
 capacity and stopping SU accrual instead of letting the lease linger until it
 expires.  `pod_watch_loop` calls this from both its DELETED and terminal-phase
-branches, right after `release_pod`.  **No on-demand-vs-booking state is tracked
+branches, right after `release_pod`, and starts an admission batch when a lease
+was actually cancelled (see **Ordered delegation**).  **No on-demand-vs-booking state is tracked
 in memory**: the pod's `galends/booking-reference` annotation resolves to the
 reservation id, and the reservation's own `kind` field — the app returns leases
 as `kind="on_demand"` and the pull keeps them in `state.reservations` — is read
@@ -1027,12 +1080,12 @@ Three consequences worth knowing, each pinned by a test:
   the first would sit Pending.  The app's own 10-minute capacity probe is an
   anti-thrash heuristic ("is this class about to be booked solid?"), **not**
   admission control, for exactly this reason.
-- **An in-batch tally** (`claimed_by_class`, accrued at preflight in
-  `_run_ondemand_admission`) nets GPUs already taken by earlier candidates off
-  `node_free_by_class`, so a burst is not all measured against the same opening.
-  It does not close the window between queue ticks, which is acceptable because
-  an over-admitted best-effort pod costs nothing: no SU, no capacity, it just
-  waits.
+- **An in-batch tally** (`node_claimed`, accrued in the grant loop of
+  `_run_ondemand_admission_once`) nets GPUs already taken by the grants ahead of
+  a candidate off `node_free_by_class`, so a burst is not all measured against
+  the same opening.  It does not close the window between queue ticks, which is
+  acceptable because an over-admitted best-effort pod costs nothing: no SU, no
+  capacity, it just waits.
 
 **App side**: `_prioritize_candidates` now sacrifices by what the reservation
 promised — `best_effort`, then `on_demand`, then `booking` — replacing the
@@ -1064,7 +1117,9 @@ will not until something changes; it is the same shape kube-scheduler's
 
 Four properties are load-bearing:
 
-- **Only the app's own answers about the ask are surfaced.**  A network failure
+- **Only the app's own answers about the ask are surfaced.**  A gate-coded
+  withhold from the admission selection is one — the same refusal, reached
+  without the create — and is surfaced identically.  A network failure
   or a 5xx says nothing about the ask (the app never answered), and most
   non-retryable 4xx — a `read_only` service key, a schema mismatch — is an
   operator fault the pod's owner can neither read usefully nor fix.  Those keep
@@ -1307,7 +1362,7 @@ guard 4 to the asks that could actually land on a missing GPU, by re-running the
 app's own check against the physical count:
 
 ```
-hold  ⟺  peak committed(t) over [now, now + lease duration)  +  claimed  +  ask  >  physical
+hold  ⟺  peak committed(t) over [now, now + lease duration)  +  ask  >  physical
 ```
 
 - **`committed(t)`** (`ControllerState.peak_committed_gpus`, pure) is the GPUs
@@ -1326,11 +1381,12 @@ hold  ⟺  peak committed(t) over [now, now + lease duration)  +  claimed  +  as
 - **`physical`** is `physical_gpu_capacity`, from the same snapshot that put the
   class in `overcommitted_gpu_classes` (a label there with no entry has no
   schedulable node: `0`).
-- **`claimed`** is the batch tally guard 5 already keeps: every lease in a batch
-  is judged before any is granted.  A lease granted by an *earlier* batch is
-  already in `state.reservations` (`_grant_and_admit` upserts it), so the
-  arithmetic is current between queue ticks — which a pod-snapshot "free GPUs"
-  count, up to one `QUEUE_PROCESSOR_INTERVAL` stale, would not be.
+- **Earlier grants** are in `committed` already: `_grant_and_admit` upserts a
+  granted lease into `state.reservations`, and the grant loop judges each
+  candidate again after the grants ahead of it (see **Ordered delegation**) —
+  so the arithmetic is current within a batch and between queue ticks, which a
+  pod-snapshot "free GPUs" count, up to one `QUEUE_PROCESSOR_INTERVAL` stale,
+  would not be.
 - **Scope**: only classes in `overcommitted_gpu_classes`.  Elsewhere the app's
   own check is already against the right number, so the flag can only ever
   admit more than the blanket pause did, never less.
@@ -1353,14 +1409,13 @@ Three things are left out on purpose:
 
 **Known limitations.**  A lease asked for while its owner's own booking is about
 to open counts both, though merge would fold the lease into the booking at open,
-so it is held slightly conservatively; `claimed` likewise treats each earlier ask
-as covering the whole window.  Physical capacity still counts a NotReady node
+so it is held slightly conservatively.  Physical capacity still counts a NotReady node
 (the snapshot drops only cordoned and deleting ones), so a crashed but
 uncordoned node is invisible to guard 4 in either mode.
 
 **Reporting.**  A hold logs `ondemand.candidate_held guard=4
-reason=overcommit_no_fit` with `committed`, `peak_at`, `phys_gpus`, `gpus` (and
-`claimed` when non-zero), and tells the pod's owner through the same
+reason=overcommit_no_fit` with `committed`, `peak_at`, `phys_gpus` and `gpus`,
+and tells the pod's owner through the same
 `OnDemandAdmissionPaused` Event, reworded: admission is *limited*, and a job
 asking for fewer GPUs or a shorter minimum runtime may start sooner.
 `ondemand.gated` reports the class only while a candidate is held by it
@@ -1810,8 +1865,8 @@ never asked for a pod held here):
   one busy host is exactly as unable to start as a fragmented 4-GPU one.  Held
   with the short retry and its owner told with a `Normal` `WaitingForNode` Event
   (the scheduler's own message names only our taint, so the pod would otherwise
-  wait silently).  The in-batch `claimed` tally is per class, so for such a pod it
-  is **conservative** — a GPU claimed by another candidate this batch counts
+  wait silently).  The grant loop's `claimed` tally is per class, so for such a
+  pod it is **conservative** — a GPU a grant ahead of it this batch took counts
   against these nodes even if it lands elsewhere; the cost is a retry.
 
 Both Events use `_post_pending_status` (the `hold` topic) and
@@ -2162,9 +2217,9 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `BEST_EFFORT_ENABLED` | `false` | Honour a pod's `galends/runtime-guarantee: none` by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation instead of a guaranteed lease (see **Best-effort admission**). Ships dark: the app must serve the best-effort create shape, and against one that does not, every such candidate takes a non-retryable 4xx into `lease.error` backoff. The pod annotation alone is deliberately *not* the opt-in — unlike `galends/force-node-capacity`, any pod author can set it |
-| `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
-| `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's refusal of a JIT lease onto the waiting pod as a `Warning` Event — its **409** denial reason (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class it does not recognise (`reason=OnDemandLeaseRejected`) — so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
-| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
+| `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch, and in what order (`POST /api/reservations/ondemand-admission`): the app dry-runs the creates, returns its grants in order and withholds the rest with a reason, and a candidate waiting for capacity is then offered in every batch (see **Ordered delegation**). `false` (or any app-call failure) grants every due eligible candidate in creation order — the behaviour before delegation. The app's order is currently the offered order — pod age — so turning this on already spares the creates the app would refuse and re-offers waiters as capacity frees, but does not yet change who comes first |
+| `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's refusal of a JIT lease onto the waiting pod as a `Warning` Event — its **409** denial reason (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class it does not recognise (`reason=OnDemandLeaseRejected`) — so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Also tells the owner of a pod the app's admission selection withheld: its reason, as for a 409, or a `Normal` `WaitingForCapacity` notice when it was passed over for capacity granted ahead of it (see **Ordered delegation**). Informational only; `false` disables |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, a capacity-wait notice, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused (or, for a guard-4 hold under `ONDEMAND_OVERCOMMIT_FIT`, limited) and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
 | `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of the "contact support" suggestion in that Event and the pod-problem Events. Unset = the suggestion names no one |
 | `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**), or its node selector / required node affinity allows none of its class's nodes (`NoMatchingNode`) — plus a `Normal` `WaitingForNode` while the nodes it allows are all full (see **Pods that narrow their nodes**). Throttled with the denial Event, on its cadence; `false` disables |
