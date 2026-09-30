@@ -964,6 +964,17 @@ things keep the controller from undoing that choice:
   waiter should not wait for the next tick to be offered it.  A booking's pod
   ending starts nothing — the booking keeps its window.
 
+**What the order is measured by.**  The app's `scripts/ondemand_commitment_report.py`
+counts how often an on-demand ask within its allocation lost to use beyond one — the
+measure a ranking in the app would be judged against.  This side's part is guard 3's
+activation line: `interlock.activated` names the reservations the stalled pods run
+under (`rids`) and the GPUs pods past their runtime guarantee held on the class at
+that moment (`overstay_gpus`, `ControllerState.overstay_gpus` over the same pool
+boundary preemption and headroom reclaim from), so a lease that fit without
+borrowing and stalled behind overstayers can be counted off the app's ledger.  A pod
+that stalls while the interlock is already on is not listed; guard 3 blocks new
+grants for the class meanwhile, so that is rare.
+
 **What a withhold does** (`_handle_withheld`).  A withhold carrying a **gate
 code** is exactly the `409` the create would have returned, reached without
 spending a create, and is handled as one: the same backoff by `retryable` /

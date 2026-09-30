@@ -3681,20 +3681,30 @@ async def _run_queue_tick(
                         detail=_placement_text(p.placement),
                     ))
                     continue
-            stuck.append((p.namespace, p.name, p.gpu_class))
-        new_classes = {gpu_class for _, _, gpu_class in stuck}
+            stuck.append((p.namespace, p.name, p.gpu_class, p.reservation_id))
+        new_classes = {gpu_class for _, _, gpu_class, _ in stuck}
         old_classes = state.stuck_holder_gpu_classes
         state.stuck_holder_gpu_classes = new_classes
         state.stuck_holder_pods = {
-            gpu_class: [f"{ns}.{name}" for ns, name, gc in stuck if gc == gpu_class]
+            gpu_class: [f"{ns}.{name}" for ns, name, gc, _ in stuck if gc == gpu_class]
             for gpu_class in new_classes
         }
-        for gpu_class in new_classes - old_classes:
-            affected = [(ns, name) for ns, name, gc in stuck if gc == gpu_class]
+        activated = new_classes - old_classes
+        # What held the class when it stalled, for the on-demand commitment's
+        # measure: which reservations the stuck pods run under (so a report can
+        # tell a within-allocation lease from anything else, off the ledger), and
+        # the GPUs pods past their runtime guarantee held on nodes the inventory
+        # counts -- the pool boundary preemption and headroom reclaim from.  A
+        # synchronous read of the reservation state, like the rest of guard 3.
+        views = [_pod_view(p, inventory) for p in snapshot] if activated else []
+        for gpu_class in activated:
+            affected = [(ns, name, rid) for ns, name, gc, rid in stuck if gc == gpu_class]
             log.warning("%s", kv(
                 event="interlock.activated", clabel=gpu_class, guard=3,
                 count=len(affected),
-                pods=[f"{ns}.{name}" for ns, name in affected],
+                pods=[f"{ns}.{name}" for ns, name, _ in affected],
+                rids=sorted({rid for _, _, rid in affected if rid is not None}),
+                overstay_gpus=state.overstay_gpus(gpu_class, views, now),
             ))
         for gpu_class in old_classes - new_classes:
             log.info("%s", kv(event="interlock.cleared", clabel=gpu_class, guard=3))

@@ -68,6 +68,7 @@ from tests.conftest import (
     USERNAME,
     kv_fields,
     make_config,
+    reservation,
 )
 
 HOST = "kubernetes.io/hostname"
@@ -622,7 +623,7 @@ class TestNoLeaseIsRequested:
 # ---------------------------------------------------------------------------
 
 
-def _tick(monkeypatch, pods, nodes, *, inventory_fails=False):
+def _tick(monkeypatch, pods, nodes, *, inventory_fails=False, reservations=()):
     m = _main_module(monkeypatch)
     fake = _FakeCoreV1(nodes=nodes, pods=pods)
     if inventory_fails:
@@ -639,6 +640,8 @@ def _tick(monkeypatch, pods, nodes, *, inventory_fails=False):
     monkeypatch.setattr(m, "_apply_reservation_facts", _noop)
     state = ControllerState()
     state.gpu_class_ids = {GPU_CLASS_LABEL: GPU_CLASS_ID}
+    state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+    state.reservations = list(reservations)
     config = make_config(
         ondemand_lease_enabled=True, pod_adoption_enabled=False, ondemand_merge_enabled=False,
     )
@@ -698,6 +701,37 @@ class TestQueueTickGuard3:
         stuck = _pod("s", tolerated=True, node_selector={HOST: "gpu-99"})
         state = _tick(monkeypatch, [stuck], _NODES, inventory_fails=True)
         assert state.stuck_holder_gpu_classes == {GPU_CLASS_LABEL}
+
+    def test_the_activation_line_says_what_held_the_class(self, monkeypatch, caplog):
+        """The line names the reservations the stuck pods run under and the GPUs
+        pods past their guarantee held: the on-demand commitment's measure joins
+        the first to the ledger and reads the second.  A pod inside its guarantee
+        is not counted, and neither is one on a node the inventory leaves out."""
+        now = datetime.now(timezone.utc)
+        live = reservation(2, start_utc=now - timedelta(hours=1),
+                           end_utc=now + timedelta(hours=1), gpu_count=1)
+        overstayer = _running_on("h2", 2, "o")      # res-1 is not live: past guarantee
+        guaranteed = _running_on("h2", 1, "g")
+        guaranteed.metadata.annotations = {"galends/booking-reference": "res-2"}
+        stranded = _running_on("gone", 1, "x")      # a node the inventory does not count
+        stuck = _pod("s", tolerated=True)
+        stuck.metadata.annotations = {"galends/booking-reference": "res-7"}
+        with caplog.at_level(logging.WARNING, logger="app.main"):
+            _tick(monkeypatch, [overstayer, guaranteed, stranded, stuck], _NODES,
+                  reservations=[live])
+        lines = [kv_fields(r.getMessage()) for r in caplog.records
+                 if "interlock.activated" in r.getMessage()]
+        assert len(lines) == 1
+        assert lines[0]["pods"] == f"{USERNAME}.pod-s"
+        assert lines[0]["rids"] == "7"
+        assert lines[0]["overstay_gpus"] == "2"
+
+    def test_an_activation_with_nothing_past_guarantee_says_zero(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="app.main"):
+            _tick(monkeypatch, [_pod("s", tolerated=True)], _NODES)
+        lines = [kv_fields(r.getMessage()) for r in caplog.records
+                 if "interlock.activated" in r.getMessage()]
+        assert lines[0]["overstay_gpus"] == "0"
 
     def test_the_tick_records_what_the_preflight_reads(self, monkeypatch):
         state = _tick(monkeypatch, [_running_on("h2", 3, "r")], _NODES)

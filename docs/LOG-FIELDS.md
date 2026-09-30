@@ -240,6 +240,7 @@ follow this grammar and are not expected to.
 | `claimed` | int | GPUs already claimed earlier in the same admission batch, netted off `node_free` (emitted only when non-zero) |
 | `demand` | int | GPUs demanded at a boundary, per class |
 | `committed` | int | peak GPUs a class's reservations commit, placed or not, over a window (on-demand guard 4) |
+| `overstay_gpus` | int | GPUs of a class held by pods past their runtime guarantee — overstayers and best-effort pods — on nodes the inventory counts; what reclaim could free (guard 3's activation) |
 | `kills` | int | victims selected at a boundary |
 | `short` | int | GPUs still short after preempting every eligible overstayer |
 | `sweep` | `A` \| `B` | preemption sweep phase (`phase=` is the pod lifecycle phase) |
@@ -301,6 +302,7 @@ both sides, whereas everywhere else an absent value means "not known".
 | `active` / `cancelled` | int | reservations by status in a fetch result |
 | `watched` | int | reservations armed with a no-show deadline |
 | `pods` | comma list | pod identifiers a line is reporting about (`ns.name`) |
+| `rids` | comma list of int | reservation ids the pods a line reports on run under, where they have one |
 | `fails` | int | consecutive failure counter (failed logins, watch-stream reconnects) |
 
 ### Auth, SICAD and Kubernetes traces
@@ -353,6 +355,7 @@ both sides, whereas everywhere else an absent value means "not known".
 | `candidates` | int | size of a pool offered for selection (preemption victims, on-demand admission) |
 | `selected` / `granted` | int | how many of them were chosen |
 | `withheld` | int | how many offered on-demand candidates the admission selection did not grant |
+| `ahead_borrowed` | int | on an `outranked` withhold: GPUs the grants ahead of it in the batch fit only by borrowing, on the tier that refused it — a sum of peaks; `0` means everything ahead was within its allocation |
 | `reservations` | int | reservations in the occupancy map |
 | `fallback` | string | what was used instead when a delegated call was unavailable |
 | `target` | string | which snapshot failed (`pods`, `node_capacity`) |

@@ -2627,6 +2627,19 @@ class ControllerState:
             and self._past_guarantee(p, now)
         ]
 
+    def overstay_gpus(
+        self, gpu_class: str, pods: list[PodRuntimeView], now: datetime
+    ) -> int:
+        """GPUs of *gpu_class* held by pods past their runtime guarantee.
+
+        Overstayers and best-effort pods alike, counted over ``_headroom_pool`` --
+        the pods boundary preemption and headroom may reclaim from -- so the
+        figure is exactly what reclaim could free.  Logged when guard 3 engages,
+        so a stalled class says how much of it was held with no reservation
+        behind it.
+        """
+        return sum(p.gpu_count for p in self._headroom_pool(gpu_class, pods, now))
+
     def headroom_shortfall_by_class(
         self,
         capacity_by_class: dict[str, int],

@@ -228,10 +228,13 @@ Allocation of the cluster to "courses" (as well as projects, labs, etc.) is done
   GPU classes explicitly linked to it, or any class flagged `attach_all_groups`.
   This controls *which hardware tiers* a course sees.
 - **Per-group GPU ceiling** (`usage_group_gpu_limits`) — `max_gpus` cap per
-  (group, class) over an optional date span. `max_gpus=0` disables a class for
-  that group. Same narrowest-span-wins overlap resolution → supports a temporary
-  "deadline-week boost" overriding a semester-long baseline cap. This is the
-  **course's share** of the cluster.
+  (group, class) over an optional date span. `max_gpus=0` gives the group no
+  allocation of its own on the class — not a block: where borrowing applies it
+  can still take idle headroom, like any group past its ceiling (§9). Detaching
+  the class keeps a group off it, or, for an `attach_all_groups` class, a 0 with
+  borrowing off for the group. Same narrowest-span-wins overlap resolution →
+  supports a temporary "deadline-week boost" overriding a semester-long baseline
+  cap. This is the **course's share** of the cluster.
   - Effective hourly availability for a member =
     `min(cluster_capacity − peak_reserved, group_ceiling − group_peak_reserved)`.
     "Peak" = maximum concurrent GPUs across any one-hour bucket in the requested
@@ -399,6 +402,21 @@ window — while timing policy (15-minute lead, whole-hour grid, 48-hour cap,
 `min/max_days_ahead`) does not apply. Denials return 409; requests are
 idempotent on an `idempotency_key`.
 
+**When on-demand asks contend.** A create is judged alone, against the calendar
+as it stands. When the controller delegates admission, it first offers its whole
+batch of pending pods to `POST /api/reservations/ondemand-admission`, which judges
+each candidate by the create's own gates, in order, against the calendar plus the
+leases granted ahead of it in the same batch, and answers with the grants in the
+order to make them. That order is currently the offered one — **oldest pod
+first** — so contention between on-demand asks is still settled first-come,
+first-served, by pod age. It is work-conserving rather than strict: an ask that
+does not fit is passed over, so a two-GPU ask can wait while one-GPU asks behind
+it are granted. A candidate that would fit on its own but lost its capacity to
+grants ahead of it is withheld as `outranked` and offered again in every batch,
+whatever its retry cooldown, until it is admitted or its pod goes away. Without
+delegation the controller makes the creates itself in the same order, and a
+refused candidate waits out its cooldown before it is asked about again.
+
 Two per-group flags qualify that symmetry, both default off and both
 administrator-only. `usage_groups.on_demand_only` makes the group
 **one-directional**: it accepts leases on this path and refuses web bookings
@@ -437,13 +455,22 @@ Consequences for the scheduling model:
 
 ## 8. What is NOT modeled (gaps for OR guidance)
 
-- **No priorities, weights, or preemption** between users or groups.
+- **No priorities, weights, or preemption** between users or groups. The two
+  orderings that do exist look at neither: contending on-demand asks are taken
+  by pod age (§7.1), and when the controller reclaims GPUs from pods past their
+  runtime guarantee it takes best-effort pods first, then leases, then bookings,
+  at random within each.
 - **No fairness mechanism** (no proportional sharing, max-min fairness, lottery,
-  or aging) — purely FCFS within static per-group ceilings.
+  or aging) — purely FCFS within static per-group ceilings: web bookings in the
+  order they are submitted, contending on-demand asks by pod age. The on-demand
+  admission selection is where a ranking would apply (§10).
 - **No dynamic pricing or quota adjustment** — SU rates and discount schedules
   are static admin-set values; group GPU ceilings are static (date-span overrides
   aside).
-- **No waitlist / queue** — no demand signal is captured when potential bookings are turned away
+- **No waitlist for bookings** — a refused booking is not queued; the denial is
+  logged with its gate's code, which is the only demand signal it leaves. On-demand
+  pods are the exception: the controller keeps a pending pod as a candidate and
+  asks again until it is admitted or deleted.
 - **No per-user-per-day GPU cap** (`max_gpus_per_user_per_day` is a documented
   deferred feature in CLAUDE.md).
 - Concurrency limits are on **peak instantaneous GPU count** and **SU budget**
@@ -522,7 +549,16 @@ something a class acquires by default.
    load, or whether deadline-driven demand is inelastic to pricing signals.
 4. Whether the first-come-first-served model with per-group ceilings achieves
    adequate fairness, or whether a max-min fair share or lottery mechanism would
-   better serve a multi-course lab environment.
+   better serve a multi-course lab environment. For contending on-demand asks one
+   answer is proposed and not built: rank the admission selection's candidates by
+   how much of its allocation each group and cohort holds, so that an ask from a
+   scope still within every ceiling the gate enforces comes ahead of one from a
+   scope beyond its own — lower shares first, pod age breaking ties — measured over
+   a window common to the batch. The window is already a setting
+   (`site_settings.ondemand_ranking_window_minutes`, default 30) that nothing reads
+   yet. It would promise precedence, not availability: it orders who is granted
+   among asks that wait together, and cannot reach capacity already held by
+   borrowed reservations or by pods running past their guarantee.
 5. Whether `su_anchor_mode = since_creation`, `weekly`, or `quarterly` gives better incentive
    alignment near assignment deadlines compared to the renewable-ceiling (`open`)
    default, and how the cancellation-penalty knobs (window / divisor / cap, see
