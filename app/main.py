@@ -2038,18 +2038,25 @@ def _ondemand_ineligibility(
     usage_group: Optional[str],
     problems: list[AnnotationProblem],
     has_usage_group_annotation: bool,
+    gpu_count: int,
 ) -> list[str]:
     """Why a Pending pod does not qualify for on-demand admission, one clause each.
 
     Mirrors the ``jit_eligible`` test in ``pod_watch_loop``: on-demand admission
-    switched off, no usable minimum runtime (unless best-effort stands in for
-    one), no usage group.  An ignored annotation is named in place of the
-    "has none" clause it explains, so the owner reads what to correct rather
-    than only what is missing.  Empty when the pod qualifies.
+    switched off, no GPUs requested, no usable minimum runtime (unless
+    best-effort stands in for one), no usage group.  An ignored annotation is
+    named in place of the "has none" clause it explains, so the owner reads
+    what to correct rather than only what is missing.  Empty when the pod
+    qualifies.
     """
     if not config.ondemand_lease_enabled:
         return ["on-demand admission is not enabled on this cluster"]
     reasons: list[str] = []
+    if gpu_count < 1:
+        reasons.append(
+            "it requests no GPUs (no container sets an nvidia.com/gpu resource "
+            "limit or request)"
+        )
     if min_runtime is None and not best_effort:
         runtime_problems = [p for p in problems if p.annotation == MIN_RUNTIME_ANNOTATION]
         reasons.extend(_annotation_problem_clause(p) for p in runtime_problems)
@@ -3294,9 +3301,14 @@ async def pod_watch_loop(
                     # A best-effort pod needs no minimum runtime -- it sizes
                     # nothing -- but still needs a usage group, because
                     # group_name is a required natural key on the app's create.
+                    # And it must ask for at least one GPU: the app's create
+                    # requires gpu_count > 0, so a lease for a pod requesting
+                    # none is a 422 retried on backoff forever, and there is
+                    # nothing for one to hold anyway.
                     jit_eligible = (
                         config.ondemand_lease_enabled
                         and phase == "Pending"
+                        and gpu_count >= 1
                         and (min_rt is not None or best_effort)
                         and usage_group is not None
                     )
@@ -3413,6 +3425,7 @@ async def pod_watch_loop(
                                     has_usage_group_annotation=(
                                         own_group_annotation is not None
                                     ),
+                                    gpu_count=gpu_count,
                                 )
                                 if config.ondemand_lease_enabled else ()
                             )
@@ -3450,6 +3463,7 @@ async def pod_watch_loop(
                                         has_usage_group_annotation=(
                                             own_group_annotation is not None
                                         ),
+                                        gpu_count=gpu_count,
                                     ),
                                     now,
                                 )

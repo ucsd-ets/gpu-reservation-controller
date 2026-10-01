@@ -220,7 +220,12 @@ def _best_effort_pod(*, uid="uid-1", min_runtime=None, conditions=None):
             creation_timestamp=datetime.now(timezone.utc),
         ),
         status=SimpleNamespace(phase="Pending", conditions=conditions),
-        spec=SimpleNamespace(tolerations=[], containers=[], scheduling_gates=None),
+        spec=SimpleNamespace(
+            tolerations=[],
+            containers=[SimpleNamespace(resources=SimpleNamespace(
+                requests={"nvidia.com/gpu": "1"}))],
+            scheduling_gates=None,
+        ),
     )
 
 

@@ -794,7 +794,9 @@ without the toleration,
    queued for it (`enqueue_pod`), with the same fast-path immediate-apply
    when the window is already open.
 2. Otherwise, if the pod is **JIT-eligible** — `ONDEMAND_LEASE_ENABLED`,
-   `Pending`, carries `galends/minimum-runtime-seconds`, and names its usage
+   `Pending`, requests at least one `nvidia.com/gpu` (the app refuses a
+   `gpu_count` of 0 with a 422 on every create shape, so such a pod was
+   retried on backoff forever), carries `galends/minimum-runtime-seconds`, and names its usage
    group (the group label when `REQUIRED_GROUP_LABEL` is set, else the
    `galends/usage-group` annotation — the lease request's `group_name` is a
    **required** natural key app-side) — it becomes an

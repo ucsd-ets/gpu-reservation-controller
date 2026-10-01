@@ -668,7 +668,7 @@ class _FakeWatcher:
 
 
 def _pod(uid="uid-1", *, gpu_class=GPU_CLASS_LABEL, labels=None, annotations=None,
-         phase="Pending", tolerations=None):
+         phase="Pending", tolerations=None, gpus="1"):
     return SimpleNamespace(
         metadata=SimpleNamespace(
             uid=uid, name=f"pod-{uid}", namespace=USERNAME,
@@ -681,7 +681,9 @@ def _pod(uid="uid-1", *, gpu_class=GPU_CLASS_LABEL, labels=None, annotations=Non
         spec=SimpleNamespace(
             tolerations=tolerations or [],
             containers=[SimpleNamespace(
-                resources=SimpleNamespace(requests={"nvidia.com/gpu": "1"})
+                resources=SimpleNamespace(
+                    requests={"nvidia.com/gpu": gpus} if gpus is not None else {}
+                )
             )],
             scheduling_gates=None,
         ),
@@ -791,6 +793,46 @@ class TestNoReservation:
         message = rec.calls[0]["message"]
         assert f"its {MIN_RUNTIME} annotation is '4h'" in message
         assert f"has no {MIN_RUNTIME}" not in message
+
+    def test_a_pod_requesting_no_gpus_is_not_sent_for_a_lease(self, monkeypatch):
+        """The reported case: a gpu-class pod with no nvidia.com/gpu request.
+
+        It used to become a candidate and ask the app for a 0-GPU lease, which
+        every create schema refuses with a 422 -- retried on backoff forever,
+        with a log line blaming a best_effort field it never sent.
+        """
+        m = _main_module(monkeypatch)
+        pod = _pod(annotations={USAGE_GROUP: GROUP_NAME, MIN_RUNTIME: "3600"}, gpus=None)
+        rec, state, batches = _watch(monkeypatch, m, _config(), [("ADDED", pod)])
+        assert state.ondemand_candidates == {}
+        assert batches == []
+        [call] = rec.calls
+        assert call["reason"] == NO_RESERVATION_REASON
+        message = call["message"]
+        assert "cannot be admitted on demand: it requests no GPUs" in message
+        # Its runtime and group are fine, so they are not blamed.
+        assert MIN_RUNTIME not in message
+        assert USAGE_GROUP not in message
+
+    @pytest.mark.parametrize("gpus", ["0", None])
+    def test_a_best_effort_pod_requesting_no_gpus_is_not_sent_either(
+        self, monkeypatch, gpus,
+    ):
+        m = _main_module(monkeypatch)
+        pod = _pod(annotations={USAGE_GROUP: GROUP_NAME, RUNTIME_GUARANTEE: "none"},
+                   gpus=gpus)
+        _rec, state, batches = _watch(
+            monkeypatch, m, _config(best_effort_enabled=True), [("ADDED", pod)]
+        )
+        assert state.ondemand_candidates == {}
+        assert batches == []
+
+    def test_a_pod_requesting_a_gpu_still_goes_on_demand(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        pod = _pod(annotations={USAGE_GROUP: GROUP_NAME, MIN_RUNTIME: "3600"})
+        _rec, state, batches = _watch(monkeypatch, m, _config(), [("ADDED", pod)])
+        assert state.ondemand_candidates["uid-1"].gpu_requested == 1
+        assert batches == [0]
 
     def test_best_effort_asked_for_but_off_is_named(self, monkeypatch):
         m = _main_module(monkeypatch)

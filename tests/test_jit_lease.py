@@ -1518,7 +1518,12 @@ def _pending_jit_pod(*, uid="uid-1", conditions=None):
             labels={"gpu-class": GPU_CLASS_LABEL},
         ),
         status=SimpleNamespace(phase="Pending", conditions=conditions),
-        spec=SimpleNamespace(tolerations=[], containers=[], scheduling_gates=None),
+        spec=SimpleNamespace(
+            tolerations=[],
+            containers=[SimpleNamespace(resources=SimpleNamespace(
+                requests={"nvidia.com/gpu": "1"}))],
+            scheduling_gates=None,
+        ),
     )
 
 
