@@ -332,7 +332,9 @@ the controller's log, wherever ignoring it changes what happens to the pod — s
 
 **Wait or lease.** These annotations decide whether a pod *can* be admitted on
 demand; whether it *is* depends first on its owner's bookings. The controller
-routes a pod by taking the first of these that applies:
+routes a pod by taking the first of these that applies — unless the pod requests
+no `nvidia.com/gpu` at all, in which case it is ignored by every path and told
+so (`NoGpuRequest`, §5.3):
 
 1. A booking of the owner's for the pod's GPU class (and usage group, where the
    cluster matches by group) that is open now, or opens within
@@ -726,7 +728,8 @@ right, reported to support.
 |---|---|
 | `OnDemandLeaseRejected` | The reservation service did not recognise something the pod's on-demand request named: its **usage group** (the usual cause — a mistyped group label or `galends/usage-group` annotation), its user (the pod's namespace) or its GPU class. The Event quotes the service's reason, the user and group that were sent, and where the group came from — the pod's label, its annotation, or the cluster's default when the pod named none. If you hold a booking of this class under a *different* usage group, it says so. |
 | `UnknownGpuClass` | The pod's `gpu-class` label is not a GPU class the reservation service knows, so no reservation can match it and it cannot be admitted on demand. The Event lists the classes that do exist. |
-| `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod requests no GPUs (no container sets an `nvidia.com/gpu` limit or request); or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
+| `NoGpuRequest` | The pod has a `gpu-class` label but no container requests an `nvidia.com/gpu`, so the controller ignores it: it is not admitted under a reservation or on demand. Set `resources.limits` `nvidia.com/gpu` on the container that needs the GPU and recreate the pod — or drop the `gpu-class` label if it needs none. |
+| `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
 | `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, or the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis.  A pod that waits for its reservation instead of being admitted now because of one is told in its §5.4 Event instead. |
 | `NoMatchingNode` | The pod's `nodeSelector`, or the required part of its node affinity, rules out every schedulable node of its GPU class — a mistyped host name, a hardware label the class does not have, or a node that is cordoned or down — so it could not start there and no on-demand lease is requested for it. The Event quotes the constraint, and names any other GPU class whose nodes it *does* match, since asking for one class's hardware under another's `gpu-class` label is a common cause. The controller keeps checking on its queue interval (5 minutes by default), so a pod waiting on a cordoned or down node goes ahead once the node is back. |
 

@@ -81,6 +81,7 @@ from .k8s_client import (
     LEASE_REJECTED_REASON,
     MIN_RUNTIME_ANNOTATION,
     NO_MATCHING_NODE_REASON,
+    NO_GPU_REQUEST_REASON,
     NO_RESERVATION_REASON,
     RESERVATION_FULL_REASON,
     RESERVATION_TOO_SMALL_REASON,
@@ -1834,6 +1835,53 @@ async def _emit_unknown_class_event(
     )
 
 
+def _no_gpu_request_message(gpu_class: str, config: Config) -> str:
+    """What the owner of a gpu-class pod that requests no GPUs reads.
+
+    Constant per class, so the shared throttle restates it only on its repeat.
+    """
+    return (
+        f"This pod has the gpu-class label {_plain(gpu_class)} but requests no "
+        f"GPUs: no container sets an nvidia.com/gpu resource limit or request. "
+        f"The GPU reservation controller ignores it -- it will not be admitted "
+        f"under a reservation or on demand. Set resources.limits nvidia.com/gpu "
+        f"on the container that needs the GPU and recreate the pod, or remove the "
+        f"gpu-class label if it needs none; if this is wrong, "
+        f"{_support_phrase(config)}"
+    )
+
+
+async def _emit_no_gpu_request_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    pod_name: str,
+    namespace: str,
+    gpu_class: str,
+    now: datetime,
+) -> None:
+    """Tell the pod's owner a gpu-class pod requesting no GPUs is ignored.
+
+    Such a pod has nothing for a reservation to hold: the app refuses a
+    ``gpu_count`` of 0 on every create shape (422), and admitting it under a
+    booking would only put a CPU-only pod on a GPU node.  So no path takes it,
+    and this Event is the whole of the controller's response -- told on first
+    sight and each watch resync, on the shared pending-status throttle, like
+    the other problems with the pod itself.
+    """
+    if not config.pod_problem_event_enabled:
+        return
+    message = _no_gpu_request_message(gpu_class, config)
+    await _post_pending_status(
+        config, state, uid, pod_name, namespace,
+        (NO_GPU_REQUEST_REASON, message), now,
+        lambda: emit_pending_pod_event(
+            uid, pod_name, namespace, message,
+            reason=NO_GPU_REQUEST_REASON, gpu_class=gpu_class, gpu_count=0,
+        ),
+    )
+
+
 def _placement_nodes(
     placement: Optional[NodePlacement],
     class_nodes: Optional[Iterable[str]],
@@ -2038,25 +2086,18 @@ def _ondemand_ineligibility(
     usage_group: Optional[str],
     problems: list[AnnotationProblem],
     has_usage_group_annotation: bool,
-    gpu_count: int,
 ) -> list[str]:
     """Why a Pending pod does not qualify for on-demand admission, one clause each.
 
     Mirrors the ``jit_eligible`` test in ``pod_watch_loop``: on-demand admission
-    switched off, no GPUs requested, no usable minimum runtime (unless
-    best-effort stands in for one), no usage group.  An ignored annotation is
-    named in place of the "has none" clause it explains, so the owner reads
-    what to correct rather than only what is missing.  Empty when the pod
-    qualifies.
+    switched off, no usable minimum runtime (unless best-effort stands in for
+    one), no usage group.  An ignored annotation is named in place of the
+    "has none" clause it explains, so the owner reads what to correct rather
+    than only what is missing.  Empty when the pod qualifies.
     """
     if not config.ondemand_lease_enabled:
         return ["on-demand admission is not enabled on this cluster"]
     reasons: list[str] = []
-    if gpu_count < 1:
-        reasons.append(
-            "it requests no GPUs (no container sets an nvidia.com/gpu resource "
-            "limit or request)"
-        )
     if min_runtime is None and not best_effort:
         runtime_problems = [p for p in problems if p.annotation == MIN_RUNTIME_ANNOTATION]
         reasons.extend(_annotation_problem_clause(p) for p in runtime_problems)
@@ -3215,6 +3256,27 @@ async def pod_watch_loop(
 
                     gpu_count = get_pod_gpu_count(pod)
                     now = datetime.now(timezone.utc)
+                    if gpu_count < 1:
+                        # A gpu-class pod asking for no GPUs is ignored: there is
+                        # nothing for a reservation to hold, the app refuses a
+                        # 0-GPU lease (a 422 that used to be retried forever),
+                        # and a toleration would only put a CPU-only pod on a
+                        # GPU node.  Its owner is told why, on first sight and
+                        # each resync -- pod resources are immutable, so a
+                        # MODIFIED cannot change the verdict.
+                        state.remove_ondemand_candidate(uid)
+                        state.dequeue_pod(uid)
+                        if event_type == "ADDED":
+                            log.debug("%s", kv(
+                                event="pod.left_pending", ns=namespace, pod=name,
+                                reason="no_gpu_request",
+                            ))
+                            if phase == "Pending":
+                                await _emit_no_gpu_request_event(
+                                    config, state, uid, name, namespace,
+                                    gpu_class_label, now,
+                                )
+                        continue
                     admittable = state.find_admittable_reservation(
                         namespace, gpu_class_label, gpu_count, now, horizon, group_label
                     )
@@ -3301,14 +3363,9 @@ async def pod_watch_loop(
                     # A best-effort pod needs no minimum runtime -- it sizes
                     # nothing -- but still needs a usage group, because
                     # group_name is a required natural key on the app's create.
-                    # And it must ask for at least one GPU: the app's create
-                    # requires gpu_count > 0, so a lease for a pod requesting
-                    # none is a 422 retried on backoff forever, and there is
-                    # nothing for one to hold anyway.
                     jit_eligible = (
                         config.ondemand_lease_enabled
                         and phase == "Pending"
-                        and gpu_count >= 1
                         and (min_rt is not None or best_effort)
                         and usage_group is not None
                     )
@@ -3425,7 +3482,6 @@ async def pod_watch_loop(
                                     has_usage_group_annotation=(
                                         own_group_annotation is not None
                                     ),
-                                    gpu_count=gpu_count,
                                 )
                                 if config.ondemand_lease_enabled else ()
                             )
@@ -3463,7 +3519,6 @@ async def pod_watch_loop(
                                         has_usage_group_annotation=(
                                             own_group_annotation is not None
                                         ),
-                                        gpu_count=gpu_count,
                                     ),
                                     now,
                                 )

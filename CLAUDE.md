@@ -793,10 +793,11 @@ without the toleration,
    has spare budget (`available(r) >= gpu_requested`).  If found, the pod is
    queued for it (`enqueue_pod`), with the same fast-path immediate-apply
    when the window is already open.
+   (A pod requesting **no** `nvidia.com/gpu` never reaches this step: it is
+   ignored by every path and its owner told with a `NoGpuRequest` Event — see
+   **Telling the pod's owner the pod itself is the problem**.)
 2. Otherwise, if the pod is **JIT-eligible** — `ONDEMAND_LEASE_ENABLED`,
-   `Pending`, requests at least one `nvidia.com/gpu` (the app refuses a
-   `gpu_count` of 0 with a 422 on every create shape, so such a pod was
-   retried on backoff forever), carries `galends/minimum-runtime-seconds`, and names its usage
+   `Pending`, carries `galends/minimum-runtime-seconds`, and names its usage
    group (the group label when `REQUIRED_GROUP_LABEL` is set, else the
    `galends/usage-group` annotation — the lease request's `group_name` is a
    **required** natural key app-side) — it becomes an
@@ -1540,6 +1541,7 @@ pod itself, which only its owner can change:
 | `OnDemandLeaseRejected` | The app answered the lease ask **404**: it does not recognise the user, usage group or GPU class the ask named — all of which came off the pod | `lease.error` WARNING, filed with the operator faults |
 | `UnknownGpuClass` | The pod's `gpu-class` label names no class the app knows | `ondemand.candidate_held reason=class_id_unknown` WARNING, every 2–5 min |
 | `NoReservation` | No reservation matches the pod and it does not qualify for on-demand admission, so no path will ever pick it up | `pod.left_pending` at **DEBUG** |
+| `NoGpuRequest` | The pod has a `gpu-class` label but requests no `nvidia.com/gpu`, so the controller ignores it — no reserved path, no lease | A JIT candidate asking the app for a 0-GPU lease: a 422 on every create shape, retried on backoff forever |
 | `AnnotationIgnored` | A `galends/*` job-input annotation was invalid, or asks for something the deployment does not offer, and ignoring it changed what happens | `pod.annotation_invalid` WARNING, or nothing (`galends/runtime-guarantee` while `BEST_EFFORT_ENABLED` is off) |
 
 Each message says what is wrong, what the controller did instead, and what to
@@ -1572,6 +1574,12 @@ the next section.
   `ControllerState.near_miss_bookings` adds what "no reservation matches" hides:
   a live booking this user holds for the same class under another usage group
   (only while `REQUIRED_GROUP_LABEL` is on), or one of another class.
+- **`NoGpuRequest`** (`main._emit_no_gpu_request_event`) is decided before
+  routing, so such a pod is neither queued for a booking (a toleration would
+  only put a CPU-only pod on a GPU node) nor made a candidate.  Told on ADDED —
+  first sight and each resync — like `NoReservation`; pod resources are
+  immutable, so no MODIFIED can change the verdict.  Needs no app state, so it
+  is not gated on `reservations_known` / `gpu_classes_known`.
 - **`AnnotationIgnored`** (`main._emit_annotation_notice`) is for an on-demand
   candidate that went ahead: running on `DEFAULT_MINIMUM_RUNTIME_SECONDS`
   because its own runtime was junk, or charged a guaranteed lease because it
@@ -1614,7 +1622,7 @@ Four properties are load-bearing:
   caught.
 
 **RBAC / config**: none new.  `POD_PROBLEM_EVENT_ENABLED=false`
-disables `UnknownGpuClass`, `NoReservation` and `AnnotationIgnored` (and the
+disables `UnknownGpuClass`, `NoReservation`, `NoGpuRequest` and `AnnotationIgnored` (and the
 two placement Events of **Pods that narrow their nodes**);
 `OnDemandLeaseRejected` rides `ONDEMAND_DENIAL_EVENT_ENABLED`.  User-facing
 documentation is `docs/POD-ANNOTATIONS.md` §5.3.
@@ -2239,7 +2247,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, a capacity-wait notice, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused (or, for a guard-4 hold under `ONDEMAND_OVERCOMMIT_FIT`, limited) and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
 | `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of the "contact support" suggestion in that Event and the pod-problem Events. Unset = the suggestion names no one |
-| `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**), or its node selector / required node affinity allows none of its class's nodes (`NoMatchingNode`) — plus a `Normal` `WaitingForNode` while the nodes it allows are all full (see **Pods that narrow their nodes**). Throttled with the denial Event, on its cadence; `false` disables |
+| `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), it requests no `nvidia.com/gpu` and is ignored (`NoGpuRequest`), one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**), or its node selector / required node affinity allows none of its class's nodes (`NoMatchingNode`) — plus a `Normal` `WaitingForNode` while the nodes it allows are all full (see **Pods that narrow their nodes**). Throttled with the denial Event, on its cadence; `false` disables |
 | `RESERVATION_WAIT_EVENT_ENABLED` | `true` | Put an Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`WaitingForReservation`, `Normal`), the owner's other pods hold its GPUs (`ReservationFull`, naming them) or it holds fewer GPUs than the pod requests (`ReservationTooSmall`) (see **Telling the pod's owner what its reservation is waiting on**). Throttled with the denial Event, on its cadence; `false` disables |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period before a booking whose window is already open is declared a no-show: one mid-window when the controller starts, or one vacated mid-window when its last holder pod ends (re-armed by `update_noshow_tracking` on the next refresh — see **In-memory state only**) |
