@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Collection, Iterable, Literal, NamedTuple, Optional
 
 from .log_fields import kv
-from .schemas import ReservationResponse
+from .schemas import GroupDetail, ReservationResponse
 
 log = logging.getLogger(__name__)
 
@@ -436,6 +436,63 @@ class NearMiss(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
+# Default usage groups (DEFAULT_USAGE_GROUP)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DefaultGroupRoster:
+    """One ``DEFAULT_USAGE_GROUP`` entry, as the app last described it.
+
+    Just what the per-user fallback asks of a group: is it live, does it enrol
+    anyone who asks (``on_demand_auto_join``), and who belongs to it.  Built
+    from ``GET /api/groups`` by :func:`build_default_group_rosters`.
+    """
+
+    name: str
+    group_id: int
+    is_active: bool
+    auto_join: bool
+    members: frozenset[str]
+
+    def admits(self, username: str) -> bool:
+        """Whether *username* may fall back to this group.
+
+        Membership, or eligibility for it: a live group the user belongs to in
+        any role -- the test the app's own lease path applies -- or one whose
+        ``on_demand_auto_join`` would enrol them on their first lease, which is
+        therefore open to everyone.  Deliberately nothing more: no validity
+        window, budget or class access, which are the app's to judge on the
+        reservation itself.  An inactive group admits no one; the app answers
+        every lease naming one with a 404.
+        """
+        return self.is_active and (self.auto_join or username in self.members)
+
+
+def build_default_group_rosters(
+    names: Collection[str], groups: Iterable[GroupDetail]
+) -> dict[str, DefaultGroupRoster]:
+    """Rosters for the *groups* named in *names*, keyed by group name.
+
+    A listed name the app has no group for is simply absent, and the resolver
+    skips it.  An inactive group is kept (and admits no one), so the refresh
+    can tell an operator which of the two is wrong with their list.  Pure.
+    """
+    wanted = set(names)
+    return {
+        group.name: DefaultGroupRoster(
+            name=group.name,
+            group_id=group.id,
+            is_active=group.is_active,
+            auto_join=group.on_demand_auto_join,
+            members=frozenset(member.username for member in group.members),
+        )
+        for group in groups
+        if group.name in wanted
+    }
+
+
+# ---------------------------------------------------------------------------
 # Task queue entry
 # ---------------------------------------------------------------------------
 
@@ -490,10 +547,12 @@ class OnDemandCandidate:
     # Optional to keep dataclass field ordering.
     usage_group: Optional[str] = None
     # Where usage_group came from -- "label" (the REQUIRED_GROUP_LABEL pod
-    # label), "annotation" (galends/usage-group) or "default"
-    # (DEFAULT_USAGE_GROUP) -- so a pod whose group the app does not recognise
-    # can be told what to fix: its own label or annotation, or nothing it
-    # controls at all.  None when the candidate was not built by routing.
+    # label), "annotation" (galends/usage-group) or "default" (the first
+    # DEFAULT_USAGE_GROUP entry its owner may use) -- so a pod whose group the
+    # app does not recognise can be told what to fix: its own label or
+    # annotation, or nothing it controls at all.  A "default" group is resolved
+    # again at every preflight, since the rosters behind it refresh while the
+    # pod waits.  None when the candidate was not built by routing.
     usage_group_source: Optional[str] = None
     # Set True only while the candidate is parked on an indeterminate guard-1
     # result (the scheduler has not yet recorded a PodScheduled verdict).  A
@@ -931,6 +990,22 @@ class ControllerState:
         # When set, the reserved-path matchers additionally require a pod's group
         # label value to equal the reservation's group.name (see _group_ok).
         self.required_group_label: Optional[str] = None
+
+        # The usage groups a pod that names none falls back to (DEFAULT_USAGE_GROUP),
+        # in priority order.  Set once from config at startup; empty = no fallback.
+        # Which of them a given pod gets depends on its owner -- see
+        # default_usage_group_for.
+        self.default_usage_groups: tuple[str, ...] = ()
+        # Those groups' rosters from the last successful GET /api/groups, by name
+        # (a listed name the app has no group for is absent).  None until the
+        # first fetch lands, so "not loaded" stays distinguishable from "no
+        # group admits this user" (default_groups_known).  Replaced wholesale on
+        # each refresh and kept, stale, when one fails: a refresh that cannot
+        # reach the app must not un-group every pod that relied on it.
+        self.default_group_rosters: Optional[dict[str, DefaultGroupRoster]] = None
+        # When default_group_rosters was fetched; the refresh is due once it is
+        # DEFAULT_USAGE_GROUP_REFRESH_INTERVAL old (main._refresh_default_group_rosters).
+        self.default_group_rosters_at: Optional[datetime] = None
 
         # Active work queue keyed by pod UID (reserved path).
         self.task_queue: dict[str, QueueEntry] = {}
@@ -2088,6 +2163,45 @@ class ControllerState:
         if self.required_group_label is None:
             return True
         return r.group is not None and r.group.name == group_label
+
+    @property
+    def default_groups_known(self) -> bool:
+        """Whether ``default_usage_group_for`` can be believed when it says None.
+
+        True when no fallback is configured (None is then simply the answer), or
+        once the rosters have loaded.  False only in the window before the first
+        successful ``GET /api/groups`` -- an app unreachable since startup --
+        when None means "not checked", and telling a pod's owner that none of
+        the default groups is open to them would blame them for the
+        controller's gap.
+        """
+        return not self.default_usage_groups or self.default_group_rosters is not None
+
+    def default_usage_group_for(self, username: str) -> Optional[str]:
+        """The usage group a pod of *username*'s that names none falls back to.
+
+        The first ``DEFAULT_USAGE_GROUP`` entry, in configured order, that
+        admits the user: a live group they belong to, or one with
+        ``on_demand_auto_join``, which the app would enrol them in (see
+        :meth:`DefaultGroupRoster.admits`).  A listed name the app has no group
+        for is skipped.  The answer is the pod's group everywhere a group is
+        read -- its lease ask, and with ``REQUIRED_GROUP_LABEL`` on its
+        reserved-path matching too, exactly as if the pod carried it.
+
+        ``None`` when nothing is configured, no entry admits the user, or the
+        rosters have not loaded yet (``default_groups_known``).  Pure and
+        cheap -- set lookups over a short list -- so it is safe to call for
+        every pod event and every pod in a snapshot.  A namespace is a
+        username, so this is called with the pod's namespace.
+        """
+        rosters = self.default_group_rosters
+        if not self.default_usage_groups or rosters is None:
+            return None
+        for name in self.default_usage_groups:
+            roster = rosters.get(name)
+            if roster is not None and roster.admits(username):
+                return name
+        return None
 
     def record_placement(
         self, reservation_id: int, pod_uid: str, gpu_count: int

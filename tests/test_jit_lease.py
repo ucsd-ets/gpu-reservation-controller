@@ -1501,7 +1501,7 @@ def _watch_config():
         scheduling_gate_name=None,
         best_effort_enabled=False,
         default_min_runtime_seconds=0,
-        default_usage_group=None,
+        default_usage_groups=(),
     )
 
 

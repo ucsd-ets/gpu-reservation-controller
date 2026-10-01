@@ -127,6 +127,10 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | ERROR | `fetch.failed` | `err` | Whole cycle failed; previous state retained. |
 | WARNING | `api.gpu_class_fetch_failed` / `api.gpu_class_parse_failed` | `cid` + `status` \| `err` | Per-class fallback. |
 | WARNING | `api.gpu_classes_fetch_failed` / `api.gpu_classes_parse_failed` | `status` \| `err` | Bulk list; the previous cycle's maps are kept rather than losing all resolution. |
+| INFO | `default_group.loaded` | `id name count reason` | One line per `DEFAULT_USAGE_GROUP` entry the app has an active group for, each time the rosters refresh (startup, then every `DEFAULT_USAGE_GROUP_REFRESH_INTERVAL`). `count` is its members; `reason=members` admits only them, `reason=auto_join` admits **everyone** (the group sets `on_demand_auto_join`), so nothing listed after it is ever reached. Read top to bottom, the lines are the fallback order a pod with no group of its own walks. |
+| WARNING | `default_group.unusable` | `name reason` (+ `id`) | A listed group the fallback skips, on every refresh until fixed: `reason=not_found` (no group of that name — a typo, or a rename in the app) or `inactive` (the group is deactivated). Pods it would have covered fall through to the next entry, or to no group at all. |
+| WARNING | `api.groups_fetch_failed` / `api.groups_parse_failed` | `status` \| `err` | The rosters could not be refreshed; the previous ones stand (none before the first success — pods relying on the fallback then have no group) and the fetch is retried on the next reservation fetch cycle. |
+| ERROR | `default_group.refresh_failed` | `err` | Unexpected error building the rosters (a bug, not the API); the previous ones stand. |
 
 ---
 
@@ -171,7 +175,8 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 |---|---|---|---|
 | INFO | `ondemand.candidate_added` | `ns pod poduid clabel gpus group` (+ `min_runtime_s` \| `best_effort`) | `min_runtime_s` is absent for a **best-effort** candidate, which sizes nothing; `best_effort` is emitted only when true. |
 | DEBUG | `ondemand.candidate_removed` | `ns pod poduid` | |
-| INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for something no lease can fix (`detail` carries the scheduler's verdict). |
+| INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for something no lease can fix (`detail` carries the scheduler's verdict). `reason=no_default_group`: the candidate's group came from `DEFAULT_USAGE_GROUP`, and after a roster refresh no listed group admits its owner any more — the next watch resync routes the pod as one with no group, and tells its owner. |
+| INFO | `ondemand.group_changed` | `ns pod chg old.group new.group` | A candidate whose group came from `DEFAULT_USAGE_GROUP` resolves to a different group than when it was first seen — its owner joined or left a listed group, and the rosters refreshed while the pod waited. Re-resolved at every preflight, so the next ask carries the new group. |
 | DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free claimed nodes phys_gpus committed peak_at`) | **The guard number is the field** — see below. Guards 4 and 5 are judged twice for a granted candidate: at preflight, on its own, and again in the grant loop, in the order the grants are made — so a hold can come from either. `claimed` (guard 5, in the grant loop) is the GPUs the batch's earlier grants took, which the node snapshot does not yet show. A guard 1 `no_class_nodes`, 3 or 4 hold is also told to the pod's owner as an `OnDemandAdmissionPaused` Event — see below. |
 | WARNING | `ondemand.gated` | `clabel guard reason dur_s candidates detail` (+ `app_gpus phys_gpus` \| `pods`) | **Every 60 s, one line per GPU class whose on-demand admission is paused**, for as long as it stays paused — see below. |
 | ERROR | `ondemand.gate_warning_failed` | `err` | The warning pass raised; retried next minute. |

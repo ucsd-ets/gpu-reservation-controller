@@ -49,7 +49,7 @@ app/
 ├── main.py               Entry point — FastAPI app, lifespan, four background tasks
 ├── config.py             Config dataclass populated from environment variables
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
-├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
+├── reservation_client.py httpx async client — fetches reservations + GPU classes + the DEFAULT_USAGE_GROUP groups' rosters; creates/cancels JIT on-demand reservations
 ├── log_fields.py         kv() — renders log message bodies as key=value fields (see docs/LOG-FIELDS.md)
 ├── trace.py              Per-unit-of-work trace ids + X-Client-Trace propagation (see **Trace ids**)
 ├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node, cordoned/deleting/NotReady nodes excluded, honouring the galends/force-node-capacity node annotation; optionally node labels too) / snapshot_node_gpu_capacity (per-class collapse of it), get_pod_node_placement (a pod's nodeSelector + required node affinity, as a matchable NodePlacement)
@@ -60,7 +60,7 @@ app/
 
 | Task | Cadence | Responsibility |
 |------|---------|----------------|
-| `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
+| `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries; reloads the `DEFAULT_USAGE_GROUP` rosters once `DEFAULT_USAGE_GROUP_REFRESH_INTERVAL` has passed (see **Defaults for pods that declare neither**) |
 | `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease and starts an admission batch; retries the pods waiting on a reservation a deleted/terminated pod held; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; moves a queued pod to an open reservation with room; tells each pod still queued what it waits on; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee: reactively, when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**), and — throttled to `HEADROOM_CHECK_INTERVAL` — anticipatorily, to hold a fixed fraction of each class free for on-demand jobs that have not arrived yet (see **Anticipatory headroom preemption**) |
@@ -1274,27 +1274,79 @@ an unconfigured deployment behaves exactly as before:
   merely on the JIT lease ask.  So this is a statement about which group
   unlabelled workloads belong to.  With the label feature off it substitutes for
   a missing `galends/usage-group` annotation, which only ever fed the lease ask,
-  so there it changes nothing else.  It is not a wildcard — it names one group,
-  and another group's booking still does not match.
+  so there it changes nothing else.  It is not a wildcard — it resolves to one
+  group per user, and another group's booking still does not match.
 
 The pod's own annotation/label always wins; the default only fills a gap.
 
-`snapshot_tolerated_pods` takes the group default alongside the label key and
-applies the same fallback, so a pod **admitted** under the default group reads
-back carrying it.  Without that, `ToleratedPodInfo.group_label` would be `None`
-for exactly the pods routing had treated as grouped, `_group_ok` would reject
-every reservation for them, and adoption / JIT-lease merge would evict a job
-they were meant to carry forward.  Every call site passes
-`config.default_usage_group` next to `config.required_group_label` for that
-reason — the two travel together.
+**`DEFAULT_USAGE_GROUP` is an ordered list, resolved per user.**  A
+comma-separated value (`research-a,research-b,dsmlp-public`; a single name is a
+list of one, so existing values keep working) is walked in order for the pod's
+owner — its namespace — and the **first group that admits them** is the pod's
+group (`ControllerState.default_usage_group_for`).  A group admits a user when
+it is active and they are a member in any role, or when it sets
+`on_demand_auto_join`, which admits everyone: the app would enrol them on their
+first lease (`DefaultGroupRoster.admits`).  An auto-join group therefore ends
+the walk for anyone who reaches it, which makes it the natural last entry.
+**Membership is all that is checked** — no validity window, SU budget, class
+attachment or capacity: those are the app's to judge on the reservation itself,
+and a group that would deny one (a course whose term is over) still claims its
+members.  Keep the list to standing groups.  A user no entry admits gets no
+group, exactly as if nothing were configured — and, unlike before, is told so
+in `NoReservation` ("you are not a member of any of the cluster's default usage
+groups"; the operator's groups are deliberately not named).  This also changes
+the single-name case: a non-member used to be sent with that group anyway and
+refused by the app (`not_a_member`, structural); now no lease is asked for.
 
-**RBAC / observability**: none new.  There is deliberately no "a default was
-applied" log event: `ondemand.candidate_added` already prints the effective
-`min_runtime_s` and `group`, which is the value that matters.  The one case the
-pod's owner is told about is a default standing in for a value they *did* write
-but which was invalid (`AnnotationIgnored`), since they would otherwise believe
-their own runtime was in force; a default filling a gap they left says nothing,
-and one supplying the usage group of a lease the app 404s is named as such in
+**Membership comes from `GET /api/groups`, cached.**  That service-key read
+already carries each group's `members`, `is_active` and
+`on_demand_auto_join` (RESERVATION-API.md §5), so no app change was needed.
+`main._refresh_default_group_rosters` pulls it at startup (before the watch
+replays every pod) and then on the first reservation fetch cycle after every
+`DEFAULT_USAGE_GROUP_REFRESH_INTERVAL` (default 4 h), keeping only the listed
+groups (`ReservationClient.fetch_groups` drops the rest before validating them);
+every resolution in between is an in-memory walk.  The cost is that a
+membership change can take up to the interval to be seen; the response is every
+group's full roster, which is why it is not fetched per pod.  A failed refresh
+keeps the previous rosters and is retried on the next fetch cycle; before the
+first success nothing resolves, and `ControllerState.default_groups_known`
+keeps that window from being reported to a pod's owner as "you belong to no
+default group" (the `reservations_known` rule, applied to rosters).  Each
+refresh logs one `default_group.loaded` per usable entry, in list order, and a
+WARNING `default_group.unusable` (`not_found` / `inactive`) per entry an
+operator has to fix.
+
+**A waiting candidate follows its owner's current fallback.**  A candidate whose
+group came from the list (`usage_group_source == "default"`) is re-resolved at
+every preflight: a candidate that kept its first answer would ask, for as long
+as the pod lived, under a group its owner had since left (a structural 409), or
+pass over one they had joined.  A changed group logs `ondemand.group_changed`
+and resets what the app said about the old ask (fault backoff, capacity queue);
+no group at all drops the candidate (`reason=no_default_group`) for the next
+watch resync to route.  A queued pod is not re-resolved — it is bound to a
+booking its owner holds, whichever group that is under.
+
+`snapshot_tolerated_pods` takes the fallback alongside the label key and
+applies it, so a pod **admitted** under a default group reads back carrying it.
+Without that, `ToleratedPodInfo.group_label` would be `None` for exactly the
+pods routing had treated as grouped, `_group_ok` would reject every reservation
+for them, and adoption / JIT-lease merge would evict a job they were meant to
+carry forward.  Since the fallback is per user, what is passed is the resolver
+itself, `state.default_usage_group_for`, called with each labelless pod's
+namespace — which is why resolution must stay synchronous and I/O-free.  Every
+call site passes it next to `config.required_group_label` for that reason — the
+two travel together.  A pod's read-back group follows the rosters, so after a
+refresh that moves its owner it reads back under the new group, the same way it
+would after the operator edited the list.
+
+**RBAC / observability**: none new — `GET /api/groups` is readable by either
+key scope.  There is deliberately no "a default was applied" log event:
+`ondemand.candidate_added` already prints the effective `min_runtime_s` and
+`group`, which is the value that matters.  The one case the pod's owner is told
+about is a default standing in for a value they *did* write but which was
+invalid (`AnnotationIgnored`), since they would otherwise believe their own
+runtime was in force; a default filling a gap they left says nothing, and one
+supplying the usage group of a lease the app 404s is named as such in
 `OnDemandLeaseRejected`.
 
 ### App-side vs physical capacity reconciliation
@@ -1550,7 +1602,7 @@ the next section.
   `_grant_and_admit`) carries the app's `detail` when it sent one, and states
   what the controller *sent* — the user (the pod's namespace) and the usage
   group, and where that group came from: the `REQUIRED_GROUP_LABEL` label, the
-  `galends/usage-group` annotation, or `DEFAULT_USAGE_GROUP`
+  `galends/usage-group` annotation, or chosen from `DEFAULT_USAGE_GROUP`
   (`OnDemandCandidate.usage_group_source`, recorded by routing).  The app cannot
   know the last, and it is the difference between "fix your label" and "you
   never named a group; contact support".  A booking the user holds under another
@@ -2245,7 +2297,8 @@ the claimed set and the grace re-arm path above applies.
 | `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
 | `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**), and a pod without the label is never JIT-eligible either. Unset = disabled |
 | `DEFAULT_MINIMUM_RUNTIME_SECONDS` | `0` | Minimum runtime assumed for a pod with no usable `galends/minimum-runtime-seconds` annotation, so it is still JIT-eligible; `0` = disabled (see **Defaults for pods that declare neither**) |
-| `DEFAULT_USAGE_GROUP` | *(absent)* | Usage group assumed for a pod that names none — standing in for the `REQUIRED_GROUP_LABEL` label when that feature is on (and therefore for the reserved-path match too), else for the `galends/usage-group` annotation. Unset = disabled |
+| `DEFAULT_USAGE_GROUP` | *(absent)* | Comma-separated usage groups, in priority order, for a pod that names none: the pod gets the **first one its owner may use** — a group they are a member of, or one with `on_demand_auto_join`, which admits anyone. Membership only; no booking or budget check. The resolved group stands in for the `REQUIRED_GROUP_LABEL` label when that feature is on (and therefore for the reserved-path match too), else for the `galends/usage-group` annotation. A single name is a list of one. Unset = disabled (see **Defaults for pods that declare neither**) |
+| `DEFAULT_USAGE_GROUP_REFRESH_INTERVAL` | `14400` | Seconds between refreshes of the `DEFAULT_USAGE_GROUP` groups' rosters (`GET /api/groups`, checked each reservation fetch cycle) — how long a user's fallback group may lag a membership change |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
 | `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and gates on-demand admission for classes the app over-counts (the gated set itself is also re-checked every queue-processor tick) (see **App-side vs physical capacity reconciliation**) |

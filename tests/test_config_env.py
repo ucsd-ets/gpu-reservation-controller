@@ -156,6 +156,14 @@ NUMERIC_SETTINGS = [
     ("HEADROOM_CHECK_INTERVAL", "headroom_check_interval", 600, False),
     # 0 is this one's "off": no stand-in for a missing minimum-runtime annotation.
     ("DEFAULT_MINIMUM_RUNTIME_SECONDS", "default_min_runtime_seconds", 0, True),
+    # Not a busy loop at 0 (it rides the fetch cycle), but 0 would mean "never
+    # cache the rosters", so it floors at 1 like every other interval.
+    (
+        "DEFAULT_USAGE_GROUP_REFRESH_INTERVAL",
+        "default_usage_group_refresh_interval",
+        14400,
+        False,
+    ),
     # 0 legitimately means "restate the denial reason on every retry" -- noisy,
     # but a coherent choice; ONDEMAND_DENIAL_EVENT_ENABLED is the off switch.
     (
@@ -208,6 +216,39 @@ class TestConfigNumericSettings:
     def test_http_port_rejects_an_unbindable_port(self, env):
         env.setenv("HTTP_PORT", "70000")
         assert Config.from_env().http_port == 8000
+
+
+class TestDefaultUsageGroupList:
+    """``DEFAULT_USAGE_GROUP`` is an ordered fallback list, comma-separated."""
+
+    def test_unset_means_no_fallback(self, env):
+        env.delenv("DEFAULT_USAGE_GROUP", raising=False)
+        assert Config.from_env().default_usage_groups == ()
+
+    def test_a_single_name_is_a_list_of_one(self, env):
+        # The form every existing deployment uses keeps working unchanged.
+        env.setenv("DEFAULT_USAGE_GROUP", "cse151b")
+        assert Config.from_env().default_usage_groups == ("cse151b",)
+
+    def test_order_is_kept(self, env):
+        env.setenv("DEFAULT_USAGE_GROUP", "research-a,research-b,dsmlp-public")
+        assert Config.from_env().default_usage_groups == (
+            "research-a", "research-b", "dsmlp-public",
+        )
+
+    def test_whitespace_and_empty_entries_are_dropped(self, env):
+        env.setenv("DEFAULT_USAGE_GROUP", " research-a , ,research-b,, ")
+        assert Config.from_env().default_usage_groups == ("research-a", "research-b")
+
+    def test_a_repeat_keeps_its_first_position(self, env):
+        # A later mention could only ever be shadowed by the first.
+        env.setenv("DEFAULT_USAGE_GROUP", "b,a,b")
+        assert Config.from_env().default_usage_groups == ("b", "a")
+
+    @pytest.mark.parametrize("raw", ["", "  ", ",", " , ,"])
+    def test_nothing_but_separators_is_unset(self, env, raw):
+        env.setenv("DEFAULT_USAGE_GROUP", raw)
+        assert Config.from_env().default_usage_groups == ()
 
 
 class TestConfigRequired:
