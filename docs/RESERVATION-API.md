@@ -130,9 +130,10 @@ Common status codes:
 A denial from one of the reservation **admission gates** carries three more
 fields beside `detail`. The gates are the checks that judge whether the
 *requested* reservation may be admitted — membership, class access, duration,
-group validity, SU budget and capacity — on `POST /api/reservations` (both
-shapes), `POST /api/reservations/preflight` and
-`POST /api/reservations/{id}/continue`:
+group validity, SU budget and capacity — on `POST /api/reservations` (every
+shape), `POST /api/reservations/preflight` and
+`POST /api/reservations/{id}/continue`. The same envelope, keyed by `pod_uid`,
+is each `withheld` entry of `POST /api/reservations/ondemand-admission`:
 
 ```json
 {
@@ -501,6 +502,11 @@ end when the denial is against the *current* window. A denial against a
 reservations already charged to it, which do not expire until the window itself
 has passed.
 
+One more code, `outranked`, is not a gate: it appears only in the `withheld`
+list of `POST /api/reservations/ondemand-admission`, for a candidate that fits on
+its own but not after the grants made ahead of it in the same batch. It is always
+`retryable: true`, with no `not_before`.
+
 Three codes never reach a lease and appear only on the web-booking and
 `preflight` paths, whose timing policy a lease does not have:
 `start_too_soon`, `booking_window_too_soon` (both always `retryable: false` —
@@ -707,26 +713,25 @@ to branch on `code`/`retryable` rather than on the status.
 
 ### `POST /api/reservations/ondemand-admission`
 
-Choose which pending pods the controller should admit on-demand this round.
-Requires a `read_write` service key (or an admin session) — the same gate as the
-on-demand create, cancel, and preemption-victims endpoints. Advisory and
-**read-only**: it creates nothing and returns only a selection; the controller
-then creates a real lease for each granted pod via `POST /api/reservations` (see
-**Creating on-demand reservations**).
+Choose which pending pods the controller should admit on-demand this round, **in
+which order**, and why the rest were not. Requires a `read_write` service key
+(or an admin session) — the same gate as the on-demand create, cancel, and
+preemption-victims endpoints. **Read-only**: it creates nothing and returns only
+a selection; the controller then creates a real lease for each granted pod via
+`POST /api/reservations` (see **Creating on-demand reservations**).
 
-This is the delegation point for **LAS (least-attained-service) prioritization**
-and any future admission policy. The controller has already determined *which*
-pending pods are eligible for a JIT lease this round (GPU-only-pending, not
-matched by an open reservation, past their retry cooldown, of a class that is
-not under the stuck-holder safety interlock). This endpoint decides *which* of
-those eligible pods to admit now, so prioritisation policy lives in the app
-rather than the controller. Each candidate carries the exact "ask" a
-`POST /api/reservations` create would make, so the app can weigh it against
-priority **and** the same feasibility analysis a create performs — plus two
-fields that are **evidence about the waiting pod** rather than part of that ask
-(`pod_created_at`, `pod_annotations`). Nothing in the create carries those two;
-they exist so admission policy can price a candidate on how long it has been
-waiting and on what its owner declared about the job.
+This is the delegation point for admission policy. The controller has already
+determined *which* pending pods are eligible for a JIT lease this round
+(GPU-only-pending, not matched by an open reservation, of a class that is not
+under the stuck-holder safety interlock, physically able to land). This endpoint
+decides which of those to admit and in what order, so prioritisation policy
+lives in the app rather than the controller. Each candidate carries the exact
+"ask" a `POST /api/reservations` create would make, so the app can weigh it
+against priority **and** the same feasibility analysis a create performs — plus
+two fields that are **evidence about the waiting pod** rather than part of that
+ask (`pod_created_at`, `pod_annotations`). Nothing in the create carries those
+two; they exist so admission policy can price a candidate on how long it has
+been waiting and on what its owner declared about the job.
 
 ```json
 {
@@ -737,9 +742,10 @@ waiting and on what its owner declared about the job.
       "username": "alice", "group_name": "cse142",
       "gpu_class_id": 10, "gpu_count": 1, "duration_seconds": 1800 },
     { "pod_uid": "def-456", "pod_created_at": "2026-08-21T17:05:00Z",
-      "pod_annotations": {},
-      "username": "bob", "group_name": null,
-      "gpu_class_id": 10, "gpu_count": 2, "duration_seconds": 1200 }
+      "pod_annotations": { "galends/runtime-guarantee": "none" },
+      "username": "bob", "group_name": "cse142",
+      "gpu_class_id": 10, "gpu_count": 2, "duration_seconds": 0,
+      "best_effort": true }
   ]
 }
 ```
@@ -750,10 +756,11 @@ waiting and on what its owner declared about the job.
 | `candidates[].pod_created_at` | The pod's Kubernetes `metadata.creationTimestamp`, **UTC** — the same key the controller FIFO-orders its own batch by, so an age computed from it is real queueing delay rather than time since this batch was assembled |
 | `candidates[].pod_annotations` | Every `galends/`-prefixed annotation on the pod, as a string map. `{}` is legitimate — a pod covered by the controller's `DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP` declares nothing itself |
 | `candidates[].username` | Reservation owner the lease would be created for (the pod's namespace) |
-| `candidates[].group_name` | Usage group the lease would be created under, or `null` when group matching is disabled |
+| `candidates[].group_name` | Usage group the lease would be created under |
 | `candidates[].gpu_class_id` | Numeric GPU-class id the lease would target |
 | `candidates[].gpu_count` | GPUs the pod requests |
-| `candidates[].duration_seconds` | Lease duration the controller would request (pod minimum-runtime + buffer) |
+| `candidates[].duration_seconds` | Lease duration the controller would request (pod minimum-runtime + buffer); `0` for a best-effort candidate, which reserves no window |
+| `candidates[].best_effort` | Optional, default `false`. `true` when a grant is followed by a **best-effort** create (see **Creating best-effort reservations**) rather than a lease, so the ask is judged by that path's gates |
 
 `pod_annotations` values are whatever the pod's creator wrote, and Kubernetes
 lets one object carry 256 KiB of annotations — which a batch would otherwise
@@ -763,42 +770,89 @@ in sorted order, so the same pod presents the same subset on every attempt) and
 **1024 characters per value**. The bound lives on the sending side on purpose,
 because this endpoint's schema is deliberately lenient: one candidate the app
 refuses 422s the *whole* batch, and none of the pods in it get admitted that
-round. For the same reason both fields are **optional app-side** — a controller
-predating them offers neither, and must not have its batch rejected for it.
+round. For the same reason the pod-evidence fields and `best_effort` are
+**optional app-side** — a controller predating them offers none of them, and
+must not have its batch rejected for it.
 
-The app is free to ignore both. They are advisory inputs to selection, never
-inputs to the lease that follows: the subsequent `POST /api/reservations` carries
-the ask alone.
+The app is free to ignore both pieces of evidence. They are advisory inputs to
+selection, never inputs to the lease that follows: the subsequent
+`POST /api/reservations` carries the ask alone.
 
-The app returns the subset of `pod_uid`s it grants admission this round:
+**The selection is a ranked dry run of the creates.** Every candidate is judged
+by the create's own gates (duration ceiling, group validity, SU budget and pool,
+the three capacity tiers, and for a best-effort candidate its capacity probe)
+against the calendar **plus every lease granted ahead of it in the same batch**,
+so the grants it returns fit together, not merely each alone. Among those that
+fit, the app grants in **rank order**, reading each scope's standing again after
+every grant (SCHEDULING.md §7.1): best-effort candidates after every guaranteed
+one; an ask that fits within every ceiling of its usage group and cohort before
+one that fits only by borrowing past them; then the binding cohort's share of
+its ceiling, the group's share of its own, the GPUs the candidate's user holds —
+all measured over one window common to the batch — and finally `pod_created_at`,
+oldest first. An ask that no longer fits is passed over, not waited for. It
+writes nothing — not even an account `on_demand_auto_join` would provision,
+which is judged as the create would judge it.
 
 ```json
-{ "granted_pod_uids": ["abc-123"] }
+{
+  "granted_pod_uids": ["abc-123"],
+  "withheld": [
+    { "pod_uid": "def-456",
+      "detail": "Fits on its own, but not after the requests granted ahead of it this round. Only 0 GPU(s) available at 2026-08-21 17:00",
+      "code": "outranked", "retryable": true }
+  ]
+}
 ```
 
+| Field | Meaning |
+|-------|---------|
+| `granted_pod_uids` | The candidates to create, **in the order to create them**. The order is the app's ranking: the controller creates in exactly this order and must not re-sort it |
+| `withheld[]` | One entry per offered candidate that was not granted, carrying the [admission-denial envelope](#admission-denial-envelope) (`detail`, `code`, `retryable`, and `not_before` when known) plus its `pod_uid`. Absent from an app predating it; read it leniently, entry by entry, by the envelope's own rules |
+
+A withheld candidate's `code` is either:
+
+- **a gate code** from §4 — exactly the denial the create would have returned.
+  The controller treats it as that `409`, without spending a create on it:
+  structural (`retryable: false`) backs off, contended retries, scheduled waits
+  for `not_before`, and the `detail` is what the pod's owner is told. An SU code
+  caused by the same owner's or group's earlier grant in the batch is reported
+  this way too, because it is what the create will say once that grant is
+  written.
+- **`outranked`** — not a gate, and never returned by a create. The candidate
+  fits on its own, but a **capacity** gate refuses it after the grants made
+  ahead of it in the batch. Always `retryable: true` with no `not_before`:
+  nothing is wrong with the ask, and capacity freeing is the answer. The
+  controller offers such a candidate again in every later batch until its answer
+  changes, and tells the pod's owner only that it is waiting for GPU capacity —
+  a count would change from batch to batch.
+
+Three kinds of candidate are **not judged**, and are granted — after the ranked
+grants — so the create answers them exactly as it always has: one naming a user,
+group or GPU class the app does not know (the create's `404`), one the create
+would reject as malformed (its `422` — no `group_name`, a lease shorter than
+60 s), and one whose `pod_uid` is already some reservation's `idempotency_key`
+(the create returns that row). None of them holds capacity against the
+candidates behind it.
+
 The controller admits only pods it offered — a `pod_uid` in the response that was
-not in the request is ignored. An **empty** list is a deliberate "grant none this
-round" decision and is respected (the non-granted pods simply retry on a later
-tick). The controller falls back to granting **every** offered candidate (its
-prior greedy per-pod behaviour) only when the call itself fails (network error,
-non-2xx, or the endpoint being absent on an older app), or when
+not in the request is ignored, and a uid granted twice is created once. An
+**empty** `granted_pod_uids` is a deliberate "grant none this round" decision and
+is respected. The controller falls back to granting every candidate whose retry
+time has passed, in its own order, only when the call itself fails (network
+error, non-2xx, or the endpoint being absent on an older app), or when
 `ONDEMAND_DELEGATE_ADMISSION` is disabled controller-side.
 
-Selection is currently **grant-all** — the endpoint exists so that admission
-prioritisation policy can live in the app (`_prioritize_ondemand_candidates` in
-`app/routers/reservations.py` is the seam where it will be imposed). For each
-granted pod the controller then issues an idempotent `POST /api/reservations`
-(keyed by `pod_uid`); a `409` there still applies — a grant this endpoint returns
-is an admission *decision*, and the subsequent create remains the authoritative
-feasibility check. A candidate the create refuses with `retryable: false` will be
-refused again on every later round, so it is worth dropping from the offered set
-rather than re-offering it each tick.
+The creates that follow remain the **authoritative** feasibility check: the
+calendar can move between the dry run and the create, so a `409` there still
+applies. The controller also re-checks its own physical guards in the returned
+order, against the GPUs the grants ahead have taken — a grant it cannot place
+waits for its next attempt.
 
 **Responses**
 
 | Code | Condition |
 |------|-----------|
-| 200 | The response body `{ "granted_pod_uids": [...] }` (`OnDemandAdmissionResponse`) |
+| 200 | The response body `{ "granted_pod_uids": [...], "withheld": [...] }` (`OnDemandAdmissionResponse`) |
 | 403 | Read-only key / non-admin session |
 | 422 | Malformed body (e.g. `gpu_count <= 0`) |
 

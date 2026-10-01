@@ -85,14 +85,13 @@ config:
   # sizing the duration of a requested JIT lease.
   ondemandLeaseBufferMinutes: 10
 
-  # Delegate on-demand admission selection to the app for LAS prioritization:
-  # the controller offers the batch of eligible pending pods to
-  # POST /api/reservations/ondemand-admission and admits only the subset the app
-  # grants. The app endpoint is shipped, but its selection is grant-all today,
-  # so turning this on changes no behaviour until the app carries real admission
-  # policy; false (or any app-call failure) grants every eligible candidate
-  # (greedy per-pod).
-  ondemandDelegateAdmission: false
+  # Delegate on-demand admission to the app: the controller offers the batch of
+  # eligible pending pods to POST /api/reservations/ondemand-admission, and the
+  # app grants them in its ranked order -- asks from groups and cohorts within
+  # their allocation ahead of asks that must borrow past it -- withholding the
+  # rest with a reason. false is the rollback: every due candidate is granted in
+  # creation order, as it also is whenever the app cannot be asked.
+  ondemandDelegateAdmission: true
 
   # Honour a pod's galends/runtime-guarantee: "none" annotation by admitting it
   # under a zero-length, zero-SU kind="best_effort" reservation instead of a

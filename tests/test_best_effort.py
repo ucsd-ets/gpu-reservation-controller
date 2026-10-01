@@ -325,16 +325,37 @@ def _preflight_config(**overrides):
     return SimpleNamespace(**base)
 
 
-def _run_preflight(monkeypatch, m, state, candidate, claimed=None):
+def _run_preflight(monkeypatch, m, state, candidate):
     async def fake_read_pod(name, namespace):
         return _best_effort_pod(conditions=[_gpu_only_condition()])
 
     monkeypatch.setattr(m, "read_pod", fake_read_pod)
     return asyncio.run(
-        m._preflight_ondemand_candidate(
-            state, _preflight_config(), "uid-1", candidate, claimed
-        )
+        m._preflight_ondemand_candidate(state, _preflight_config(), "uid-1", candidate)
     )
+
+
+def _held_at_grant(monkeypatch, m, state, candidate, node_claimed):
+    """Guards 4 and 5 as the grant loop judges them, after earlier grants.
+
+    Preflight must find the candidate ready on its own first; the grant loop
+    then judges it again, netting *node_claimed* off the node snapshot.
+    """
+    async def fake_read_pod(name, namespace):
+        return _best_effort_pod(conditions=[_gpu_only_condition()])
+
+    monkeypatch.setattr(m, "read_pod", fake_read_pod)
+    config = _preflight_config()
+
+    async def run():
+        status, _ask, fit = await m._preflight_with_fit(state, config, "uid-1", candidate)
+        assert status == m._PREFLIGHT_READY
+        return await m._hold_on_fit(
+            state, config, "uid-1", candidate, fit, datetime.now(timezone.utc),
+            node_claimed=node_claimed,
+        )
+
+    return asyncio.run(run())
 
 
 def _be_candidate(uid="uid-1", *, gpu_requested=1):
@@ -422,25 +443,20 @@ class TestGuardFiveAtEveryGpuCount:
         status, _ = _run_preflight(monkeypatch, m, state, _be_candidate())
         assert status == m._PREFLIGHT_READY
 
-    def test_the_batch_tally_is_netted_off(self, monkeypatch):
-        # One GPU free, one already claimed earlier in this batch -> nothing
-        # left. Without the tally both candidates would clear the same opening.
+    def test_the_batch_tally_is_netted_off_at_grant_time(self, monkeypatch):
+        # One GPU free, one already taken by a grant earlier in this batch ->
+        # nothing left. Without the tally both candidates would clear the same
+        # opening.
         m = _main_module(monkeypatch)
         state = _state_ready()
         state.node_free_by_class = {GPU_CLASS_LABEL: 1}
-        status, _ = _run_preflight(
-            monkeypatch, m, state, _be_candidate(), {GPU_CLASS_LABEL: 1}
-        )
-        assert status == m._PREFLIGHT_RETRY
+        assert _held_at_grant(monkeypatch, m, state, _be_candidate(), 1) is True
 
-    def test_a_tally_for_another_class_does_not_interfere(self, monkeypatch):
+    def test_nothing_granted_ahead_leaves_the_opening(self, monkeypatch):
         m = _main_module(monkeypatch)
         state = _state_ready()
         state.node_free_by_class = {GPU_CLASS_LABEL: 1}
-        status, _ = _run_preflight(
-            monkeypatch, m, state, _be_candidate(), {"other": 4}
-        )
-        assert status == m._PREFLIGHT_READY
+        assert _held_at_grant(monkeypatch, m, state, _be_candidate(), 0) is False
 
 
 class TestTheAskCarriesTheAnnotation:

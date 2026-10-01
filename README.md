@@ -88,10 +88,10 @@ multi-GPU reservation.
 │         for a reason a lease can fix, the class has  │
 │         nodes, and the pod's node selector allows    │
 │         one), resolve gpu-class → gpu_class_id.      │
-│         If ONDEMAND_DELEGATE_ADMISSION, offer the     │
-│         whole batch to the app (LAS prioritization):  │
+│         Offer the whole batch to the app, which       │
+│         ranks it by allocation share:                 │
 │           POST /api/reservations/ondemand-admission   │
-│         → app returns which to admit (else grant all).│
+│         → grants in rank order (else grant all due).  │
 │         For each granted:                             │
 │           POST /api/reservations (on_demand=true,     │
 │             idempotency_key=pod UID)                  │
@@ -178,13 +178,14 @@ unlabelled workloads belong to, not merely a JIT lease detail.
 
 **Batch admission** — each attempt gathers all due candidates, vets each
 (re-routing, the guards below, and resolving its `gpu-class` label to a numeric
-`gpu_class_id`), and — when `ONDEMAND_DELEGATE_ADMISSION` is enabled — offers the
-whole eligible set to the app in one call
-(`POST /api/reservations/ondemand-admission`), which returns the subset to admit
-this round.  This is where **LAS (least-attained-service) prioritization** will
-live.  When the flag is off, or the app call fails, the controller grants every
-eligible candidate (its prior greedy behaviour), so the feature ships safely
-dark.  For each granted pod it then calls `POST /api/reservations` with
+`gpu_class_id`), and offers the whole eligible set to the app in one call
+(`POST /api/reservations/ondemand-admission`).  The app dry-runs the creates and
+returns its grants **in rank order**: asks from usage groups and cohorts within
+their allocation ahead of asks that would borrow past it, then the scopes holding
+the least of their ceilings, then the owner holding least, then pod age.  The
+controller grants in exactly that order.  `ONDEMAND_DELEGATE_ADMISSION=false` is
+the rollback, and the behaviour whenever the app call fails: every due candidate
+is granted in creation order.  For each granted pod it then calls `POST /api/reservations` with
 `duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES * 60` and
 `on_demand=true` (the app relaxes policy limits — SU, caps, minimum duration
 — never physical calendar capacity).  The request is **idempotent by the
@@ -609,7 +610,7 @@ All settings are supplied via environment variables.
 | `POD_PROBLEM_EVENT_ENABLED` | no | `true` | Put a `Warning` Kubernetes Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the reservation app knows (`reason=UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`reason=NoReservation`), one of its `galends/*` annotations was ignored (`reason=AnnotationIgnored`), or its node selector / required node affinity allows none of its class's nodes (`reason=NoMatchingNode`); plus the `Normal` `reason=WaitingForNode` while the nodes it allows are all full. Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
 | `RESERVATION_WAIT_EVENT_ENABLED` | no | `true` | Put a Kubernetes Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`reason=WaitingForReservation`, a `Normal` Event), the owner's other pods hold its GPUs, which are named (`reason=ReservationFull`), or it holds fewer GPUs than the pod requests (`reason=ReservationTooSmall`). Throttled with the denial Event above, on the same cadence. Informational only. Set to `false` to disable |
 | `BEST_EFFORT_ENABLED` | no | `false` | Honour a pod's `galends/runtime-guarantee: none` annotation by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation rather than a guaranteed lease — no runtime guarantee, no Service Units, preemptible from the first second. Requires an app build serving the best-effort create shape; `false` ignores the annotation entirely |
-| `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. The app endpoint is shipped but selects grant-all today, so enabling this changes no behaviour until the app carries real admission policy |
+| `ONDEMAND_DELEGATE_ADMISSION` | no | `true` | Let the reservation app decide which pending pods get on-demand GPUs, and in what order (`POST /api/reservations/ondemand-admission`): it ranks the batch by how much of its allocation each usage group and cohort holds — asks within their allocation ahead of asks that must borrow — and withholds the rest with a reason the pod is told. `false` is the rollback: every due candidate is granted in creation order, as it also is whenever the app cannot be asked |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side |
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) before a booking whose window is already open is declared a no-show: one already in progress when the controller starts, or one vacated mid-window after its last pod ends (finished, deleted or idle-culled) |
 | `QUEUE_PROCESSOR_INTERVAL` | no | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |

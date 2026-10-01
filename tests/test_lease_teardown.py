@@ -160,3 +160,61 @@ def test_cancel_failure_keeps_lease_in_state():
     # so the next poll can reconcile it (best-effort teardown).
     assert client.cancel_calls == [(500, "pod-terminated")]
     assert any(r.id == 500 for r in state.reservations)
+
+
+# ---------------------------------------------------------------------------
+# A released lease starts an admission batch
+# ---------------------------------------------------------------------------
+#
+# Cancelling a lease returns its capacity to the app's calendar, so a candidate
+# waiting on that capacity is offered it at once rather than at the next queue
+# tick.  Nothing else returns app-side capacity: a booking's pod ending leaves
+# the booking holding its window.
+
+
+def _run_counting_batches(state, client, events) -> list:
+    import unittest.mock as mock
+    import app.main as main_module
+
+    batches: list = []
+
+    async def _fake_batch(st, cl, cfg):
+        batches.append(st)
+
+    with mock.patch.object(main_module, "_run_ondemand_admission", _fake_batch):
+        _run(state, client, events)
+    return batches
+
+
+def test_a_deleted_lease_pod_starts_a_batch():
+    state = _lease_state(500)
+    batches = _run_counting_batches(
+        state, _FakeClient(), [("DELETED", _pod("uid-1", reservation_id=500))],
+    )
+    assert len(batches) == 1
+
+
+def test_a_finished_lease_pod_starts_a_batch():
+    state = _lease_state(500)
+    batches = _run_counting_batches(
+        state, _FakeClient(),
+        [("MODIFIED", _pod("uid-1", reservation_id=500, phase="Failed"))],
+    )
+    assert len(batches) == 1
+
+
+def test_a_booking_pod_ending_starts_no_batch():
+    state = _lease_state(500, kind="booking")
+    batches = _run_counting_batches(
+        state, _FakeClient(), [("DELETED", _pod("uid-1", reservation_id=500))],
+    )
+    assert batches == []
+
+
+def test_a_cancel_that_did_not_land_starts_no_batch():
+    state = _lease_state(500)
+    batches = _run_counting_batches(
+        state, _FakeClient(cancel_result=False),
+        [("DELETED", _pod("uid-1", reservation_id=500))],
+    )
+    assert batches == []

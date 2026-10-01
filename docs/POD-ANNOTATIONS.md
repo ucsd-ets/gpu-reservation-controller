@@ -432,9 +432,9 @@ where it is off, the annotation is ignored and the pod is handled as before.
 ### The whole `galends/` namespace leaves the cluster
 
 The keys above are the ones the controller itself acts on, but they are not
-the only ones it *sends*. When a pod is waiting for a just-in-time lease and the
-deployment delegates that decision to the reservation app
-(`ONDEMAND_DELEGATE_ADMISSION`), the controller offers the pod to the app along
+the only ones it *sends*. When a pod is waiting for a just-in-time lease, the
+controller offers it to the reservation app to decide which waiting pods go first
+(unless the deployment has turned `ONDEMAND_DELEGATE_ADMISSION` off), along
 with **every** annotation it carries under the `galends/` prefix — its own keys
 from §2 included — plus the pod's creation time. The app may weigh any of them
 when deciding which waiting pods to admit; a key it does not recognise is simply
@@ -543,7 +543,8 @@ any other reason — its on-demand lease merged into your booking as that bookin
 opened, or its reservation replaced by Extend — `Preempted` immediately before
 deletion, `ReservationCancelled` and `ReservationReassigned` immediately before
 a deletion no warning announces (below),
-`OnDemandLeaseDenied` when a lease request is refused — §5.1 —
+`OnDemandLeaseDenied` when a lease request is refused, and `WaitingForCapacity`
+when the GPUs free went to requests ahead of it — §5.1 —
 `OnDemandAdmissionPaused` when on-demand admission for the pod's GPU class is
 on hold — §5.2 — `OnDemandLeaseRejected`, `UnknownGpuClass`,
 `NoReservation`, `AnnotationIgnored` and `NoMatchingNode` when something about
@@ -633,6 +634,28 @@ Three things worth knowing about it:
   operator.  A request the app rejects because it does not recognise something
   the pod named — its usage group, most often — is reported too, as
   `OnDemandLeaseRejected` (§5.3), because that one *is* the owner's to fix.
+
+**When the reservation service chooses who goes first.** The reservation service
+decides which waiting pods get on-demand GPUs, and in what order, unless the
+deployment has turned `ONDEMAND_DELEGATE_ADMISSION` off. A pod whose usage
+group — and cohort — is still within its GPU allocation goes ahead of one whose
+group would have to borrow beyond its own; among the rest, the group holding the
+least of its allocation goes first, then the person holding the fewest GPUs,
+then the pod that has waited longest. It answers for every waiting pod at
+once, before any lease is requested. A pod it would refuse gets the same
+`OnDemandLeaseDenied` Event, with the same reason, as if the lease had been
+asked for. A pod that would fit on its own, but not after the pods admitted
+ahead of it, gets a `Normal` Event instead:
+
+```text
+Normal  WaitingForCapacity  1m3s  gpu-reservation-controller  Waiting for GPU capacity in class a100; still retrying. The GPUs free this round went to on-demand requests ahead of this one. Nothing about this pod needs to change.
+```
+
+Nothing is wrong with such a pod: it is offered again each time the controller
+admits on-demand pods — including the moment another on-demand job ends — and
+starts when its turn comes. The message deliberately carries no count of the
+requests ahead of it, which changes by the minute, so it repeats on the same
+cadence as the denial above rather than on every round.
 
 ### 5.2 When on-demand admission is paused: `OnDemandAdmissionPaused`
 
@@ -845,9 +868,7 @@ is expected in these cases:
   `controller-revoked`) and a fresh one requested 2–5 minutes later.
 - **The reservation service cannot be reached**, or refuses the controller
   itself (its credentials, say) — an operator's problem, logged for them
-  (§5.1). Where the deployment lets the reservation service choose which
-  waiting pods to admit on demand (`ONDEMAND_DELEGATE_ADMISSION`), a pod it
-  passes over for a round is not told either.
+  (§5.1).
 - **Its reservation went away while it waited** — the window ended, or the
   booking was cancelled with nothing to move to: its last §5.4 Event stands
   until the controller re-examines it at the next resync.

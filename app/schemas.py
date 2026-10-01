@@ -6,7 +6,7 @@ Mirrors the shapes documented in RESERVATION-API.md §6.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -277,6 +277,9 @@ class OnDemandAdmissionCandidate(BaseModel):
     gpu_class_id: int
     gpu_count: int
     duration_seconds: int
+    # Which create follows a grant: a best-effort stub (duration_seconds 0)
+    # rather than a lease, so the app judges the ask by that path's gates.
+    best_effort: bool = False
 
 
 class OnDemandAdmissionRequest(BaseModel):
@@ -292,13 +295,18 @@ class OnDemandAdmissionRequest(BaseModel):
 
 
 class OnDemandAdmissionResponse(BaseModel):
-    """Pods the app grants on-demand admission this round, as offered ``pod_uid``s.
+    """Pods the app grants on-demand admission this round, and why it withheld the rest.
 
-    An empty list is a deliberate "grant none" decision and is respected; the
-    controller ignores any uid it did not offer.
+    ``granted_pod_uids`` is in the order to grant them.  An empty list is a
+    deliberate "grant none" decision and is respected; the controller ignores
+    any uid it did not offer.  ``withheld`` is read entry by entry
+    (``reservation_client._withheld_entries``) rather than validated here, so
+    one malformed entry cannot discard the app's grants with it; absent from an
+    app predating it.
     """
 
     granted_pod_uids: list[str]
+    withheld: list[Any] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.controller import ControllerState, OnDemandCandidate, slot_start
-from app.reservation_client import LeaseAttempt
+from app.reservation_client import AdmissionSelection, AdmissionWithheld, LeaseAttempt
 
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, GROUP_NAME, USERNAME, kv_fields
 from tests.conftest import make_state as _state
@@ -344,8 +344,9 @@ class _FakeClient:
         # gives each pod its own reservation id; falls back to ``lease``.
         self._leases = leases or {}
         self.cancel_result = cancel_result
-        # Return value for select_ondemand_admissions: a list of granted uids,
-        # or None to simulate an unavailable endpoint (fallback to grant-all).
+        # Return value for select_ondemand_admissions: a list of granted uids
+        # (in the app's order), an AdmissionSelection for one that also
+        # withholds, or None to simulate an unavailable endpoint (fallback).
         self._select_response = select_response
         self.create_requests: list = []
         self.cancel_calls: list = []
@@ -367,6 +368,8 @@ class _FakeClient:
 
     async def select_ondemand_admissions(self, req):
         self.select_requests.append(req)
+        if isinstance(self._select_response, list):
+            return AdmissionSelection(granted=list(self._select_response), withheld={})
         return self._select_response
 
 
@@ -941,13 +944,19 @@ class TestTryRequestLease:
 # ---------------------------------------------------------------------------
 
 
-def _admission_config(*, placement=True, delegate=True):
+def _admission_config(*, placement=True, delegate=True, denial_events=False):
     return SimpleNamespace(
         ondemand_lease_enabled=placement,
         ondemand_delegate_admission=delegate,
         ondemand_horizon_minutes=30,
         ondemand_lease_buffer_minutes=10,
         scheduling_gate_name=None,
+        ondemand_denial_event_enabled=denial_events,
+        ondemand_denial_event_repeat_minutes=30,
+        ondemand_overcommit_fit=True,
+        ondemand_pause_event_enabled=False,
+        pod_problem_event_enabled=False,
+        support_contact=None,
     )
 
 
@@ -1135,6 +1144,336 @@ class TestRunOndemandAdmission:
         # The nested trigger did not launch a parallel batch; the outer loop ran
         # the trailing pass and cleared the flag.
         assert state.ondemand_rerun_requested is False
+
+
+# ---------------------------------------------------------------------------
+# The app's order, the guards judged in it, and what a withhold does
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    """Stands in for a k8s Event emitter, keeping what it was asked to say."""
+
+    def __init__(self):
+        self.calls: list = []
+
+    async def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def _aged(uid, minutes_ago, **kw):
+    """A candidate created *minutes_ago*, so creation order is explicit."""
+    c = _candidate(uid, **kw)
+    c.pod_created_at = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return c
+
+
+def _batch(monkeypatch, m, state, client, config=None):
+    async def fake_read_pod(name, namespace):
+        return _pod(conditions=[_gpu_only_condition()])
+
+    monkeypatch.setattr(m, "read_pod", fake_read_pod)
+    _patch_admission(monkeypatch, m)
+    asyncio.run(m._run_ondemand_admission(state, client, config or _admission_config()))
+
+
+class TestGrantOrder:
+    def test_grants_in_the_order_the_app_returned(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        uids = ["uid-1", "uid-2", "uid-3"]
+        client = _FakeClient(
+            leases={u: _lease(800 + i) for i, u in enumerate(uids)},
+            select_response=["uid-3", "uid-1", "uid-2"],
+        )
+        state = _state_ready()
+        for i, uid in enumerate(uids):
+            state.ondemand_candidates[uid] = _aged(uid, 10 - i)
+
+        _batch(monkeypatch, m, state, client)
+
+        # Offered oldest first; created in the app's order, not that one.
+        assert [c.pod_uid for c in client.select_requests[0].candidates] == uids
+        assert [r.idempotency_key for r in client.create_requests] == [
+            "uid-3", "uid-1", "uid-2",
+        ]
+
+    def test_a_uid_granted_twice_is_created_once(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(leases={"uid-1": _lease(821)}, select_response=["uid-1", "uid-1"])
+        state = _ready_state_with_candidates(["uid-1"])
+        _batch(monkeypatch, m, state, client)
+        assert [r.idempotency_key for r in client.create_requests] == ["uid-1"]
+
+    def test_the_offer_says_which_create_follows(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(select_response=[])
+        state = _state_ready()
+        lease_ask, stub_ask = _aged("uid-1", 5), _aged("uid-2", 4, min_runtime_seconds=0)
+        stub_ask.best_effort = True
+        state.ondemand_candidates = {"uid-1": lease_ask, "uid-2": stub_ask}
+        _batch(monkeypatch, m, state, client)
+        offered = {c.pod_uid: c for c in client.select_requests[0].candidates}
+        assert offered["uid-1"].best_effort is False
+        assert offered["uid-2"].best_effort is True
+        assert offered["uid-2"].duration_seconds == 0
+
+
+class TestGuardsInGrantOrder:
+    """Guards 4 and 5 judge each grant against what the grants ahead of it took."""
+
+    def test_the_single_node_opening_goes_to_the_app_order(self, monkeypatch, caplog):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(
+            leases={"uid-1": _lease(831, gpu_count=2), "uid-2": _lease(832, gpu_count=2)},
+            select_response=["uid-2", "uid-1"],
+        )
+        state = _state_ready()
+        state.node_free_by_class = {GPU_CLASS_LABEL: 2}  # one two-GPU opening
+        state.ondemand_candidates = {
+            "uid-1": _aged("uid-1", 10, gpu_requested=2),
+            "uid-2": _aged("uid-2", 5, gpu_requested=2),
+        }
+
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            _batch(monkeypatch, m, state, client)
+
+        # Both fit on their own, so both were offered; the opening went to the
+        # app's first choice, though it is the younger pod.
+        assert {c.pod_uid for c in client.select_requests[0].candidates} == {"uid-1", "uid-2"}
+        assert [r.idempotency_key for r in client.create_requests] == ["uid-2"]
+        assert "uid-1" in state.ondemand_candidates
+        [held] = [
+            kv_fields(r.getMessage()) for r in caplog.records
+            if "event=ondemand.candidate_held" in r.getMessage()
+        ]
+        assert held["guard"] == "5" and held["claimed"] == "2"
+
+    def test_an_overcounted_class_goes_to_the_app_order(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(
+            leases={"uid-a": _lease(841, gpu_count=3), "uid-b": _lease(842, gpu_count=3)},
+            select_response=["uid-b", "uid-a"],
+        )
+        state = _state_ready()
+        state.overcommitted_gpu_classes = {GPU_CLASS_LABEL}
+        state.physical_gpu_capacity = {GPU_CLASS_LABEL: 4}
+        state.ondemand_candidates = {
+            "uid-a": _aged("uid-a", 10, gpu_requested=3),
+            "uid-b": _aged("uid-b", 5, gpu_requested=3),
+        }
+
+        _batch(monkeypatch, m, state, client)
+
+        # uid-b's lease is in state.reservations by the time uid-a is judged.
+        assert [r.idempotency_key for r in client.create_requests] == ["uid-b"]
+        assert state.ondemand_candidates["uid-a"].held_by_overcommit is True
+
+    def test_a_denied_grant_takes_nothing_from_the_one_behind_it(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        # uid-2 is refused by the app, so uid-1 keeps the whole opening.
+        client = _FakeClient(
+            leases={"uid-1": _lease(851, gpu_count=2)}, select_response=["uid-2", "uid-1"],
+        )
+        state = _state_ready()
+        state.node_free_by_class = {GPU_CLASS_LABEL: 2}
+        state.ondemand_candidates = {
+            "uid-1": _aged("uid-1", 10, gpu_requested=2),
+            "uid-2": _aged("uid-2", 5, gpu_requested=2),
+        }
+        _batch(monkeypatch, m, state, client)
+        assert [r.idempotency_key for r in client.create_requests] == ["uid-2", "uid-1"]
+        assert "uid-1" not in state.ondemand_candidates
+
+
+class _CapacityDenyingClient(_FakeClient):
+    """Refuses every lease with the envelope a capacity gate sends."""
+
+    def __init__(self, *, code="capacity_group", retryable=True, **kw):
+        super().__init__(**kw)
+        self._code, self._retryable = code, retryable
+
+    async def create_ondemand_reservation(self, req):
+        self.create_requests.append(req)
+        return LeaseAttempt(
+            status=409, detail="Only 0 GPU(s) available for this group",
+            code=self._code, app_retryable=self._retryable,
+        )
+
+
+class TestWaitingForCapacity:
+    """With delegation on, a pod waiting only for capacity is offered every batch."""
+
+    def test_a_contended_capacity_denial_marks_the_candidate(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _CapacityDenyingClient(select_response=["uid-1"])
+        state = _ready_state_with_candidates(["uid-1"])
+        _batch(monkeypatch, m, state, client)
+        assert state.ondemand_candidates["uid-1"].awaiting_capacity is True
+
+    def test_other_denials_do_not(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        for code, retryable in (("capacity_group", False), ("su_budget_member", True)):
+            client = _CapacityDenyingClient(
+                code=code, retryable=retryable, select_response=["uid-1"],
+            )
+            state = _ready_state_with_candidates(["uid-1"])
+            _batch(monkeypatch, m, state, client)
+            assert state.ondemand_candidates["uid-1"].awaiting_capacity is False, code
+
+    def _cooling(self, uid):
+        c = _candidate(uid)
+        c.next_attempt_at = datetime.now(timezone.utc) + timedelta(minutes=3)
+        c.awaiting_capacity = True
+        return c
+
+    def test_it_is_offered_before_its_retry_time(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(leases={"uid-1": _lease(861)}, select_response=["uid-1"])
+        state = _state_ready()
+        state.ondemand_candidates = {"uid-1": self._cooling("uid-1")}
+        _batch(monkeypatch, m, state, client)
+        # The app's grant overrides the cooldown.
+        assert [c.pod_uid for c in client.select_requests[0].candidates] == ["uid-1"]
+        assert [r.idempotency_key for r in client.create_requests] == ["uid-1"]
+        assert state.ondemand_candidates == {}
+
+    def test_not_without_delegation(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(leases={"uid-1": _lease(862)})
+        state = _state_ready()
+        state.ondemand_candidates = {"uid-1": self._cooling("uid-1")}
+        _batch(monkeypatch, m, state, client, _admission_config(delegate=False))
+        assert client.create_requests == []
+
+    def test_not_granted_when_the_app_cannot_be_asked(self, monkeypatch):
+        # Falling back to grant-all must not turn every waiter into a create.
+        m = _main_module(monkeypatch)
+        client = _FakeClient(
+            leases={"uid-1": _lease(863), "uid-2": _lease(864)}, select_response=None,
+        )
+        state = _state_ready()
+        waiter = self._cooling("uid-1")
+        before = waiter.next_attempt_at
+        state.ondemand_candidates = {"uid-1": waiter, "uid-2": _candidate("uid-2")}
+        _batch(monkeypatch, m, state, client)
+        assert [r.idempotency_key for r in client.create_requests] == ["uid-2"]
+        assert waiter.next_attempt_at == before and waiter.awaiting_capacity is True
+
+    def test_a_controller_hold_clears_it(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(select_response=[])
+        state = _state_ready()
+        state.stuck_holder_gpu_classes = {GPU_CLASS_LABEL}  # guard 3
+        state.ondemand_candidates = {"uid-1": self._cooling("uid-1")}
+        _batch(monkeypatch, m, state, client)
+        assert state.ondemand_candidates["uid-1"].awaiting_capacity is False
+        assert client.select_requests == []
+
+
+class TestWithheld:
+    def _withholding(self, monkeypatch, withheld, *, config=None):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(
+            leases={"uid-1": _lease(871)},
+            select_response=AdmissionSelection(granted=["uid-1"], withheld=withheld),
+        )
+        state = _state_ready()
+        state.ondemand_candidates = {"uid-1": _aged("uid-1", 10), "uid-2": _aged("uid-2", 5)}
+        pending, denied = _Recorder(), _Recorder()
+        monkeypatch.setattr(m, "emit_pending_pod_event", pending)
+        monkeypatch.setattr(m, "emit_lease_denied_event", denied)
+        _batch(monkeypatch, m, state, client, config or _admission_config(denial_events=True))
+        return m, state, client, pending, denied
+
+    def test_outranked_waits_for_capacity_and_is_told_so(self, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            m, state, client, pending, denied = self._withholding(
+                monkeypatch,
+                {"uid-2": AdmissionWithheld(
+                    detail="Fits on its own, but not after ...", code="outranked",
+                    app_retryable=True,
+                )},
+            )
+        waiter = state.ondemand_candidates["uid-2"]
+        assert waiter.awaiting_capacity is True
+        assert waiter.next_attempt_at > datetime.now(timezone.utc)
+        assert denied.calls == []
+        [(args, kwargs)] = pending.calls
+        assert kwargs["reason"] == "WaitingForCapacity"
+        message = args[3]
+        assert "Waiting for GPU capacity" in message and "still retrying" in message
+        [line] = [
+            kv_fields(r.getMessage()) for r in caplog.records
+            if "event=ondemand.withheld" in r.getMessage()
+        ]
+        assert line["reason"] == "outranked" and line["pod"] == "pod-1"
+
+    def test_the_notice_is_throttled_across_batches(self, monkeypatch):
+        m, state, client, pending, _denied = self._withholding(
+            monkeypatch, {"uid-2": AdmissionWithheld(code="outranked", app_retryable=True)},
+        )
+        client._select_response = AdmissionSelection(
+            granted=[], withheld={"uid-2": AdmissionWithheld(code="outranked", app_retryable=True)},
+        )
+        asyncio.run(m._run_ondemand_admission(
+            state, client, _admission_config(denial_events=True),
+        ))
+        # Offered again (it waits for capacity), withheld again, told once.
+        assert len(client.select_requests) == 2
+        assert len(pending.calls) == 1
+
+    def test_a_withhold_without_a_reason_waits_like_outranked(self, monkeypatch):
+        _m, state, _client, pending, _denied = self._withholding(monkeypatch, {})
+        assert state.ondemand_candidates["uid-2"].awaiting_capacity is True
+        assert len(pending.calls) == 1
+
+    def test_a_gate_refusal_is_handled_as_the_create_s_409(self, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            _m, state, client, pending, denied = self._withholding(
+                monkeypatch,
+                {"uid-2": AdmissionWithheld(
+                    detail="User 'alice' is not a member of group 'g'",
+                    code="not_a_member", app_retryable=False,
+                )},
+            )
+        waiter = state.ondemand_candidates["uid-2"]
+        # Structural: the fault backoff, not the 2-5 min cadence.
+        assert waiter.lease_error_count == 1 and waiter.awaiting_capacity is False
+        # No create was spent on it, and its owner reads the app's own reason.
+        assert [r.idempotency_key for r in client.create_requests] == ["uid-1"]
+        [(args, kwargs)] = denied.calls
+        assert "not a member" in args[3] and kwargs["structural"] is True
+        assert pending.calls == []
+        [line] = [
+            kv_fields(r.getMessage()) for r in caplog.records
+            if "event=ondemand.withheld" in r.getMessage()
+        ]
+        assert line["reason"] == "not_a_member" and line["retryable"] == "false"
+
+    def test_a_contended_capacity_refusal_waits_for_capacity(self, monkeypatch):
+        _m, state, _client, _pending, denied = self._withholding(
+            monkeypatch,
+            {"uid-2": AdmissionWithheld(
+                detail="Only 0 GPU(s) available for this cohort", code="capacity_cohort",
+                app_retryable=True,
+            )},
+        )
+        waiter = state.ondemand_candidates["uid-2"]
+        assert waiter.awaiting_capacity is True and waiter.lease_error_count == 0
+        assert len(denied.calls) == 1
+
+    def test_a_scheduled_refusal_waits_for_its_instant(self, monkeypatch):
+        not_before = datetime.now(timezone.utc) + timedelta(minutes=20)
+        _m, state, _client, _pending, _denied = self._withholding(
+            monkeypatch,
+            {"uid-2": AdmissionWithheld(
+                detail="This lease costs 4 SU ...", code="su_budget_member",
+                app_retryable=True, not_before=not_before,
+            )},
+        )
+        waiter = state.ondemand_candidates["uid-2"]
+        assert waiter.next_attempt_at == not_before
+        assert waiter.awaiting_capacity is False
 
 
 # ---------------------------------------------------------------------------

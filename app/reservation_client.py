@@ -5,7 +5,7 @@ Implements only the endpoints the controller needs:
   - GET /api/gpu-classes/{id}  — per-class detail including label_value
   - GET /api/gpu-classes  — full class list (JIT label → id resolution)
   - POST /api/reservations  — create a JIT on-demand booking
-  - POST /api/reservations/ondemand-admission  — ask the app which pending pods to admit
+  - POST /api/reservations/ondemand-admission  — ask the app which pending pods to admit, in what order
   - POST /api/reservations/preemption-victims  — ask the app which overstay pods to preempt
   - POST /api/reservations/{id}/cancel  — cancel a reservation (no-show / revoke)
   - POST /api/reservations/{id}/overstay  — report an ended overstay's duration (analysis-only)
@@ -123,6 +123,13 @@ _DETAIL_MAX_CHARS = 200
 _NO_RESPONSE_BODY = "no body"
 
 
+def _clip_detail(text: str) -> str:
+    """*text* cut to ``_DETAIL_MAX_CHARS``: it is logged, and shown on a pod."""
+    if len(text) > _DETAIL_MAX_CHARS:
+        text = text[:_DETAIL_MAX_CHARS] + "…"
+    return text
+
+
 def _response_detail(response: httpx.Response) -> str:
     """A short, log-safe excerpt of an error response body.
 
@@ -137,9 +144,7 @@ def _response_detail(response: httpx.Response) -> str:
         payload = None
     detail = payload.get("detail") if isinstance(payload, dict) else None
     text = str(detail) if detail is not None else (response.text or "").strip()
-    if len(text) > _DETAIL_MAX_CHARS:
-        text = text[:_DETAIL_MAX_CHARS] + "…"
-    return text or _NO_RESPONSE_BODY
+    return _clip_detail(text) or _NO_RESPONSE_BODY
 
 
 def _denial_envelope(
@@ -155,6 +160,17 @@ def _denial_envelope(
         payload = response.json()
     except ValueError:
         return None, None, None
+    return _envelope_fields(payload)
+
+
+def _envelope_fields(
+    payload: object,
+) -> tuple[Optional[str], Optional[bool], Optional[datetime]]:
+    """``(code, retryable, not_before)`` from a parsed envelope, or ``None`` each.
+
+    Shared by a 409 body and an entry of the admission selection's ``withheld``
+    list, which carries the same envelope, so the two are read by one rule.
+    """
     if not isinstance(payload, dict):
         return None, None, None
     code = payload.get("code")
@@ -175,6 +191,82 @@ def _denial_envelope(
                 else parsed.astimezone(timezone.utc)
             )
     return code, retryable, not_before
+
+
+# The code the admission selection gives a candidate it withholds although the
+# candidate fits on its own: the capacity went to grants ahead of it in the same
+# batch.  Not a gate, so never a create's 409 -- it appears only in the
+# selection's ``withheld`` list (RESERVATION-API.md, ondemand-admission).
+OUTRANKED_CODE = "outranked"
+
+# The capacity gates' codes.  A contended denial from one of these clears as
+# the class drains, and is what a lease release can change.
+CAPACITY_DENIAL_CODES = frozenset({
+    "capacity_physical", "capacity_cohort", "capacity_group",
+})
+
+
+@dataclass(frozen=True)
+class AdmissionWithheld:
+    """Why the app withheld one offered candidate from an admission batch.
+
+    One entry of the selection's ``withheld`` list: the admission-denial
+    envelope the create would have answered with, or ``code="outranked"`` for a
+    candidate that fits on its own but not after the grants made ahead of it.
+    Read as leniently as a 409 body (``_envelope_fields``): a field that is
+    absent or of the wrong type is ``None``, and an absent verdict reads as
+    retryable, as the contract requires.
+    """
+
+    detail: Optional[str] = None
+    code: Optional[str] = None
+    app_retryable: Optional[bool] = None
+    not_before: Optional[datetime] = None
+
+    @property
+    def outranked(self) -> bool:
+        return self.code == OUTRANKED_CODE
+
+    def as_denial(self) -> LeaseAttempt:
+        """This withhold as the 409 the create would have returned."""
+        return LeaseAttempt(
+            status=LEASE_DENIED_STATUS, detail=self.detail, code=self.code,
+            app_retryable=self.app_retryable, not_before=self.not_before,
+        )
+
+
+@dataclass(frozen=True)
+class AdmissionSelection:
+    """The app's answer to one admission batch.
+
+    ``granted`` is the order to grant in -- the app's ranking, which the
+    controller must not re-sort.  ``withheld`` is keyed by pod uid.
+    """
+
+    granted: list[str]
+    withheld: dict[str, AdmissionWithheld]
+
+
+def _withheld_entries(entries: list) -> dict[str, AdmissionWithheld]:
+    """The selection's ``withheld`` list by pod uid, skipping what cannot be read.
+
+    An entry that is not an object, or names no uid, is dropped: its candidate
+    is then simply not granted, which is what the app said.
+    """
+    withheld: dict[str, AdmissionWithheld] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        uid = entry.get("pod_uid")
+        if not isinstance(uid, str) or not uid:
+            continue
+        code, retryable, not_before = _envelope_fields(entry)
+        detail = entry.get("detail")
+        withheld.setdefault(uid, AdmissionWithheld(
+            detail=_clip_detail(detail) if isinstance(detail, str) and detail else None,
+            code=code, app_retryable=retryable, not_before=not_before,
+        ))
+    return withheld
 
 
 async def _attach_trace(request: httpx.Request) -> None:
@@ -435,16 +527,17 @@ class ReservationClient:
 
     async def select_ondemand_admissions(
         self, req: OnDemandAdmissionRequest
-    ) -> Optional[list[str]]:
+    ) -> Optional[AdmissionSelection]:
         """Ask the app which pending pods to grant JIT on-demand admission.
 
-        Returns the granted pod UIDs (possibly empty — the app may deliberately
-        grant none), or ``None`` on any failure (endpoint missing on an older
-        app, network error, non-2xx, unparseable body).  A ``None`` return tells
-        the caller to fall back to granting every offered candidate (today's
-        greedy per-pod behaviour); an empty list is a deliberate app decision and
-        is respected.  Degrades like the other client calls so a transient
-        failure never strands the admission batch.
+        Returns the app's :class:`AdmissionSelection` -- the pod UIDs to grant,
+        **in the order to grant them** (possibly none: the app may deliberately
+        grant nothing), and why it withheld each of the rest -- or ``None`` on
+        any failure (endpoint missing on an older app, network error, non-2xx,
+        unparseable body).  A ``None`` return tells the caller to fall back to
+        granting the candidates itself; an empty grant is a deliberate app
+        decision and is respected.  Degrades like the other client calls so a
+        transient failure never strands the admission batch.
         """
         try:
             resp = await self._client.post(
@@ -453,7 +546,11 @@ class ReservationClient:
                 timeout=15.0,
             )
             resp.raise_for_status()
-            return OnDemandAdmissionResponse.model_validate(resp.json()).granted_pod_uids
+            parsed = OnDemandAdmissionResponse.model_validate(resp.json())
+            return AdmissionSelection(
+                granted=list(parsed.granted_pod_uids),
+                withheld=_withheld_entries(parsed.withheld),
+            )
         except httpx.HTTPStatusError as exc:
             log.warning("%s", kv(
                 event="api.admission_selection_failed", status=exc.response.status_code,

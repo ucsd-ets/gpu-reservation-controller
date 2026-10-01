@@ -228,10 +228,13 @@ Allocation of the cluster to "courses" (as well as projects, labs, etc.) is done
   GPU classes explicitly linked to it, or any class flagged `attach_all_groups`.
   This controls *which hardware tiers* a course sees.
 - **Per-group GPU ceiling** (`usage_group_gpu_limits`) — `max_gpus` cap per
-  (group, class) over an optional date span. `max_gpus=0` disables a class for
-  that group. Same narrowest-span-wins overlap resolution → supports a temporary
-  "deadline-week boost" overriding a semester-long baseline cap. This is the
-  **course's share** of the cluster.
+  (group, class) over an optional date span. `max_gpus=0` gives the group no
+  allocation of its own on the class — not a block: where borrowing applies it
+  can still take idle headroom, like any group past its ceiling (§9). Detaching
+  the class keeps a group off it, or, for an `attach_all_groups` class, a 0 with
+  borrowing off for the group. Same narrowest-span-wins overlap resolution →
+  supports a temporary "deadline-week boost" overriding a semester-long baseline
+  cap. This is the **course's share** of the cluster.
   - Effective hourly availability for a member =
     `min(cluster_capacity − peak_reserved, group_ceiling − group_peak_reserved)`.
     "Peak" = maximum concurrent GPUs across any one-hour bucket in the requested
@@ -399,6 +402,59 @@ window — while timing policy (15-minute lead, whole-hour grid, 48-hour cap,
 `min/max_days_ahead`) does not apply. Denials return 409; requests are
 idempotent on an `idempotency_key`.
 
+**When on-demand asks contend.** A create is judged alone, against the calendar
+as it stands. The controller therefore first offers its whole batch of pending
+pods to `POST /api/reservations/ondemand-admission`, which judges each candidate
+by the create's own gates against the calendar plus the leases granted ahead of
+it in the same batch, and answers with the grants in the order to make them. The
+order is a **ranking by how much of its allocation each scope holds**, and it
+exists for one commitment: *a course within its allocation goes ahead of use
+beyond an allocation.* It promises precedence, never availability — idle
+capacity is still lent to whoever asks. The keys, most significant first:
+
+1. **Best-effort asks after every guaranteed one.** They hold no calendar
+   capacity, and they are the first thing reclaimed.
+2. **Asks that fit within every ceiling of their scope** — group and cohort
+   alike — before asks that fit only because borrowing raises one. This is the
+   gate's own test, the one that decides whether an admission records
+   `borrowed_gpus > 0`, and it is the commitment itself.
+3. **The binding cohort's share** — GPUs of the class its groups hold, over the
+   cohort's ceiling. A group with no binding cohort stands at this level alone,
+   its own share in the cohort's place.
+4. **The group's share** — GPUs of the class it holds, over its ceiling after
+   approved loans.
+5. **The GPUs of the class the ask's user holds**, fewest first.
+6. **Pod age**, oldest first.
+
+A scope's holdings are the peak concurrent GPUs of its active bookings and
+leases over **one window common to the whole batch** — from now to
+`site_settings.ondemand_ranking_window_minutes` ahead (default 30; `0` reads the
+present instant only) — so a shorter declared runtime cannot improve a rank;
+each lease's feasibility is still judged over its own span. A share is read
+*before* the ask, so a multi-GPU ask is not ranked below a single-GPU one from an
+equally loaded scope. A scope with no ceiling is read against the next tier that
+binds it — a group against its cohort's ceiling, a cohort against the class's
+physical capacity — and a **zero ceiling ranks last**: it is the lowest priority,
+not a block. The grants are made one at a time and every standing is read again
+after each, so a scope's rank falls as it is served; an ask that no longer fits
+is passed over, not waited for, so a two-GPU ask can wait while one-GPU asks
+behind it are granted. A candidate that would fit on its own but lost its
+capacity to grants ahead of it is withheld as `outranked` and offered again in
+every batch, whatever its retry cooldown, until it is admitted or its pod goes
+away. The order is deterministic.
+
+What the ranking cannot reach is capacity already held: a reservation admitted
+earlier by borrowing keeps its GPUs until it ends (bounded by the borrowing
+horizon, and by the class's near buffer), and a pod running past its guarantee
+holds a GPU with no reservation behind it, which the app does not see — its
+scope reads as *less* loaded than it is. Where group or cohort ceilings are
+over-committed, every contender can be within its own ceiling and the ranking
+spreads the shortfall by share rather than keeping a promise.
+`ONDEMAND_DELEGATE_ADMISSION=false` on the controller, or the call failing, falls
+back to creation order: the controller makes the creates itself, oldest pod
+first, and a refused candidate waits out its cooldown before it is asked about
+again.
+
 Two per-group flags qualify that symmetry, both default off and both
 administrator-only. `usage_groups.on_demand_only` makes the group
 **one-directional**: it accepts leases on this path and refuses web bookings
@@ -437,13 +493,25 @@ Consequences for the scheduling model:
 
 ## 8. What is NOT modeled (gaps for OR guidance)
 
-- **No priorities, weights, or preemption** between users or groups.
-- **No fairness mechanism** (no proportional sharing, max-min fairness, lottery,
-  or aging) — purely FCFS within static per-group ceilings.
+- **No priorities, weights, or preemption** between users or groups on the
+  booking path. Two orderings exist, both at a margin: contending on-demand asks
+  are ranked by how much of its allocation each group and cohort holds (§7.1),
+  and when the controller reclaims GPUs from pods past their runtime guarantee it
+  takes best-effort pods first, then leases, then bookings, at random within
+  each.
+- **No fairness mechanism for bookings** (no proportional sharing, max-min
+  fairness, lottery, or aging) — purely FCFS within static per-group ceilings, in
+  the order bookings are submitted. The on-demand ranking is the one exception:
+  weighted max-min over the ceilings, applied only among asks that contend at the
+  same time, and carrying nothing forward — a scope that stayed away holds
+  nothing and is owed nothing.
 - **No dynamic pricing or quota adjustment** — SU rates and discount schedules
   are static admin-set values; group GPU ceilings are static (date-span overrides
   aside).
-- **No waitlist / queue** — no demand signal is captured when potential bookings are turned away
+- **No waitlist for bookings** — a refused booking is not queued; the denial is
+  logged with its gate's code, which is the only demand signal it leaves. On-demand
+  pods are the exception: the controller keeps a pending pod as a candidate and
+  asks again until it is admitted or deleted.
 - **No per-user-per-day GPU cap** (`max_gpus_per_user_per_day` is a documented
   deferred feature in CLAUDE.md).
 - Concurrency limits are on **peak instantaneous GPU count** and **SU budget**
@@ -521,8 +589,12 @@ something a class acquires by default.
 3. Whether an off-peak discount multiplier schedule effectively redistributes
    load, or whether deadline-driven demand is inelastic to pricing signals.
 4. Whether the first-come-first-served model with per-group ceilings achieves
-   adequate fairness, or whether a max-min fair share or lottery mechanism would
-   better serve a multi-course lab environment.
+   adequate fairness for bookings, or whether a max-min fair share or lottery
+   mechanism would better serve a multi-course lab environment; and whether the
+   on-demand ranking (§7.1) keeps its commitment in practice — how often an ask
+   within its allocation still loses to use beyond one, which it cannot reach
+   when that use is already held. `scripts/ondemand_commitment_report.py` in the
+   app repository counts it.
 5. Whether `su_anchor_mode = since_creation`, `weekly`, or `quarterly` gives better incentive
    alignment near assignment deadlines compared to the renewable-ceiling (`open`)
    default, and how the cancellation-penalty knobs (window / divisor / cap, see
