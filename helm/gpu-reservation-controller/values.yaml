@@ -155,13 +155,26 @@ config:
   # 0 disables the fallback: such a pod is left Pending, as before.
   defaultMinimumRuntimeSeconds: 0
 
-  # Usage group to assume for a pod that names none.  With requiredGroupLabel
-  # set this stands in for the missing *label* — the pod matches that group's
-  # reservations exactly as if it carried it, and a JIT lease for the pod is
-  # created under that group.  With requiredGroupLabel empty it stands in for a
-  # missing galends/usage-group annotation (the JIT lease's group only).  Leave
-  # empty to disable the fallback.
+  # Usage groups, in priority order, to assume for a pod that names none: the
+  # pod gets the first one its owner may use -- a group they are a member of,
+  # or one with on_demand_auto_join set, which admits anyone (so it belongs
+  # last).  Only membership is checked, never validity dates or budgets.  With
+  # requiredGroupLabel set the chosen group stands in for the missing *label* —
+  # the pod matches that group's reservations exactly as if it carried it, and
+  # a JIT lease for the pod is created under that group.  With
+  # requiredGroupLabel empty it stands in for a missing galends/usage-group
+  # annotation (the JIT lease's group only).  Either a YAML list or a
+  # comma-separated string; a single name is a list of one.  Leave empty to
+  # disable the fallback.
+  #   defaultUsageGroup: [faculty-research, grad-research, dsmlp-public]
+  # (With --set, use a list index -- --set config.defaultUsageGroup[0]=a -- or
+  # escape the commas, since --set splits on them: 'config.defaultUsageGroup=a\,b'.)
   defaultUsageGroup: ""
+
+  # Seconds the defaultUsageGroup groups' memberships are cached for before
+  # being re-read from the reservation app (GET /api/groups): how long a
+  # membership change can take to change which group a user's pods fall back to.
+  defaultUsageGroupRefreshInterval: 14400
 
   # Minutes before an upcoming reservation slot boundary that the preemption
   # sweep's phase-A pass runs (proactively frees capacity from overstaying

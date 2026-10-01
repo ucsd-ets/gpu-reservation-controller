@@ -124,7 +124,7 @@ RELINK_EVENTS: list[tuple] = []
 def _run_cancellations(m, state, config, cancelled, now):
     """Plan under the lock, execute outside it — the shape the reconcile uses."""
     async def _go():
-        snapshot = await m._snapshot_pods_for_eviction(config)
+        snapshot = await m._snapshot_pods_for_eviction(state, config)
         async with state.reservation_lock:
             evictions = await m._plan_cancelled_reservations(
                 state, config, cancelled, now, snapshot
@@ -252,7 +252,7 @@ class TestSnapshotCarriesTheGroupLabel:
         seen = self._capture(
             monkeypatch,
             state,
-            lambda m: m._snapshot_pods_for_eviction(config),
+            lambda m: m._snapshot_pods_for_eviction(state, config),
         )
         assert seen["group_label_key"] == "dsmlp/course"
 
@@ -262,7 +262,7 @@ class TestSnapshotCarriesTheGroupLabel:
         seen = self._capture(
             monkeypatch,
             state,
-            lambda m: m._snapshot_pods_for_eviction(config),
+            lambda m: m._snapshot_pods_for_eviction(state, config),
         )
         assert seen["group_label_key"] == "dsmlp/course"
 
@@ -272,6 +272,22 @@ class TestSnapshotCarriesTheGroupLabel:
         seen = self._capture(
             monkeypatch,
             state,
-            lambda m: m._snapshot_pods_for_eviction(_config()),
+            lambda m: m._snapshot_pods_for_eviction(state, _config()),
         )
         assert seen["group_label_key"] is None
+
+    def test_the_default_group_resolver_rides_along(self, monkeypatch):
+        """A pod admitted under a DEFAULT_USAGE_GROUP fallback must read back
+        carrying it, for the same reason the label key must be passed -- and
+        since the fallback is per user, what is passed is the state's resolver,
+        not a group name."""
+        state = ControllerState()
+        config = _config(
+            required_group_label="dsmlp/course", default_usage_groups=("cse151b",)
+        )
+        seen = self._capture(
+            monkeypatch,
+            state,
+            lambda m: m._snapshot_pods_for_eviction(state, config),
+        )
+        assert seen["group_label_default"] == state.default_usage_group_for

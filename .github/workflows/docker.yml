@@ -98,7 +98,8 @@ jobs:
             --set imagePullSecrets[0].name=ghcr-pull-secret \
             --set inboundApiTokenSecret.name=controller-inbound-token \
             --set config.requiredGroupLabel=dsmlp/course \
-            --set config.defaultUsageGroup=cse151b \
+            --set 'config.defaultUsageGroup[0]=cse151b' \
+            --set 'config.defaultUsageGroup[1]=dsmlp-public' \
             --set config.podSchedulingGateName=gpu-reservation \
             --set config.timezone=America/Los_Angeles \
             --set config.supportContact=gpu-help@example.edu \
@@ -107,7 +108,9 @@ jobs:
           grep -q 'name: ghcr-pull-secret' /tmp/rendered-full.yaml
           grep -q 'INBOUND_API_TOKEN' /tmp/rendered-full.yaml
           grep -q 'REQUIRED_GROUP_LABEL' /tmp/rendered-full.yaml
-          grep -q 'DEFAULT_USAGE_GROUP' /tmp/rendered-full.yaml
+          grep -q 'name: DEFAULT_USAGE_GROUP$' /tmp/rendered-full.yaml
+          # A YAML list is joined into the comma-separated order the controller parses.
+          grep -q 'value: "cse151b,dsmlp-public"' /tmp/rendered-full.yaml
           grep -q 'SUPPORT_CONTACT' /tmp/rendered-full.yaml
 
       # The chart's one `required` guard. Asserting it fires keeps it from

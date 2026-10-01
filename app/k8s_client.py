@@ -1051,7 +1051,7 @@ class ToleratedPodInfo:
 async def snapshot_tolerated_pods(
     toleration_key: str,
     group_label_key: Optional[str] = None,
-    group_label_default: Optional[str] = None,
+    group_label_default: Optional[Callable[[str], Optional[str]]] = None,
 ) -> list[ToleratedPodInfo]:
     """Return one ``ToleratedPodInfo`` per pod carrying a *toleration_key* toleration.
 
@@ -1064,10 +1064,13 @@ async def snapshot_tolerated_pods(
     *group_label_key* (the configured REQUIRED_GROUP_LABEL, when enabled) names
     an additional pod label whose value is captured into
     ``ToleratedPodInfo.group_label``; unset ⇒ the field stays None.
-    *group_label_default* (the configured DEFAULT_USAGE_GROUP) stands in when the
-    pod carries no value for that label — it must be passed wherever routing
-    applies the same default, or a pod admitted under the default group would
-    read back as group-less and `_group_ok` would reject every reservation for it.
+    *group_label_default* resolves the group that stands in when the pod carries
+    no value for that label: called with the pod's namespace, it returns the
+    DEFAULT_USAGE_GROUP entry that namespace's user falls back to (or None).  It
+    must be passed wherever routing applies the same fallback, or a pod admitted
+    under a default group would read back as group-less and `_group_ok` would
+    reject every reservation for it.  A callable rather than a name because the
+    fallback is per user; it must not do I/O, being called once per pod.
     """
     log.debug("%s", kv(event="k8s.list_pods", selector="gpu-class", purpose="tolerated_snapshot"))
     pod_list = await _run(
@@ -1097,7 +1100,14 @@ async def snapshot_tolerated_pods(
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
                 deletion_timestamp=pod.metadata.deletion_timestamp,
                 group_label=(
-                    (labels.get(group_label_key) or group_label_default)
+                    (
+                        labels.get(group_label_key)
+                        or (
+                            group_label_default(pod.metadata.namespace)
+                            if group_label_default is not None
+                            else None
+                        )
+                    )
                     if group_label_key
                     else None
                 ),

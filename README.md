@@ -176,6 +176,23 @@ for the `REQUIRED_GROUP_LABEL` label *wholesale* — the pod also matches that
 group's reservations in step 1 — so it is a statement about which group
 unlabelled workloads belong to, not merely a JIT lease detail.
 
+`DEFAULT_USAGE_GROUP` is a comma-separated list, tried in order **per user**:
+the pod's owner gets the first listed group they are a member of (any role), or
+the first group with `on_demand_auto_join` set, which admits anyone — the app
+enrols them on their first lease, so such a group is the natural last entry.
+For example, `DEFAULT_USAGE_GROUP=faculty-research,grad-research,dsmlp-public`
+puts a faculty member's unlabelled pods under `faculty-research`, a graduate
+student's under `grad-research`, and everyone else's under the auto-join
+`dsmlp-public`.  Only membership is checked — never a group's validity dates,
+SU budget or class access, which the app still judges on the reservation — so
+list standing groups rather than term-limited ones.  A user no listed group
+admits gets no group, and the pod is left Pending with a `NoReservation` Event
+saying so.  Membership is read from `GET /api/groups` and cached for
+`DEFAULT_USAGE_GROUP_REFRESH_INTERVAL` (default 4 hours), so a membership change
+can take that long to take effect; each refresh logs the resolved order
+(`default_group.loaded`) and warns about any listed group the app does not have
+or has deactivated (`default_group.unusable`).
+
 **Batch admission** — each attempt gathers all due candidates, vets each
 (re-routing, the guards below, and resolving its `gpu-class` label to a numeric
 `gpu_class_id`), and offers the whole eligible set to the app in one call
@@ -216,7 +233,7 @@ reservation rather than creating a duplicate.
   fault, and is also told to the pod as a `Warning` Event
   (`reason=OnDemandLeaseRejected`) carrying the app's reason, the user and
   usage group that were sent, where the group came from (label, annotation or
-  `DEFAULT_USAGE_GROUP`), and any booking the user holds under another group.
+  chosen from `DEFAULT_USAGE_GROUP`), and any booking the user holds under another group.
   Rides `ONDEMAND_DENIAL_EVENT_ENABLED`.
 - **Granted**: the pod is admitted under the new reservation immediately,
   through the same admission path as any reserved-path pod (stamps
@@ -630,7 +647,8 @@ All settings are supplied via environment variables.
 | `HEADROOM_CHECK_INTERVAL` | no | `600` | Seconds between headroom evaluations. Headroom rides the preemption sweep but is throttled to this slower cadence, so an otherwise-idle cluster is not LISTed on `PREEMPTION_CHECK_INTERVAL` just to re-check headroom. Kill latency is therefore between `HEADROOM_NOTICE_MINUTES` and `HEADROOM_NOTICE_MINUTES` + this interval after a pod is warned |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
 | `DEFAULT_MINIMUM_RUNTIME_SECONDS` | no | `0` | Minimum runtime to assume for a pod that carries no usable `galends/minimum-runtime-seconds` annotation, so it can still be JIT-eligible. `0` disables the fallback (such a pod is left Pending, the historical behaviour) |
-| `DEFAULT_USAGE_GROUP` | no | *(absent)* | Usage group to assume for a pod that names none. With `REQUIRED_GROUP_LABEL` set it stands in for the missing **label** — the pod matches that group's reservations on the reserved path exactly as if it carried the label, and a JIT lease for it is created under that group. With the label feature off it stands in for a missing `galends/usage-group` **annotation** (the JIT lease's group only). Unset disables the fallback |
+| `DEFAULT_USAGE_GROUP` | no | *(absent)* | Comma-separated usage groups, in priority order, to assume for a pod that names none: the pod gets the **first one its owner may use** — a group they are a member of, or one with `on_demand_auto_join` set, which admits anyone. Only membership is checked, not validity dates, budget or class access. With `REQUIRED_GROUP_LABEL` set the chosen group stands in for the missing **label** — the pod matches that group's reservations on the reserved path exactly as if it carried the label, and a JIT lease for it is created under that group. With the label feature off it stands in for a missing `galends/usage-group` **annotation** (the JIT lease's group only). A single name works as before. Unset disables the fallback |
+| `DEFAULT_USAGE_GROUP_REFRESH_INTERVAL` | no | `14400` | Seconds the `DEFAULT_USAGE_GROUP` groups' memberships are cached for (re-read from `GET /api/groups`, checked on each reservation fetch cycle), i.e. how long a membership change can take to change which group a user's pods fall back to |
 | `SINGLETON_LEASE_ENABLED` | no | `true` | Hold a `coordination.k8s.io` Lease so a **second** controller instance refuses to run (two would issue duplicate toleration patches). A duplicate-instance guard, not leader election: there is no waiting to take over. Startup aborts (non-zero exit, kubelet backs off and retries) if another live instance holds the lease; if the coordination API is unreachable — e.g. an upgrade whose ClusterRole predates the leases rule — the controller logs a warning and runs unguarded. Set to `false` to disable |
 | `K8S_TLS_STRICT_VERIFY` | no | `true` | OpenSSL strict X.509 verification on the connection to the Kubernetes API server. Python 3.13 enables these checks by default, and they require an Authority Key Identifier extension on the certificates the chain runs through — a cluster PKI built by older tooling may not carry one, and every API call then fails with `CERTIFICATE_VERIFY_FAILED ... Missing Authority Key Identifier` despite a correctly mounted service-account `ca.crt`. Regenerating the apiserver certificate with an AKID is the real fix; `false` is the escape hatch until then, and logs `k8s.tls_relaxed` at WARNING on every startup. **Not** `insecure-skip-tls-verify`: the chain is still verified against the mounted CA, validity dates still apply, and the hostname is still matched |
 | `POD_NAME` | no | *(hostname)* | This pod's name, from the downward API; used as the singleton Lease holder identity. Falls back to `HOSTNAME`, then the system hostname |
@@ -639,7 +657,8 @@ All settings are supplied via environment variables.
 | `LIBRARY_LOG_LEVEL` | no | `WARNING` | Logging level for the HTTP and Kubernetes client libraries (`httpx`, `httpcore`, `urllib3`, `kubernetes`), whose verbose output is raw API request/response traces — so `LOG_LEVEL=DEBUG` shows the controller's own DEBUG events without them. Can only quieten the libraries below `LOG_LEVEL`, never raise them above it; set both to `DEBUG` to see the raw traces. An unknown level logs `config.invalid` and falls back |
 
 > **Security note:** The controller needs a **`read_write`**-scoped service
-> key: besides the read endpoints (`/api/reservations`, `/api/gpu-classes`),
+> key: besides the read endpoints (`/api/reservations`, `/api/gpu-classes`, and
+> `/api/groups` when `DEFAULT_USAGE_GROUP` is set),
 > it calls `POST /api/reservations` (JIT lease requests) and
 > `POST /api/reservations/{id}/cancel` (no-show / controller-revoked cancels).
 > Always inject the key from a Kubernetes Secret rather than baking it into an

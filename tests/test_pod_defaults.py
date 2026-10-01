@@ -12,6 +12,11 @@ default.
 stand-ins.  Both ship disabled (``0`` / unset), so an unconfigured deployment
 behaves exactly as before — which the "no default" cases below pin.
 
+``DEFAULT_USAGE_GROUP`` is an ordered list resolved per user against the
+listed groups' rosters; here the pod's owner is a member of every listed group,
+so the stand-in behaviour is what is under test.  The per-user walk itself is
+``tests/test_default_group_fallback.py``.
+
 Drives ``pod_watch_loop`` with a fake watcher, mirroring
 ``tests/test_jit_group_source.py``.
 """
@@ -23,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.config import Config
-from app.controller import ControllerState
+from app.controller import ControllerState, DefaultGroupRoster
 
 from tests.conftest import (
     GPU_CLASS_ID,
@@ -83,8 +88,21 @@ def _pod(uid: str, *, labels: dict | None = None, annotations: dict | None = Non
     )
 
 
-def _run_watch(monkeypatch, m, config, pod, state=None):
-    """Feed one ADDED event through pod_watch_loop with the admission batch stubbed."""
+def _roster(name: str = GROUP_NAME, *, members=(USERNAME,), auto_join=False, active=True):
+    """One DEFAULT_USAGE_GROUP entry as the app would describe it."""
+    return DefaultGroupRoster(
+        name=name, group_id=1, is_active=active, auto_join=auto_join,
+        members=frozenset(members),
+    )
+
+
+def _run_watch(monkeypatch, m, config, pod, state=None, rosters=None):
+    """Feed one ADDED event through pod_watch_loop with the admission batch stubbed.
+
+    *rosters* stand in for the last GET /api/groups: by default the pod's owner
+    is a member of every configured default group, which is the case the
+    stand-in tests below are about (the per-user walk has its own tests).
+    """
 
     async def _no_admission(*args, **kwargs):
         pass
@@ -94,6 +112,10 @@ def _run_watch(monkeypatch, m, config, pod, state=None):
 
     state = state if state is not None else ControllerState()
     state.required_group_label = config.required_group_label
+    state.default_usage_groups = config.default_usage_groups
+    if rosters is None:
+        rosters = [_roster(name) for name in config.default_usage_groups]
+    state.default_group_rosters = {r.name: r for r in rosters}
     asyncio.run(m.pod_watch_loop(state, None, config))
     return state
 
@@ -126,7 +148,7 @@ class TestDefaultMinimumRuntime:
         m = _main_module(monkeypatch)
         pod = _pod("uid-3")
         config = _config(
-            default_min_runtime_seconds=900, default_usage_group=GROUP_NAME
+            default_min_runtime_seconds=900, default_usage_groups=(GROUP_NAME,)
         )
         state = _run_watch(monkeypatch, m, config, pod)
 
@@ -180,7 +202,7 @@ class TestDefaultUsageGroupWithLabelFeatureOn:
         m = _main_module(monkeypatch)
         pod = _pod("uid-7", annotations={MIN_RUNTIME: "600"})
         config = _config(
-            required_group_label=GROUP_LABEL_NAME, default_usage_group=GROUP_NAME
+            required_group_label=GROUP_LABEL_NAME, default_usage_groups=(GROUP_NAME,)
         )
         state = _run_watch(monkeypatch, m, config, pod)
 
@@ -196,7 +218,7 @@ class TestDefaultUsageGroupWithLabelFeatureOn:
             annotations={MIN_RUNTIME: "600"},
         )
         config = _config(
-            required_group_label=GROUP_LABEL_NAME, default_usage_group=GROUP_NAME
+            required_group_label=GROUP_LABEL_NAME, default_usage_groups=(GROUP_NAME,)
         )
         state = _run_watch(monkeypatch, m, config, pod)
 
@@ -222,7 +244,7 @@ class TestDefaultUsageGroupWithLabelFeatureOn:
         ]
         pod = _pod("uid-9", annotations={MIN_RUNTIME: "600"})
         config = _config(
-            required_group_label=GROUP_LABEL_NAME, default_usage_group=GROUP_NAME
+            required_group_label=GROUP_LABEL_NAME, default_usage_groups=(GROUP_NAME,)
         )
 
         # The window is already open, so the fast path fires; stub the patch.
@@ -253,7 +275,7 @@ class TestDefaultUsageGroupWithLabelFeatureOn:
         ]
         pod = _pod("uid-10", annotations={MIN_RUNTIME: "600"})
         config = _config(
-            required_group_label=GROUP_LABEL_NAME, default_usage_group=GROUP_NAME
+            required_group_label=GROUP_LABEL_NAME, default_usage_groups=(GROUP_NAME,)
         )
         _run_watch(monkeypatch, m, config, pod, state=state)
 
@@ -265,7 +287,7 @@ class TestDefaultUsageGroupWithLabelFeatureOff:
     def test_default_stands_in_for_a_missing_annotation(self, monkeypatch):
         m = _main_module(monkeypatch)
         pod = _pod("uid-11", annotations={MIN_RUNTIME: "600"})
-        config = _config(default_usage_group=GROUP_NAME)
+        config = _config(default_usage_groups=(GROUP_NAME,))
         state = _run_watch(monkeypatch, m, config, pod)
 
         candidate = state.ondemand_candidates["uid-11"]
@@ -279,7 +301,7 @@ class TestDefaultUsageGroupWithLabelFeatureOff:
             "uid-12",
             annotations={MIN_RUNTIME: "600", USAGE_GROUP: "annotated-group"},
         )
-        config = _config(default_usage_group=GROUP_NAME)
+        config = _config(default_usage_groups=(GROUP_NAME,))
         state = _run_watch(monkeypatch, m, config, pod)
 
         assert state.ondemand_candidates["uid-12"].usage_group == "annotated-group"
@@ -291,23 +313,27 @@ class TestDefaultUsageGroupWithLabelFeatureOff:
 
 
 class TestSnapshotAppliesTheGroupDefault:
-    """A pod admitted under the default group must read back carrying it.
+    """A pod admitted under a default group must read back carrying it.
 
     ``ToleratedPodInfo.group_label`` feeds ``_group_ok`` through
     ``PodRuntimeView``.  If the snapshot reported ``None`` for a pod routing had
-    treated as the default group, every reservation would be rejected for it —
+    treated as a default group, every reservation would be rejected for it —
     adoption and the JIT-lease merge could never find a booking to carry it onto,
     and it would be evicted instead.
+
+    The fallback is per user, so what the snapshot is handed is a resolver,
+    called with each labelless pod's namespace -- ``state.default_usage_group_for``
+    in production.
     """
 
-    def _snapshot(self, monkeypatch, pod, *, key, default):
+    def _snapshot(self, monkeypatch, pods, *, key, default):
         from app import k8s_client
 
         monkeypatch.setattr(
             k8s_client,
             "_core_v1",
             SimpleNamespace(
-                list_pod_for_all_namespaces=lambda **kw: SimpleNamespace(items=[pod])
+                list_pod_for_all_namespaces=lambda **kw: SimpleNamespace(items=pods)
             ),
         )
         return asyncio.run(
@@ -316,12 +342,12 @@ class TestSnapshotAppliesTheGroupDefault:
             )
         )
 
-    def _tolerated_pod(self, labels: dict):
+    def _tolerated_pod(self, labels: dict, *, namespace: str = USERNAME, uid: str = "uid-20"):
         return SimpleNamespace(
             metadata=SimpleNamespace(
-                uid="uid-20",
-                name="pod-uid-20",
-                namespace=USERNAME,
+                uid=uid,
+                name=f"pod-{uid}",
+                namespace=namespace,
                 labels={"gpu-class": GPU_CLASS_LABEL, **labels},
                 annotations={"galends/booking-reference": "res-1"},
                 deletion_timestamp=None,
@@ -348,30 +374,72 @@ class TestSnapshotAppliesTheGroupDefault:
     def test_default_fills_in_for_a_labelless_pod(self, monkeypatch):
         out = self._snapshot(
             monkeypatch,
-            self._tolerated_pod({}),
+            [self._tolerated_pod({})],
             key=GROUP_LABEL_NAME,
-            default=GROUP_NAME,
+            default=lambda namespace: GROUP_NAME,
         )
         assert out[0].group_label == GROUP_NAME
 
-    def test_the_pods_own_label_wins(self, monkeypatch):
+    def test_each_pod_gets_its_own_owners_default(self, monkeypatch):
+        # Two labelless pods, two users, two different fallbacks: the resolver
+        # is asked per pod, with that pod's namespace.
+        state = ControllerState()
+        state.default_usage_groups = ("research-a", "dsmlp-public")
+        state.default_group_rosters = {
+            "research-a": _roster("research-a", members=("bob",)),
+            "dsmlp-public": _roster("dsmlp-public", members=(), auto_join=True),
+        }
         out = self._snapshot(
             monkeypatch,
-            self._tolerated_pod({GROUP_LABEL_NAME: "cse251a"}),
+            [
+                self._tolerated_pod({}, namespace="bob", uid="uid-b"),
+                self._tolerated_pod({}, namespace="carol", uid="uid-c"),
+            ],
             key=GROUP_LABEL_NAME,
-            default=GROUP_NAME,
+            default=state.default_usage_group_for,
+        )
+        assert {p.namespace: p.group_label for p in out} == {
+            "bob": "research-a",
+            "carol": "dsmlp-public",
+        }
+
+    def test_the_pods_own_label_wins(self, monkeypatch):
+        asked: list[str] = []
+
+        def _default(namespace):
+            asked.append(namespace)
+            return GROUP_NAME
+
+        out = self._snapshot(
+            monkeypatch,
+            [self._tolerated_pod({GROUP_LABEL_NAME: "cse251a"})],
+            key=GROUP_LABEL_NAME,
+            default=_default,
         )
         assert out[0].group_label == "cse251a"
+        assert asked == []  # a pod with its own label never needs the fallback
 
     def test_no_default_leaves_it_none(self, monkeypatch):
         out = self._snapshot(
-            monkeypatch, self._tolerated_pod({}), key=GROUP_LABEL_NAME, default=None
+            monkeypatch, [self._tolerated_pod({})], key=GROUP_LABEL_NAME, default=None
+        )
+        assert out[0].group_label is None
+
+    def test_a_user_no_default_admits_reads_back_none(self, monkeypatch):
+        out = self._snapshot(
+            monkeypatch,
+            [self._tolerated_pod({})],
+            key=GROUP_LABEL_NAME,
+            default=lambda namespace: None,
         )
         assert out[0].group_label is None
 
     def test_feature_off_ignores_the_default(self, monkeypatch):
         # The group *match axis* is off, so the field stays None regardless.
         out = self._snapshot(
-            monkeypatch, self._tolerated_pod({}), key=None, default=GROUP_NAME
+            monkeypatch,
+            [self._tolerated_pod({})],
+            key=None,
+            default=lambda namespace: GROUP_NAME,
         )
         assert out[0].group_label is None

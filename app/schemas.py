@@ -104,6 +104,31 @@ class GpuClassDetail(GpuClassBrief):
         return self.total_gpus if self.effective_gpus_today is None else self.effective_gpus_today
 
 
+class GroupMemberBrief(UserBrief):
+    """One entry of a group's ``members`` (RESERVATION-API.md §6 GroupMemberBrief).
+
+    Membership is any role, as the app's own membership check reads it, so
+    ``role`` is carried but nothing here branches on it.
+    """
+
+    role: Optional[str] = None
+
+
+class GroupDetail(GroupBrief):
+    """Returned by GET /api/groups (RESERVATION-API.md §6 GroupResponse).
+
+    Only what ``DEFAULT_USAGE_GROUP``'s per-user fallback reads: whether the
+    group is live, whether it enrols anyone who asks (``on_demand_auto_join``),
+    and who belongs to it.  The rest of the payload -- policy fields, the full
+    GPU-class list -- is ignored.  The flags default the way an app predating
+    them behaves: active, and no auto-join.
+    """
+
+    is_active: bool = True
+    on_demand_auto_join: bool = False
+    members: list[GroupMemberBrief] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Inbound push API (POST /api/reservations/push)
 # ---------------------------------------------------------------------------

@@ -486,7 +486,7 @@ class TestLeaseRejected:
     @pytest.mark.parametrize("source,phrase", [
         ("label", f"from the pod's {GROUP_LABEL_NAME} label"),
         ("annotation", f"from the pod's {USAGE_GROUP} annotation"),
-        ("default", "the cluster's default usage group"),
+        ("default", "chosen from the cluster's default usage groups, as the pod names none"),
     ])
     def test_it_says_where_the_group_came_from(self, monkeypatch, source, phrase):
         m = _main_module(monkeypatch)

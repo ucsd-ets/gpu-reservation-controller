@@ -46,7 +46,7 @@ from fastapi.responses import JSONResponse
 
 from . import trace
 from .config import Config, timezone_label
-from .log_fields import kv, scrub
+from .log_fields import changes, kv, scrub
 from .controller import (
     PENDING_TOPIC_ANNOTATIONS,
     PENDING_TOPIC_HOLD,
@@ -63,6 +63,7 @@ from .controller import (
     QueueEntry,
     TerminationWarning,
     apply_push_to_active,
+    build_default_group_rosters,
     build_preemption_plan,
     canceller_description,
     free_gpus_by_node_class,
@@ -511,7 +512,7 @@ async def _reconcile_after_reservation_change(
 
     # One snapshot serves both planners, taken lazily — we only know whether it
     # is needed after detection, and detection happens under the lock.
-    pod_snapshot = await _snapshot_pods_for_eviction(config)
+    pod_snapshot = await _snapshot_pods_for_eviction(state, config)
 
     evictions: list[_PodEviction] = []
     # Mid-window cancellations: re-link each admitted pod onto another open
@@ -596,6 +597,68 @@ async def _refresh_reservations(
     await _execute_evictions(state, evictions)
 
 
+async def _refresh_default_group_rosters(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    now: datetime,
+) -> None:
+    """Reload the ``DEFAULT_USAGE_GROUP`` rosters, once they are due.
+
+    The fallback is per user -- a pod that names no group gets the first listed
+    group its owner may use -- so the controller needs each listed group's
+    members and ``on_demand_auto_join`` flag.  They come from one
+    ``GET /api/groups`` every ``DEFAULT_USAGE_GROUP_REFRESH_INTERVAL``, and every
+    resolution in between is an in-memory walk of the list
+    (``ControllerState.default_usage_group_for``): which is also what lets the
+    synchronous pod snapshot apply the fallback at all.  The cost is that a
+    membership change can take up to the interval to be seen.
+
+    Called at startup and on every reservation fetch cycle, so a failed refresh
+    is retried a fetch interval later rather than a refresh interval later; the
+    previous rosters stand meanwhile.  No lock: the rosters are replaced in one
+    assignment, and nothing reads them alongside the reservation set.
+
+    Each refresh logs one line per listed group -- ``default_group.loaded``, or
+    ``default_group.unusable`` at WARNING for a name the app has no group for or
+    whose group is inactive, which an operator has to fix.  Never raises: an
+    unexpected error is logged and the rosters left as they were.
+    """
+    if not config.default_usage_groups:
+        return
+    fetched_at = state.default_group_rosters_at
+    if fetched_at is not None and now - fetched_at < timedelta(
+        seconds=config.default_usage_group_refresh_interval
+    ):
+        return
+    try:
+        groups = await client.fetch_groups(config.default_usage_groups)
+        if groups is None:
+            return  # logged by the client; the previous rosters stand
+        rosters = build_default_group_rosters(config.default_usage_groups, groups)
+        state.default_group_rosters = rosters
+        state.default_group_rosters_at = now
+        for name in config.default_usage_groups:
+            roster = rosters.get(name)
+            if roster is None:
+                log.warning("%s", kv(
+                    event="default_group.unusable", name=name, reason="not_found",
+                ))
+            elif not roster.is_active:
+                log.warning("%s", kv(
+                    event="default_group.unusable", id=roster.group_id, name=name,
+                    reason="inactive",
+                ))
+            else:
+                log.info("%s", kv(
+                    event="default_group.loaded", id=roster.group_id, name=name,
+                    count=len(roster.members),
+                    reason="auto_join" if roster.auto_join else "members",
+                ))
+    except Exception as exc:  # noqa: BLE001
+        log.error("%s", kv(event="default_group.refresh_failed", err=exc), exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Cancellation and owner-change handlers
 #
@@ -616,7 +679,7 @@ class _PodEviction(NamedTuple):
     emit: Callable         # emit_reservation_{cancelled,reassigned}_event
 
 
-async def _snapshot_pods_for_eviction(config: Config) -> list:
+async def _snapshot_pods_for_eviction(state: ControllerState, config: Config) -> list:
     """One tolerated-pod snapshot, shared by both eviction planners.
 
     Taken lazily — only when a reconcile actually has something to evict.  A
@@ -626,12 +689,12 @@ async def _snapshot_pods_for_eviction(config: Config) -> list:
     required_group_label must be passed: without it every ToleratedPodInfo
     carries group_label=None, `_group_ok` then rejects every reservation while
     the feature is enabled, and the adoption re-link can never find a booking to
-    carry the pod onto.  default_usage_group rides along for the same reason: a
-    pod admitted under the default group must read back carrying it.
+    carry the pod onto.  The DEFAULT_USAGE_GROUP resolver rides along for the
+    same reason: a pod admitted under a default group must read back carrying it.
     """
     try:
         return await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, state.default_usage_group_for
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(
@@ -1078,7 +1141,9 @@ async def _preflight_ondemand_candidate(
     Runs the controller-owned eligibility checks (formerly steps 1-5 of
     ``_try_request_lease``):
 
-    1. Re-read the pod; drop if gone/terminal/Unknown.
+    1. Re-read the pod; drop if gone/terminal/Unknown.  Re-resolve a usage
+       group ``DEFAULT_USAGE_GROUP`` supplied, whose rosters may have refreshed
+       since; drop the candidate if no listed group admits its owner any more.
     2. Re-run the reserved-path routing check: a matching reservation may have
        appeared since the candidate was queued (a new booking, or simply time
        passing into the horizon) — route there instead of requesting a lease.
@@ -1109,7 +1174,8 @@ async def _preflight_ondemand_candidate(
 
     Returns one of:
     - ``(_PREFLIGHT_REMOVE, None)`` — drop the candidate (gone/terminal, routed
-      to the reserved queue, or blocked by something no lease can fix).
+      to the reserved queue, no longer admitted by any default group, or
+      blocked by something no lease can fix).
     - ``(_PREFLIGHT_RETRY, None)`` — keep it; ``candidate.next_attempt_at`` has
       been pushed forward (transient read error, conditions not yet set, a
       drained gpu-class, guard-3 interlock, a guard-4 or guard-5 hold, or
@@ -1151,6 +1217,37 @@ async def _preflight_with_fit(
             pod=candidate.pod_name, phase=phase, reason="terminal_phase",
         ))
         return _PREFLIGHT_REMOVE, None, None
+
+    # A group DEFAULT_USAGE_GROUP supplied is the owner's fallback *now*, not
+    # when the pod was first seen: the rosters behind it refresh while the pod
+    # waits.  A candidate that kept its first answer would ask under a group its
+    # owner has since left -- a structural denial, retried for as long as the
+    # pod lived -- or pass over one they have since joined.  Before step 2, which
+    # matches bookings on the group too.
+    if candidate.usage_group_source == "default":
+        resolved = state.default_usage_group_for(candidate.pod_namespace)
+        if resolved is None:
+            # No listed group admits the owner any more.  The pod is left to
+            # the next watch resync, which routes it as a pod with no group --
+            # and tells its owner so.
+            log.info("%s", kv(
+                event="ondemand.candidate_dropped", ns=candidate.pod_namespace,
+                pod=candidate.pod_name, reason="no_default_group",
+            ))
+            return _PREFLIGHT_REMOVE, None, None
+        if resolved != candidate.usage_group:
+            log.info("%s", kv(
+                event="ondemand.group_changed", ns=candidate.pod_namespace,
+                pod=candidate.pod_name,
+                **changes({"group": (candidate.usage_group, resolved)}),
+            ))
+            candidate.usage_group = resolved
+            if config.required_group_label:
+                candidate.group_label = resolved
+            # A different ask: what the app said about the old one -- a fault
+            # backoff, a place in the capacity queue -- does not carry over.
+            candidate.lease_error_count = 0
+            candidate.awaiting_capacity = False
 
     # Step 2: a matching reservation may have appeared since this candidate
     # was queued (or since its last attempt) — prefer it over requesting a
@@ -1661,7 +1758,7 @@ def _usage_group_source_phrase(source: Optional[str], config: Config) -> Optiona
     if source == "annotation":
         return f"from the pod's {USAGE_GROUP_ANNOTATION} annotation"
     if source == "default":
-        return "the cluster's default usage group, as the pod names none"
+        return "chosen from the cluster's default usage groups, as the pod names none"
     return None
 
 
@@ -2038,6 +2135,7 @@ def _ondemand_ineligibility(
     usage_group: Optional[str],
     problems: list[AnnotationProblem],
     has_usage_group_annotation: bool,
+    default_groups_known: bool = True,
 ) -> list[str]:
     """Why a Pending pod does not qualify for on-demand admission, one clause each.
 
@@ -2046,6 +2144,13 @@ def _ondemand_ineligibility(
     one), no usage group.  An ignored annotation is named in place of the
     "has none" clause it explains, so the owner reads what to correct rather
     than only what is missing.  Empty when the pod qualifies.
+
+    With ``DEFAULT_USAGE_GROUP`` configured, a pod with no group of its own is
+    also one whose owner none of the default groups admits -- said, so they do
+    not go looking for a label the cluster would have filled in for anyone
+    else, but only when *default_groups_known*: before the rosters load, it is
+    not known.  The groups are not named: they are the operator's, and a user
+    has no business learning the names of groups they are not in.
     """
     if not config.ondemand_lease_enabled:
         return ["on-demand admission is not enabled on this cluster"]
@@ -2075,6 +2180,8 @@ def _ondemand_ineligibility(
                 )
         else:
             clause = f"it has no {USAGE_GROUP_ANNOTATION} annotation naming its usage group"
+        if config.default_usage_groups and default_groups_known:
+            clause += ", and you are not a member of any of the cluster's default usage groups"
         reasons.append(clause)
     return reasons
 
@@ -2929,6 +3036,12 @@ async def reservation_fetch_loop(
                 # exc_info so an unexpected bug (e.g. a TypeError in merge
                 # arithmetic) is distinguishable from a transient API error (H2).
                 log.error("%s", kv(event="fetch.failed", err=exc), exc_info=True)
+            # Outside the try above: the rosters are a separate read, and a
+            # reservation fetch that failed says nothing about them.  A no-op
+            # until DEFAULT_USAGE_GROUP_REFRESH_INTERVAL has passed.
+            await _refresh_default_group_rosters(
+                state, client, config, datetime.now(timezone.utc)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3065,9 +3178,9 @@ async def pod_watch_loop(
     - ADDED, Pending, has ``galends/minimum-runtime-seconds`` annotation (or
       ``DEFAULT_MINIMUM_RUNTIME_SECONDS`` standing in for it), and names its usage
       group (the group label when REQUIRED_GROUP_LABEL is set, else the
-      ``galends/usage-group`` annotation, with ``DEFAULT_USAGE_GROUP`` standing in
-      for either — the lease ask's required ``group_name``) → add as a candidate
-      and attempt a lease request immediately
+      ``galends/usage-group`` annotation, with the first ``DEFAULT_USAGE_GROUP``
+      entry its owner may use standing in for either — the lease ask's required
+      ``group_name``) → add as a candidate and attempt a lease request immediately
     - MODIFIED carrying the scheduler's verdict (``PodScheduled`` now set) for a
       tracked candidate that was parked on an indeterminate guard-1 result →
       re-attempt immediately, so a fresh pod does not wait a full periodic scan.
@@ -3105,11 +3218,14 @@ async def pod_watch_loop(
                 # the feature is disabled and when the pod lacks a (non-empty) value; a
                 # labelless pod (feature on) matches no booking and is never JIT-eligible
                 # either — it is left Pending for future "born overstay" handling, unless
-                # DEFAULT_USAGE_GROUP names a group to fall back to.  The default stands
-                # in for the label wholesale: the pod matches that group's reservations
-                # on the reserved path exactly as if it had carried the label itself.
+                # DEFAULT_USAGE_GROUP lists a group its owner may use: the first one
+                # they belong to, or one that enrols anyone (on_demand_auto_join).  That
+                # group stands in for the label wholesale: the pod matches its
+                # reservations on the reserved path exactly as if it had carried the
+                # label itself.
                 group_label: str | None = (
-                    labels.get(config.required_group_label) or config.default_usage_group
+                    labels.get(config.required_group_label)
+                    or state.default_usage_group_for(namespace)
                     if config.required_group_label
                     else None
                 )
@@ -3273,16 +3389,18 @@ async def pod_watch_loop(
                     # pod must name its group to be JIT-eligible — via the group label
                     # when REQUIRED_GROUP_LABEL is on (the label doubles as the group
                     # source), else via the galends/usage-group annotation.  The group
-                    # label already carries DEFAULT_USAGE_GROUP when it applies; the
-                    # annotation branch falls back to the same default, so one setting
-                    # covers a pod that named no group by either route.
+                    # label already carries the DEFAULT_USAGE_GROUP fallback when it
+                    # applies; the annotation branch falls back the same way, so one
+                    # setting covers a pod that named no group by either route.
                     own_group_annotation = get_pod_usage_group(pod)
                     if config.required_group_label:
                         usage_group: str | None = group_label
                         own_group = labels.get(config.required_group_label)
                         own_source = "label"
                     else:
-                        usage_group = own_group_annotation or config.default_usage_group
+                        usage_group = (
+                            own_group_annotation or state.default_usage_group_for(namespace)
+                        )
                         own_group = own_group_annotation
                         own_source = "annotation"
                     # Where the group came from, so a group the app turns out not
@@ -3413,6 +3531,7 @@ async def pod_watch_loop(
                                     has_usage_group_annotation=(
                                         own_group_annotation is not None
                                     ),
+                                    default_groups_known=state.default_groups_known,
                                 )
                                 if config.ondemand_lease_enabled else ()
                             )
@@ -3428,6 +3547,9 @@ async def pod_watch_loop(
                         # "No reservation matches" is only said once a full
                         # fetch has shown the reservation list: before that
                         # it is merely empty, and the claim would be false.
+                        # Likewise a pod left without a group only because the
+                        # DEFAULT_USAGE_GROUP rosters have not loaded: whether
+                        # one admits its owner is not known yet.
                         if phase == "Pending":
                             if (
                                 state.gpu_classes_known
@@ -3437,7 +3559,9 @@ async def pod_watch_loop(
                                     config, state, uid, name, namespace,
                                     gpu_class_label, now,
                                 )
-                            elif state.reservations_known:
+                            elif state.reservations_known and (
+                                usage_group is not None or state.default_groups_known
+                            ):
                                 await _emit_no_reservation_event(
                                     config, state, uid, name, namespace,
                                     gpu_class_label, group_label,
@@ -3450,6 +3574,7 @@ async def pod_watch_loop(
                                         has_usage_group_annotation=(
                                             own_group_annotation is not None
                                         ),
+                                        default_groups_known=state.default_groups_known,
                                     ),
                                     now,
                                 )
@@ -3554,7 +3679,7 @@ async def _run_queue_tick(
     snapshot = None
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, state.default_usage_group_for
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="queue.snapshot_failed", target="pods", err=exc), exc_info=True)
@@ -4529,7 +4654,7 @@ async def _run_preemption_sweep(
 
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, state.default_usage_group_for
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="preempt.snapshot_failed", target="pods", err=exc), exc_info=True)
@@ -5018,6 +5143,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Enable the optional usage-group match constraint (REQUIRED_GROUP_LABEL).
     # None keeps the group gate off, preserving prior behaviour.
     state.required_group_label = config.required_group_label
+    # The fallback order for a pod that names no group (DEFAULT_USAGE_GROUP);
+    # its rosters load with the first fetch below.
+    state.default_usage_groups = config.default_usage_groups
 
     # Expose the shared state and client so request handlers (e.g. the inbound
     # push endpoint) can reach them; the background loops receive them as task
@@ -5075,6 +5203,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 event="startup.initial_fetch_failed", err=exc,
                 retry_s=config.reservation_fetch_interval,
             ))
+
+        # The DEFAULT_USAGE_GROUP rosters too, before the watch replays every
+        # pod: a pod routed before they load falls back to no group at all, and
+        # stays that way until the next resync re-routes it.
+        await _refresh_default_group_rosters(
+            state, client, config, datetime.now(timezone.utc)
+        )
 
         # Run one capacity audit synchronously so an app-side overcommit pauses
         # on-demand admission from the start rather than up to an interval later.
@@ -5416,7 +5551,7 @@ async def preemption_risk_forecast(
     # Snapshots are awaited OUTSIDE the lock, mirroring the preemption sweep.
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, state.default_usage_group_for
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="forecast.snapshot_failed", target="pods", err=exc), exc_info=True)

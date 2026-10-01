@@ -357,7 +357,11 @@ unless you also project `metadata.labels`) names the GPU class.
 
 A deployment may configure cluster-wide stand-ins for the minimum runtime and
 the usage group (`DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP`), in
-which case a pod carrying neither annotation is still JIT-eligible. Neither default is written
+which case a pod carrying neither annotation is still JIT-eligible. The usage
+group is chosen per user: the first of the deployment's default groups the
+pod's owner belongs to, or one that admits anyone — so two users' identical
+pods can land in different groups, and a user none of them admits gets none.
+Neither default is written
 back to the pod, so a UI cannot tell from the annotations alone whether a value
 came from the pod or from the deployment — read the absence of an annotation as
 "whatever the cluster defaults to", not as "unset".
@@ -726,7 +730,7 @@ right, reported to support.
 |---|---|
 | `OnDemandLeaseRejected` | The reservation service did not recognise something the pod's on-demand request named: its **usage group** (the usual cause — a mistyped group label or `galends/usage-group` annotation), its user (the pod's namespace) or its GPU class. The Event quotes the service's reason, the user and group that were sent, and where the group came from — the pod's label, its annotation, or the cluster's default when the pod named none. If you hold a booking of this class under a *different* usage group, it says so. |
 | `UnknownGpuClass` | The pod's `gpu-class` label is not a GPU class the reservation service knows, so no reservation can match it and it cannot be admitted on demand. The Event lists the classes that do exist. |
-| `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
+| `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group (and, on a cluster with default usage groups, you are not a member of any of them) — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
 | `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, or the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis.  A pod that waits for its reservation instead of being admitted now because of one is told in its §5.4 Event instead. |
 | `NoMatchingNode` | The pod's `nodeSelector`, or the required part of its node affinity, rules out every schedulable node of its GPU class — a mistyped host name, a hardware label the class does not have, or a node that is cordoned or down — so it could not start there and no on-demand lease is requested for it. The Event quotes the constraint, and names any other GPU class whose nodes it *does* match, since asking for one class's hardware under another's `gpu-class` label is a common cause. The controller keeps checking on its queue interval (5 minutes by default), so a pod waiting on a cordoned or down node goes ahead once the node is back. |
 
@@ -751,8 +755,9 @@ Events:
   created from and create it again.
 - **Nothing is claimed that the controller cannot see.**  `UnknownGpuClass` and
   `NoReservation` are only reported once the controller has the reservation
-  service's full class list and reservation list — so a pod created while the
-  service is unreachable is told nothing rather than something false.
+  service's full class list and reservation list — and, for a pod relying on
+  the cluster's default usage groups, their memberships — so a pod created while
+  the service is unreachable is told nothing rather than something false.
   `NoMatchingNode` likewise waits for the controller's first look at the
   cluster's nodes, and a constraint it cannot evaluate (an operator Kubernetes
   itself would reject) is treated as no constraint at all.

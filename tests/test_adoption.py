@@ -176,7 +176,7 @@ def _run_owner_changes(m, state, config, owner_changes):
     exercises the whole path has to span both halves.
     """
     async def _go():
-        snapshot = await m._snapshot_pods_for_eviction(config)
+        snapshot = await m._snapshot_pods_for_eviction(state, config)
         async with state.reservation_lock:
             evictions = m._plan_owner_changes(state, owner_changes, snapshot)
         await m._execute_evictions(state, evictions)

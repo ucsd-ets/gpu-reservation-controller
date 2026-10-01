@@ -96,10 +96,13 @@ spec:
             {{- end }}
             - name: DEFAULT_MINIMUM_RUNTIME_SECONDS
               value: {{ .Values.config.defaultMinimumRuntimeSeconds | quote }}
-            {{- if .Values.config.defaultUsageGroup }}
+            {{- with .Values.config.defaultUsageGroup }}
+            {{- /* A YAML list or a comma-separated string: sprig's join passes a string through whole. */}}
             - name: DEFAULT_USAGE_GROUP
-              value: {{ .Values.config.defaultUsageGroup | quote }}
+              value: {{ join "," . | quote }}
             {{- end }}
+            - name: DEFAULT_USAGE_GROUP_REFRESH_INTERVAL
+              value: {{ .Values.config.defaultUsageGroupRefreshInterval | quote }}
             - name: PREEMPTION_LEAD_MINUTES
               value: {{ .Values.config.preemptionLeadMinutes | quote }}
             - name: PREEMPTION_CHECK_INTERVAL

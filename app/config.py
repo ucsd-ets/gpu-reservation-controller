@@ -84,6 +84,23 @@ def _env_int(
     return value
 
 
+def _env_list(name: str) -> tuple[str, ...]:
+    """Read a comma-separated environment variable as an ordered tuple.
+
+    Whitespace around each entry is stripped, empty entries are dropped (so a
+    trailing comma is harmless) and a repeated entry keeps only its first
+    position — order is what these lists mean, and a second mention of the
+    same name could only ever be shadowed by the first.  Unset or blank yields
+    ``()``.  There is no escaping, so an entry cannot itself contain a comma.
+    """
+    entries: list[str] = []
+    for raw in (os.environ.get(name) or "").split(","):
+        entry = raw.strip()
+        if entry and entry not in entries:
+            entries.append(entry)
+    return tuple(entries)
+
+
 def timezone_label(tz: Optional[tzinfo]) -> str:
     """Name *tz* for a log line, where ``None`` means the process's local zone.
 
@@ -217,7 +234,13 @@ class Config:
     # can mint a JIT lease on its behalf.  Both ship disabled, so an unconfigured
     # deployment keeps the "a pod that doesn't say is left Pending" behaviour.
     default_min_runtime_seconds: int = 0  # stand-in for a missing galends/minimum-runtime-seconds; 0 = disabled
-    default_usage_group: Optional[str] = None  # stand-in for a missing group label/annotation; None = disabled
+    # Stand-ins for a missing group label/annotation, in priority order: a pod
+    # that names no group gets the first one its owner may use -- a member of,
+    # or one that enrols anyone (on_demand_auto_join).  () = disabled.
+    default_usage_groups: tuple[str, ...] = ()
+    # Seconds between refreshes of those groups' rosters (GET /api/groups),
+    # i.e. how long a user's fallback group may lag a membership change.
+    default_usage_group_refresh_interval: int = 14400
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
     capacity_check_interval: int = 3600  # seconds between app-side vs physical capacity audits
@@ -280,7 +303,15 @@ class Config:
             default_min_runtime_seconds=_env_int(
                 "DEFAULT_MINIMUM_RUNTIME_SECONDS", 0, minimum=0
             ),
-            default_usage_group=os.environ.get("DEFAULT_USAGE_GROUP") or None,
+            # A comma-separated list since it became a fallback *order*; a
+            # single name -- the old form -- is a list of one.
+            default_usage_groups=_env_list("DEFAULT_USAGE_GROUP"),
+            # Checked on each reservation fetch cycle, so no value is a busy
+            # loop and anything under RESERVATION_FETCH_INTERVAL just means
+            # "every cycle"; it still floors at 1 like every other *_INTERVAL.
+            default_usage_group_refresh_interval=_env_int(
+                "DEFAULT_USAGE_GROUP_REFRESH_INTERVAL", 14400
+            ),
             inbound_api_token=os.environ.get("INBOUND_API_TOKEN") or None,
             preemption_lead_minutes=_env_int("PREEMPTION_LEAD_MINUTES", 15, minimum=0),
             preemption_check_interval=_env_int("PREEMPTION_CHECK_INTERVAL", 60),

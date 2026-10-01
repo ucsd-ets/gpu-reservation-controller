@@ -4,6 +4,7 @@ Implements only the endpoints the controller needs:
   - GET /api/reservations  — paginated list of all (active + cancelled) reservations
   - GET /api/gpu-classes/{id}  — per-class detail including label_value
   - GET /api/gpu-classes  — full class list (JIT label → id resolution)
+  - GET /api/groups  — usage groups with their members (DEFAULT_USAGE_GROUP's per-user fallback)
   - POST /api/reservations  — create a JIT on-demand booking
   - POST /api/reservations/ondemand-admission  — ask the app which pending pods to admit, in what order
   - POST /api/reservations/preemption-victims  — ask the app which overstay pods to preempt
@@ -14,6 +15,7 @@ Implements only the endpoints the controller needs:
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -24,6 +26,7 @@ from pydantic import ValidationError
 from .config import Config
 from .schemas import (
     GpuClassDetail,
+    GroupDetail,
     OnDemandAdmissionRequest,
     OnDemandAdmissionResponse,
     BestEffortReservationRequest,
@@ -401,6 +404,47 @@ class ReservationClient:
             return None
         except (ValidationError, ValueError) as exc:
             log.warning("%s", kv(event="api.gpu_classes_parse_failed", err=exc))
+            return None
+
+    async def fetch_groups(self, names: Collection[str]) -> Optional[list[GroupDetail]]:
+        """Return the usage groups among *names* that exist, or None on error.
+
+        Feeds ``DEFAULT_USAGE_GROUP``'s per-user fallback, which needs each
+        listed group's flags and roster.  ``GET /api/groups`` is the service-key
+        read that carries them, and it answers with *every* group and every
+        member -- so the groups not asked for are dropped before validation
+        rather than parsed only to be thrown away.  A name the app has no group
+        for is simply absent from the result.
+
+        Degrades to ``None`` like ``fetch_gpu_classes``: a failed refresh then
+        keeps the previous rosters instead of un-grouping every pod that was
+        relying on them.
+        """
+        wanted = set(names)
+        try:
+            # The whole roster of every group can run to megabytes on a large
+            # site, hence the longer timeout; it is fetched once per refresh
+            # interval (hours), not per pod.
+            resp = await self._client.get("/api/groups", timeout=30.0)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, list):
+                raise ValueError("expected a JSON list of groups")
+            return [
+                GroupDetail.model_validate(group)
+                for group in payload
+                if isinstance(group, dict)
+                and isinstance(group.get("name"), str)
+                and group["name"] in wanted
+            ]
+        except httpx.HTTPStatusError as exc:
+            log.warning("%s", kv(event="api.groups_fetch_failed", status=exc.response.status_code))
+            return None
+        except httpx.RequestError as exc:
+            log.warning("%s", kv(event="api.groups_fetch_failed", err=exc))
+            return None
+        except (ValidationError, ValueError) as exc:
+            log.warning("%s", kv(event="api.groups_parse_failed", err=exc))
             return None
 
     async def create_ondemand_reservation(
