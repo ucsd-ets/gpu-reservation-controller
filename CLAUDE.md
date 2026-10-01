@@ -872,18 +872,18 @@ delegation on, every candidate **waiting for capacity** whatever its cooldown
   app-side, so a controller predating them is not rejected.  A dropped key logs
   `pod.annotations_truncated` at DEBUG (it repeats per attempt for as long as the
   pod waits); a truncated *value* is silent, being still recognisably itself.
-- **Delegate** (only when `ONDEMAND_DELEGATE_ADMISSION` is on): the whole
+- **Delegate** (`ONDEMAND_DELEGATE_ADMISSION`, on by default): the whole
   survivor set is offered to the app in one call
   (`POST /api/reservations/ondemand-admission`,
   `ReservationClient.select_ondemand_admissions`).  The app answers with a dry
-  run of the creates — which to grant, **in the order to grant them**, and for
-  every other candidate the admission-denial envelope the create would have
-  returned, or `outranked` (see **Ordered delegation**).  Mirrors the
+  run of the creates, **ranked** — which to grant, **in the order to grant
+  them**, and for every other candidate the admission-denial envelope the create
+  would have returned, or `outranked` (see **Ordered delegation**).  Mirrors the
   preemption-victims pattern: only offered uids are honoured
   (`_map_granted_uids` drops unknowns and keeps the app's order), an **empty**
   answer is respected (grant none), and a **call failure or the flag being
   off** falls back to granting every *due* survivor in creation order — the
-  behaviour before delegation, so the change ships safely dark.
+  behaviour before delegation, and the rollback.
 - **Grant** (`_grant_and_admit`, per granted pod, **in the app's order**, each
   judged first by guards 4 and 5 again — `_hold_on_fit`): calls `POST /api/reservations`
   with `on_demand=True` (the app relaxes policy limits — SU, caps, minimum
@@ -930,9 +930,13 @@ so exactly one trailing pass follows — an ADDED burst collapses into at most o
 in-flight + one trailing batch.  The single-pod `_try_request_lease` remains as a
 thin `preflight → grant` wrapper (the non-delegated path and the unit-test seam).
 
-**Ordered delegation.**  With `ONDEMAND_DELEGATE_ADMISSION` on, the app — not
-creation order — decides who gets capacity that cannot cover everyone, and four
-things keep the controller from undoing that choice:
+**Ordered delegation.**  With `ONDEMAND_DELEGATE_ADMISSION` on (the default),
+the app — not creation order — decides who gets capacity that cannot cover
+everyone.  It ranks the batch by how much of its allocation each candidate's
+usage group and cohort hold: asks within every ceiling before asks that must
+borrow, then the cohort's share, the group's, the owner's own holdings, and pod
+age (its `docs/SCHEDULING.md` §7.1, which the controller does not re-derive).
+Four things keep the controller from undoing that choice:
 
 - **Grants are made in the returned order** (`AdmissionSelection.granted`).  A
   set would have let the controller re-impose creation order.
@@ -966,7 +970,7 @@ things keep the controller from undoing that choice:
 
 **What the order is measured by.**  The app's `scripts/ondemand_commitment_report.py`
 counts how often an on-demand ask within its allocation lost to use beyond one — the
-measure a ranking in the app would be judged against.  This side's part is guard 3's
+measure the app's ranking is judged against.  This side's part is guard 3's
 activation line: `interlock.activated` names the reservations the stalled pods run
 under (`rids`) and the GPUs pods past their runtime guarantee held on the class at
 that moment (`overstay_gpus`, `ControllerState.overstay_gpus` over the same pool
@@ -2228,7 +2232,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `BEST_EFFORT_ENABLED` | `false` | Honour a pod's `galends/runtime-guarantee: none` by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation instead of a guaranteed lease (see **Best-effort admission**). Ships dark: the app must serve the best-effort create shape, and against one that does not, every such candidate takes a non-retryable 4xx into `lease.error` backoff. The pod annotation alone is deliberately *not* the opt-in — unlike `galends/force-node-capacity`, any pod author can set it |
-| `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch, and in what order (`POST /api/reservations/ondemand-admission`): the app dry-runs the creates, returns its grants in order and withholds the rest with a reason, and a candidate waiting for capacity is then offered in every batch (see **Ordered delegation**). `false` (or any app-call failure) grants every due eligible candidate in creation order — the behaviour before delegation. The app's order is currently the offered order — pod age — so turning this on already spares the creates the app would refuse and re-offers waiters as capacity frees, but does not yet change who comes first |
+| `ONDEMAND_DELEGATE_ADMISSION` | `true` | Ask the app which pending pods to admit on-demand from the eligible batch, and in what order (`POST /api/reservations/ondemand-admission`): the app dry-runs the creates, returns its grants in its ranked order — asks from usage groups and cohorts within their allocation ahead of asks that must borrow, then by allocation share, owner's holdings and pod age — and withholds the rest with a reason, and a candidate waiting for capacity is then offered in every batch (see **Ordered delegation**). `false` is the rollback: every due eligible candidate is granted in creation order, as on any app-call failure |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's refusal of a JIT lease onto the waiting pod as a `Warning` Event — its **409** denial reason (`reason=OnDemandLeaseDenied`), or a **404** for a user, usage group or GPU class it does not recognise (`reason=OnDemandLeaseRejected`) — so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Also tells the owner of a pod the app's admission selection withheld: its reason, as for a 409, or a `Normal` `WaitingForCapacity` notice when it was passed over for capacity granted ahead of it (see **Ordered delegation**). Informational only; `false` disables |
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, a capacity-wait notice, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused (or, for a guard-4 hold under `ONDEMAND_OVERCOMMIT_FIT`, limited) and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |

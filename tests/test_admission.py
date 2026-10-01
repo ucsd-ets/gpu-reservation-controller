@@ -88,8 +88,8 @@ class TestConfigFromEnv:
         assert c.scheduling_gate_name is None
         assert c.preemption_lead_minutes == 15
         assert c.preemption_check_interval == 60
-        # Delegation is opt-in: default off until the app ships the endpoint.
-        assert c.ondemand_delegate_admission is False
+        # Delegation is on: the app ranks the batch.  The flag is the rollback.
+        assert c.ondemand_delegate_admission is True
 
     def _base_env(self, monkeypatch):
         _clean_env(monkeypatch)
@@ -130,11 +130,11 @@ class TestConfigFromEnv:
 
     @pytest.mark.parametrize("value,expected", [
         ("true", True), ("1", True), ("yes", True), ("TRUE", True),
-        ("false", False), ("0", False), ("no", False), ("anything-else", False),
+        ("false", False), ("0", False), ("no", False), ("anything-else", True),
     ])
-    def test_ondemand_delegate_admission_truthy_parsing(self, monkeypatch, value, expected):
-        # Opt-in flag: only explicit truthy values enable it (mirrors the
-        # inverse of the falsy-default flags).
+    def test_ondemand_delegate_admission_parsing(self, monkeypatch, value, expected):
+        # On by default, with the flag as the rollback: only an explicit falsy
+        # value turns it off, and an unrecognised one keeps the default.
         from app.config import Config
 
         _clean_env(monkeypatch)

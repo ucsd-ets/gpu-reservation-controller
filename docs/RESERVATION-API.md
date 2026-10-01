@@ -778,12 +778,18 @@ The app is free to ignore both pieces of evidence. They are advisory inputs to
 selection, never inputs to the lease that follows: the subsequent
 `POST /api/reservations` carries the ask alone.
 
-**The selection is a dry run of the creates.** The app orders the candidates by
-its admission policy — currently the offered order — and judges them one at a
-time by the create's own gates (duration ceiling, group validity, SU budget and
-pool, the three capacity tiers, and for a best-effort candidate its capacity
-probe), each against the calendar **plus every lease granted ahead of it in the
-same batch**. So the grants it returns fit together, not merely each alone. It
+**The selection is a ranked dry run of the creates.** Every candidate is judged
+by the create's own gates (duration ceiling, group validity, SU budget and pool,
+the three capacity tiers, and for a best-effort candidate its capacity probe)
+against the calendar **plus every lease granted ahead of it in the same batch**,
+so the grants it returns fit together, not merely each alone. Among those that
+fit, the app grants in **rank order**, reading each scope's standing again after
+every grant (SCHEDULING.md §7.1): best-effort candidates after every guaranteed
+one; an ask that fits within every ceiling of its usage group and cohort before
+one that fits only by borrowing past them; then the binding cohort's share of
+its ceiling, the group's share of its own, the GPUs the candidate's user holds —
+all measured over one window common to the batch — and finally `pod_created_at`,
+oldest first. An ask that no longer fits is passed over, not waited for. It
 writes nothing — not even an account `on_demand_auto_join` would provision,
 which is judged as the create would judge it.
 
@@ -820,13 +826,13 @@ A withheld candidate's `code` is either:
   changes, and tells the pod's owner only that it is waiting for GPU capacity —
   a count would change from batch to batch.
 
-Three kinds of candidate are **not judged**, and are granted so the create
-answers them exactly as it always has: one naming a user, group or GPU class the
-app does not know (the create's `404`), one the create would reject as
-malformed (its `422` — no `group_name`, a lease shorter than 60 s), and one
-whose `pod_uid` is already some reservation's `idempotency_key` (the create
-returns that row). None of them holds capacity against the candidates behind
-it.
+Three kinds of candidate are **not judged**, and are granted — after the ranked
+grants — so the create answers them exactly as it always has: one naming a user,
+group or GPU class the app does not know (the create's `404`), one the create
+would reject as malformed (its `422` — no `group_name`, a lease shorter than
+60 s), and one whose `pod_uid` is already some reservation's `idempotency_key`
+(the create returns that row). None of them holds capacity against the
+candidates behind it.
 
 The controller admits only pods it offered — a `pod_uid` in the response that was
 not in the request is ignored, and a uid granted twice is created once. An

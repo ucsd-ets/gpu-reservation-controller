@@ -198,10 +198,13 @@ class Config:
     # Event's repeat cadence.
     reservation_wait_event_enabled: bool = True
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
-    ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
+    # Ask the app which pending pods to admit, and in what order -- its ranking
+    # by how much of its allocation each group and cohort holds.  On by default;
+    # false is the rollback, granting every due candidate in creation order.
+    ondemand_delegate_admission: bool = True
     # Honour galends/runtime-guarantee=none by admitting the pod under a
-    # zero-length, zero-SU kind="best_effort" reservation.  Ships **off**, like
-    # ondemand_delegate_admission above: the app must be running a build that
+    # zero-length, zero-SU kind="best_effort" reservation.  Ships **off**: the
+    # app must be running a build that
     # serves the best-effort create shape, and against one that is not, every
     # such candidate would take a non-retryable 4xx into lease.error backoff.
     # Unlike the node-level galends/force-node-capacity, whose annotation is its
@@ -305,7 +308,7 @@ class Config:
                 "PREEMPTION_DELEGATE_SELECTION", True
             ),
             ondemand_delegate_admission=_env_bool(
-                "ONDEMAND_DELEGATE_ADMISSION", False
+                "ONDEMAND_DELEGATE_ADMISSION", True
             ),
             ondemand_horizon_minutes=_env_int(
                 "ONDEMAND_HORIZON_MINUTES", 30, minimum=0

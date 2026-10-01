@@ -356,6 +356,10 @@ both sides, whereas everywhere else an absent value means "not known".
 | `selected` / `granted` | int | how many of them were chosen |
 | `withheld` | int | how many offered on-demand candidates the admission selection did not grant |
 | `ahead_borrowed` | int | on an `outranked` withhold: GPUs the grants ahead of it in the batch fit only by borrowing, on the tier that refused it — a sum of peaks; `0` means everything ahead was within its allocation |
+| `rank` | int | a grant's 1-based position in the on-demand admission order |
+| `cohort_share` / `group_share` | float | GPUs the candidate's binding cohort / group held over the ranking window, over that scope's ceiling (a scope with no ceiling is read against the next tier's; `inf` for a zero ceiling; an unbound group's own share stands in for the cohort's) |
+| `owner_gpus` | int | GPUs of the class the candidate's user held over the ranking window |
+| `window_min` | int minutes | the on-demand ranking window holdings were measured over |
 | `reservations` | int | reservations in the occupancy map |
 | `fallback` | string | what was used instead when a delegated call was unavailable |
 | `target` | string | which snapshot failed (`pods`, `node_capacity`) |

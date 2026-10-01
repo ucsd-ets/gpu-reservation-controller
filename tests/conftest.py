@@ -293,6 +293,9 @@ def make_config(**overrides) -> Config:
         inbound_api_token=None,
         preemption_lead_minutes=15,
         preemption_check_interval=60,
+        # On in production.  Off here so a test's fake client need answer only
+        # the creates it is about; a test of delegation opts in.
+        ondemand_delegate_admission=False,
     )
     base.update(overrides)
     return Config(**base)

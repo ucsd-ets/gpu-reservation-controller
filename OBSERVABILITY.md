@@ -278,10 +278,12 @@ pod is told about the drain.  `ONDEMAND_PAUSE_EVENT_ENABLED=false` turns it off;
 a failed write logs `k8s.event_failed reason=OnDemandAdmissionPaused` and
 changes nothing else.
 
-**Delegated admission (`ONDEMAND_DELEGATE_ADMISSION`) is ordered.**  The app
-returns its grants in the order to make them, and the controller creates leases
-in exactly that order, re-judging guards 4 and 5 before each — so on the
-scarcest capacity it is the app's order, not pod age, that decides.  A candidate
+**Delegated admission (`ONDEMAND_DELEGATE_ADMISSION`, on by default) is
+ordered.**  The app returns its grants in the order to make them — its ranking by
+allocation share, which the app logs one line per grant with the keys that
+placed it — and the controller creates leases in exactly that
+order, re-judging guards 4 and 5 before each — so on the scarcest capacity it is
+the app's order, not pod age, that decides.  A candidate
 the app withholds for capacity (`ondemand.withheld reason=outranked`, or a
 capacity code the app marks retryable), or whose create a capacity gate refused
 the same way, is offered again in every later delegated batch whatever its retry
