@@ -1269,15 +1269,18 @@ book on behalf of others in that group.
 
 #### `POST /api/groups/{template_id}/clone`
 
-Create a new group modelled on an existing **template** group. The intended use
-is course provisioning: the caller passes the SICAD course name as `name`, and
-the template, which an administrator configures and usually keeps inactive,
+Create a new group modelled on an existing **template** group: one an
+administrator has flagged `allow_clone`. The intended use is course
+provisioning: the caller passes the SICAD course name as `name`, and the
+template, which an administrator configures and usually keeps inactive,
 supplies everything else.
 
 **Authorization:** an admin session or a `read_write` service key. A key can
 **clone** a group but cannot create one from scratch with `POST /api/groups`,
 which is admin-only: a clone can only replicate policy an administrator already
-set on the template.
+set on the template. Neither caller may clone a group whose `allow_clone` is
+`false`. Only an administrator can set it (`POST`/`PUT /api/groups`), so a key
+can copy only the groups an administrator designated as templates.
 
 **Path parameter:** `template_id` — integer
 
@@ -1299,12 +1302,14 @@ per-group GPU limit (count, dates, named-date-range link, notes). A clone
 linked to a named date range follows later edits to that range.
 
 **Not copied:** `sicad_course_id`; `is_active` (a clone is always created
-active); members and managers; SICAD teams; GPU loans; SU quota boosts.
+active); `allow_clone` (a clone is never itself a template, so it cannot be
+cloned in turn until an administrator flags it); members and managers; SICAD
+teams; GPU loans; SU quota boosts.
 
 The group, its attachments and its limits are committed atomically.
 
 **Response** `201` — the new [GroupResponse](#groupresponse), with
-`is_active: true` and an empty `members` list.
+`is_active: true`, `allow_clone: false` and an empty `members` list.
 
 **Errors**
 
@@ -1313,6 +1318,7 @@ The group, its attachments and its limits are committed atomically.
 | 400 | `Group name already exists`. On a retry, match `GET /api/groups` by name to see whether an earlier attempt succeeded |
 | 403 | `read_only` key, or a non-admin session |
 | 404 | Template group not found |
+| 409 | `Group is not a clone template (allow_clone is off)`: the group exists but is not flagged. Retrying will not help. Correct `template_id`, or have an administrator set `allow_clone` on the group. Checked before the name |
 | 422 | Body validation failed |
 
 Add instructors afterwards with `POST /api/groups/{group_id}/members` and
@@ -1544,6 +1550,7 @@ entry is a full GpuClassResponse.
 | `max_reservation_hours` | integer | Hard ceiling on the length of a **single** reservation, in hours. Default `168` (7 days); always present and always finite — there is no "unlimited". Applies on **every** creation path (booking, on-demand lease, continue) and to **every** caller, including group managers and admins; unlike the 48-hour cap it has no exemption. A non-exempt member is therefore bounded by `min(48, max_reservation_hours)`. Settable only by an admin via `POST`/`PUT /api/groups` |
 | `on_demand_only` | boolean | Whether this group may be used **only** for controller-created on-demand leases. Default `false`. When `true`, `POST /api/reservations` refuses every web booking under it with **400**, for every caller — there is no exemption for group managers or administrators, because the flag describes what the group's allocation is *for* rather than what a caller has earned. On-demand leases are unaffected, and so is `POST /api/reservations/{id}/continue` on an already-running job. Settable only by an admin via `POST`/`PUT /api/groups` |
 | `on_demand_auto_join` | boolean | Whether an on-demand lease naming this group may enrol — and if necessary create — the user it names. Default `false`. When `true` and the request's `username` is not a member, the app adds them as a `member`; when no such account exists at all, it provisions an ordinary `role="user"` account keyed to JupyterHub with an empty password. Affects **only** the on-demand creation path — web bookings, SSO login and the roster APIs in §5 are unchanged — never reactivates a deactivated account, and relaxes no gate other than membership. Settable only by an admin via `POST`/`PUT /api/groups` |
+| `allow_clone` | boolean | Whether this group is an approved **clone template**. `POST /api/groups/{template_id}/clone` refuses any group without it, for every caller. Default `false`, and never copied onto a clone. Settable only by an admin via `POST`/`PUT /api/groups` |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
 | `members` | array of [GroupMemberBrief](#groupmemberbrief) | |
