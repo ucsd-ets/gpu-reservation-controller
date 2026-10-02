@@ -186,7 +186,7 @@ def _preflight(monkeypatch, pod_annotations, *, created_at):
         return _pod(pod_annotations)
 
     monkeypatch.setattr(m, "read_pod", _read)
-    monkeypatch.setattr(m, "is_gpu_gated_pending", lambda pod, taint_key: True)
+    monkeypatch.setattr(m, "is_gpu_gated_pending", lambda pod, taint_key, resources=(): True)
 
     state = ControllerState()
     state.gpu_class_ids = {GPU_CLASS_LABEL: 10}

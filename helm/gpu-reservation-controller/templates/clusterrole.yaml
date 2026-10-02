@@ -17,9 +17,9 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]
-  # snapshot_node_gpu_capacity sums allocatable nvidia.com/gpu per
-  # gpu-class-reservation taint value to compute physical capacity for
-  # preemption planning.
+  # snapshot_node_gpu_capacity sums allocatable nvidia.com/gpu (or each class's
+  # own unit) per gpu-class-reservation taint value to compute physical
+  # capacity for preemption planning.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]

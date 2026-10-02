@@ -222,7 +222,7 @@ class TestWarnOndemandGates:
 def test_capacity_audit_records_physical_capacity(monkeypatch):
     m = _main_module(monkeypatch)
 
-    async def _snapshot(_key):
+    async def _snapshot(_key, _class_resources=None):
         return {GPU_CLASS_LABEL: 8}
 
     monkeypatch.setattr(m, "snapshot_node_gpu_capacity", _snapshot)

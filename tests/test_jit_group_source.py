@@ -184,7 +184,7 @@ class TestPreflightAskCarriesUsageGroup:
 
         monkeypatch.setattr(m, "read_pod", _read)
         # Make guard 1 pass deterministically without PodScheduled conditions.
-        monkeypatch.setattr(m, "is_gpu_gated_pending", lambda pod, taint_key: True)
+        monkeypatch.setattr(m, "is_gpu_gated_pending", lambda pod, taint_key, resources=(): True)
 
         state = ControllerState()
         state.gpu_class_ids = {GPU_CLASS_LABEL: 10}
