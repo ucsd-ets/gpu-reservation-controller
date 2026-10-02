@@ -7,7 +7,8 @@ This document covers every endpoint needed to build two external daemons:
   guaranteeing each one its reserved window, reclaiming capacity from a pod that
   overruns only when a later reservation actually needs it.
 - **Roster sync daemon** — provisions user accounts and manages usage-group
-  membership from an institutional directory.
+  membership from an institutional directory, and may create course groups
+  from an admin-maintained template.
 
 Both daemons authenticate with a long-lived service key (see §1).
 An interactive API explorer is available at `GET /api/docs` on any running instance.
@@ -1263,6 +1264,59 @@ book on behalf of others in that group.
     "can_manage": false }
 ]
 ```
+
+---
+
+#### `POST /api/groups/{template_id}/clone`
+
+Create a new group modelled on an existing **template** group. The intended use
+is course provisioning: the caller passes the SICAD course name as `name`, and
+the template, which an administrator configures and usually keeps inactive,
+supplies everything else.
+
+**Authorization:** an admin session or a `read_write` service key. A key can
+**clone** a group but cannot create one from scratch with `POST /api/groups`,
+which is admin-only: a clone can only replicate policy an administrator already
+set on the template.
+
+**Path parameter:** `template_id` — integer
+
+**Request body**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string (1–128) | yes | New group name; must be unique. With no `sicad_course_id`, SICAD roster sync looks the course up by this name |
+| `description` | string \| null | no | Omitted → the template's description is copied; `null` → cleared |
+| `sicad_course_id` | string \| null | no | Only when the SICAD course ID differs from `name`. **Never** copied from the template |
+
+**Copied from the template:** every policy field (`provisioning_source`,
+`team_mode`, `allow_manager_impersonation`, `researcher_mode`,
+`on_demand_only`, `on_demand_auto_join`, `relax_mode`, `max_reservation_hours`,
+`min_days_ahead`/`max_days_ahead`, `su_budget`, `pool_su_budget`,
+`su_anchor_mode`), the validity window `valid_from`/`valid_until` and its
+named-date-range link, the cohort, the GPU-class attachments, and every
+per-group GPU limit (count, dates, named-date-range link, notes). A clone
+linked to a named date range follows later edits to that range.
+
+**Not copied:** `sicad_course_id`; `is_active` (a clone is always created
+active); members and managers; SICAD teams; GPU loans; SU quota boosts.
+
+The group, its attachments and its limits are committed atomically.
+
+**Response** `201` — the new [GroupResponse](#groupresponse), with
+`is_active: true` and an empty `members` list.
+
+**Errors**
+
+| Code | Condition |
+|------|-----------|
+| 400 | `Group name already exists`. On a retry, match `GET /api/groups` by name to see whether an earlier attempt succeeded |
+| 403 | `read_only` key, or a non-admin session |
+| 404 | Template group not found |
+| 422 | Body validation failed |
+
+Add instructors afterwards with `POST /api/groups/{group_id}/members` and
+`role: "manager"`. Students arrive through SICAD roster sync.
 
 ---
 
