@@ -1834,7 +1834,7 @@ async def emit_admission_paused_event(
 # Events telling a pending pod's owner why it is not running yet, whose
 # message ``main`` renders -- the siblings of OnDemandLeaseDenied and
 # OnDemandAdmissionPaused, which report the app refusing or a class being
-# paused.  The first five say something *about the pod* stops the controller
+# paused.  The first six say something *about the pod* stops the controller
 # admitting it; the rest, that it is waiting -- for a reservation it is queued
 # on, for room on the nodes it asked for, or for GPU capacity the app gave to
 # requests ahead of it.  Each reason maps to the Event's
@@ -1843,6 +1843,7 @@ async def emit_admission_paused_event(
 LEASE_REJECTED_REASON = "OnDemandLeaseRejected"
 UNKNOWN_GPU_CLASS_REASON = "UnknownGpuClass"
 NO_RESERVATION_REASON = "NoReservation"
+NO_GPU_REQUEST_REASON = "NoGpuRequest"
 ANNOTATION_IGNORED_REASON = "AnnotationIgnored"
 NO_MATCHING_NODE_REASON = "NoMatchingNode"
 WAITING_FOR_NODE_REASON = "WaitingForNode"
@@ -1855,6 +1856,7 @@ _PENDING_POD_EVENTS: dict[str, tuple[str, str, str]] = {
     LEASE_REJECTED_REASON: ("Warning", "RequestOnDemandLease", "gpu-lease-rejected-"),
     UNKNOWN_GPU_CLASS_REASON: ("Warning", "AdmitPod", "gpu-unknown-class-"),
     NO_RESERVATION_REASON: ("Warning", "AdmitPod", "gpu-no-reservation-"),
+    NO_GPU_REQUEST_REASON: ("Warning", "AdmitPod", "gpu-no-request-"),
     ANNOTATION_IGNORED_REASON: ("Warning", "ReadAnnotations", "gpu-annotation-ignored-"),
     NO_MATCHING_NODE_REASON: ("Warning", "RequestOnDemandLease", "gpu-no-matching-node-"),
     # Normal, like WaitingForReservation: the owner chose the nodes, and they
@@ -1887,7 +1889,7 @@ async def emit_pending_pod_event(
 ) -> None:
     """Create an Event telling a pending pod's owner why it is not running yet.
 
-    *reason* is one of the nine above.  Something about the pod stops the
+    *reason* is one of those above.  Something about the pod stops the
     controller admitting it as written (``Warning``):
 
     - ``OnDemandLeaseRejected`` -- the reservation app answered the pod's lease
@@ -1898,6 +1900,8 @@ async def emit_pending_pod_event(
       reservation app knows, so no path can admit it.
     - ``NoReservation`` -- no reservation matches the pod and it does not
       qualify for on-demand admission either.
+    - ``NoGpuRequest`` -- the pod carries a ``gpu-class`` label but requests
+      no ``nvidia.com/gpu``, so the controller ignores it.
     - ``AnnotationIgnored`` -- one of its ``galends/*`` job-input annotations
       was invalid, or asks for something this deployment does not offer.
     - ``NoMatchingNode`` -- its node selector or required node affinity allows

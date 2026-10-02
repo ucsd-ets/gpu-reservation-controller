@@ -81,6 +81,7 @@ from .k8s_client import (
     LEASE_REJECTED_REASON,
     MIN_RUNTIME_ANNOTATION,
     NO_MATCHING_NODE_REASON,
+    NO_GPU_REQUEST_REASON,
     NO_RESERVATION_REASON,
     RESERVATION_FULL_REASON,
     RESERVATION_TOO_SMALL_REASON,
@@ -1834,6 +1835,53 @@ async def _emit_unknown_class_event(
     )
 
 
+def _no_gpu_request_message(gpu_class: str, config: Config) -> str:
+    """What the owner of a gpu-class pod that requests no GPUs reads.
+
+    Constant per class, so the shared throttle restates it only on its repeat.
+    """
+    return (
+        f"This pod has the gpu-class label {_plain(gpu_class)} but requests no "
+        f"GPUs: no container sets an nvidia.com/gpu resource limit or request. "
+        f"The GPU reservation controller ignores it -- it will not be admitted "
+        f"under a reservation or on demand. Set resources.limits nvidia.com/gpu "
+        f"on the container that needs the GPU and recreate the pod, or remove the "
+        f"gpu-class label if it needs none; if this is wrong, "
+        f"{_support_phrase(config)}"
+    )
+
+
+async def _emit_no_gpu_request_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    pod_name: str,
+    namespace: str,
+    gpu_class: str,
+    now: datetime,
+) -> None:
+    """Tell the pod's owner a gpu-class pod requesting no GPUs is ignored.
+
+    Such a pod has nothing for a reservation to hold: the app refuses a
+    ``gpu_count`` of 0 on every create shape (422), and admitting it under a
+    booking would only put a CPU-only pod on a GPU node.  So no path takes it,
+    and this Event is the whole of the controller's response -- told on first
+    sight and each watch resync, on the shared pending-status throttle, like
+    the other problems with the pod itself.
+    """
+    if not config.pod_problem_event_enabled:
+        return
+    message = _no_gpu_request_message(gpu_class, config)
+    await _post_pending_status(
+        config, state, uid, pod_name, namespace,
+        (NO_GPU_REQUEST_REASON, message), now,
+        lambda: emit_pending_pod_event(
+            uid, pod_name, namespace, message,
+            reason=NO_GPU_REQUEST_REASON, gpu_class=gpu_class, gpu_count=0,
+        ),
+    )
+
+
 def _placement_nodes(
     placement: Optional[NodePlacement],
     class_nodes: Optional[Iterable[str]],
@@ -3208,6 +3256,27 @@ async def pod_watch_loop(
 
                     gpu_count = get_pod_gpu_count(pod)
                     now = datetime.now(timezone.utc)
+                    if gpu_count < 1:
+                        # A gpu-class pod asking for no GPUs is ignored: there is
+                        # nothing for a reservation to hold, the app refuses a
+                        # 0-GPU lease (a 422 that used to be retried forever),
+                        # and a toleration would only put a CPU-only pod on a
+                        # GPU node.  Its owner is told why, on first sight and
+                        # each resync -- pod resources are immutable, so a
+                        # MODIFIED cannot change the verdict.
+                        state.remove_ondemand_candidate(uid)
+                        state.dequeue_pod(uid)
+                        if event_type == "ADDED":
+                            log.debug("%s", kv(
+                                event="pod.left_pending", ns=namespace, pod=name,
+                                reason="no_gpu_request",
+                            ))
+                            if phase == "Pending":
+                                await _emit_no_gpu_request_event(
+                                    config, state, uid, name, namespace,
+                                    gpu_class_label, now,
+                                )
+                        continue
                     admittable = state.find_admittable_reservation(
                         namespace, gpu_class_label, gpu_count, now, horizon, group_label
                     )
