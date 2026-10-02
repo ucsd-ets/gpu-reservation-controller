@@ -251,7 +251,7 @@ class TestSweepDisabledByDefault:
         m = _main_module(monkeypatch)
         state = _state(_ended_booking(1))
 
-        async def _boom(_key, _group_label_key=None):
+        async def _boom(_key, _group_label_key=None, *_a, **_kw):
             raise AssertionError("headroom must not force a snapshot when disabled")
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)
@@ -399,7 +399,7 @@ class TestThrottle:
         m = _main_module(monkeypatch)
         state = _state(_ended_booking(1))
 
-        async def _boom(_key, _group_label_key=None):
+        async def _boom(_key, _group_label_key=None, *_a, **_kw):
             raise RuntimeError("apiserver down")
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _boom)

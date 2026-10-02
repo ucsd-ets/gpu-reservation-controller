@@ -93,6 +93,14 @@ class GpuClassDetail(GpuClassBrief):
 
     total_gpus: Optional[int] = None
     effective_gpus_today: Optional[int] = None
+    # What one unit of the class is, in Kubernetes resources, and what users
+    # call it (RESERVATION-API.md §4, "What one unit of a class is").  Both None
+    # = one nvidia.com/gpu, called a GPU -- also what an app predating the
+    # fields implies.  Kept loose (Any values) so a payload the controller
+    # cannot use is reported by resources.class_resources rather than failing
+    # the whole class list's validation.
+    k8s_resources: Optional[dict[str, Any]] = None
+    unit_name: Optional[str] = None
 
     @property
     def audit_gpus(self) -> Optional[int]:

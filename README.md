@@ -941,7 +941,9 @@ GPU class record (e.g. `h100`, `a100-80gb`).
 ### 5 — Overriding a node's GPU capacity (optional)
 
 The controller's only notion of how many GPUs physically exist is
-`status.allocatable["nvidia.com/gpu"]`, summed per class over the tainted nodes
+`status.allocatable["nvidia.com/gpu"]` (or, for a class whose unit is something
+else — see *Classes counted in something other than NVIDIA GPUs* below — the
+allocatable of that unit's resources, converted to units), summed per class over the tainted nodes
 that are schedulable and Ready — a cordoned, terminating or **NotReady** node is
 left out, so a GPU node that crashes stops counting as soon as Kubernetes marks
 it NotReady, without anyone cordoning it (it logs `k8s.node_excluded` at DEBUG).
@@ -1007,7 +1009,8 @@ Pods that should be managed by the controller must:
 
 1. Run in a namespace whose name matches the **reservation owner's username**.
 2. Carry the label `gpu-class=<label-value>` matching the reserved GPU class.
-3. Request `nvidia.com/gpu` resources in their container spec.
+3. Request `nvidia.com/gpu` resources in their container spec — or whatever
+   their GPU class counts instead (below).
 
 Example pod fragment:
 
@@ -1025,6 +1028,27 @@ spec:
         limits:
           nvidia.com/gpu: "2"
 ```
+
+### Classes counted in something other than NVIDIA GPUs
+
+A GPU class in the reservation app may define what **one unit** of it is
+(`k8s_resources`, with a display word in `unit_name`): `{"amd.com/gpu": "1"}` for
+a class of AMD GPUs, or `{"memory": "16Gi", "cpu": "2"}` for a class of
+large-memory nodes counted in blocks.  Reservations, ceilings and SU rates on
+such a class are all in its units.  The controller counts:
+
+- **a pod** as, for each resource of the unit, its request divided by the unit's
+  share, rounded up — and takes the largest (40 GiB and 2 cores = 3 blocks);
+- **a node** as, for each resource, its allocatable divided by the unit's share,
+  rounded down — and takes the smallest.  For cpu and memory, which pods outside
+  the reservation system (DaemonSets) also consume, their requests on the node
+  are subtracted first, at the cost of one pod LIST per such node per snapshot.
+
+On a class counted in memory, every container of a pod must set its memory limit
+equal to its memory request, or the pod is not admitted (`MemoryLimitMismatch`
+Event).  Taint the class's nodes exactly as for a GPU class; no RBAC changes.
+A node serves one class, so a machine cannot be in a GPU class and a memory class
+at once.  See `docs/POD-ANNOTATIONS.md` §3.2 for the pod owner's view.
 
 ---
 

@@ -150,7 +150,7 @@ def _install_k8s_stubs(monkeypatch, m, snapshot):
     deleted: list[tuple[str, str]] = []
     events: list[tuple[str, str, str]] = []
 
-    async def _snapshot(_key, _group_label_key=None, _group_label_default=None):
+    async def _snapshot(_key, _group_label_key=None, _group_label_default=None, class_resources=None):
         return list(snapshot)
 
     async def _delete(name, ns):

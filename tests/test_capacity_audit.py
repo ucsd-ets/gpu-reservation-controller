@@ -181,14 +181,19 @@ class TestCapacityMapPopulation:
             async def fetch_gpu_class(self, cid):  # pragma: no cover
                 return None
 
+        # Every map is kept, the class units included: losing those on a blip
+        # would count a memory class in nvidia.com/gpu until the next fetch.
         prior = m.GpuClassMaps(
-            {10: GPU_CLASS_LABEL}, {GPU_CLASS_LABEL: 10}, {GPU_CLASS_LABEL: 8}
+            {10: GPU_CLASS_LABEL}, {GPU_CLASS_LABEL: 10}, {GPU_CLASS_LABEL: 8},
+            resources={GPU_CLASS_LABEL: m.class_resources({"memory": "16Gi"}, "block")},
         )
         maps = asyncio.run(m._resolve_gpu_class_maps(_FailingClient(), set(), prior))
         assert maps == prior
         # Copies, not aliases: mutating the result must not touch the caller's.
         maps.labels[99] = "other"
         assert 99 not in prior.labels
+        maps.resources["other"] = None
+        assert "other" not in prior.resources
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +210,7 @@ def _main_module(monkeypatch):
 
 
 def _patch_capacity(monkeypatch, m, capacity, *, fail=False):
-    async def _snapshot(_key):
+    async def _snapshot(_key, _class_resources=None):
         if fail:
             raise RuntimeError("apiserver down")
         return capacity

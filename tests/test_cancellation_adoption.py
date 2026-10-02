@@ -79,7 +79,7 @@ def _install_stubs(monkeypatch, m, snapshot):
     cancelled_events: list[tuple[str, str, str]] = []
     patched_refs: list[tuple[str, str]] = []  # (pod name, booking_reference)
 
-    async def _snapshot(_key, _group_label_key=None, _group_label_default=None):
+    async def _snapshot(_key, _group_label_key=None, _group_label_default=None, class_resources=None):
         return list(snapshot)
 
     async def _delete(name, ns):
@@ -233,7 +233,7 @@ class TestSnapshotCarriesTheGroupLabel:
         m = _main_module(monkeypatch)
         seen = {}
 
-        async def _snapshot(key, group_label_key=None, group_label_default=None):
+        async def _snapshot(key, group_label_key=None, group_label_default=None, class_resources=None):
             seen["key"] = key
             seen["group_label_key"] = group_label_key
             seen["group_label_default"] = group_label_default

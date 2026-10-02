@@ -6,20 +6,22 @@ never stall the asyncio event loop.
 Public surface
 --------------
 init_k8s(kubeconfig_path, strict_tls_verify)  — load credentials once at startup
-get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
+get_pod_effective_requests(pod)              — the pod's requests per resource, as kube-scheduler sums them
+get_pod_gpu_count(pod, spec)                 — units of its class the pod needs (default: nvidia.com/gpu)
+get_pod_memory_limit_problem(pod)            — a container whose memory limit is not its request
 get_pod_booking_reference(pod)               — read galends/booking-reference annotation
 get_pod_usage_group(pod)                     — read galends/usage-group annotation (JIT lease group)
 get_pod_annotation_problems(pod, ...)        — job-input annotations the controller will ignore, and why
 get_pod_galends_annotations(pod)             — every galends/* annotation, bounded (JIT admission ask)
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
-is_gpu_gated_pending(pod, taint_key)         — guard 1: is Pending fixable by a lease?
+is_gpu_gated_pending(pod, taint_key, names)  — guard 1: is Pending fixable by a lease?
 read_pod(name, namespace)                    — fetch current pod object
-snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
+snapshot_tolerated_pods(tol_key, ...)        — one LIST → occupancy + claims + guard 3
 get_node_forced_gpu_capacity(node)           — read galends/force-node-capacity annotation
 node_exclusion_reason(node)                  — why a node's GPUs are not placeable (cordoned/deleting/NotReady)
-snapshot_node_gpu_inventory(taint_key)       — one LIST → allocatable GPUs per class, per node
-snapshot_node_gpu_capacity(taint_key)        — per-class collapse of the inventory (preemption planning)
+snapshot_node_gpu_inventory(taint_key, ...)  — one LIST → allocatable units per class, per node
+snapshot_node_gpu_capacity(taint_key, ...)   — per-class collapse of the inventory (preemption planning)
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
 PodWatcher                                   — async-generator based pod event stream
 acquire_singleton_lease / renew_singleton_lease — coordination Lease duplicate-instance guard
@@ -36,13 +38,22 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
-from typing import AsyncIterator, Callable, Iterable, NamedTuple, Optional, TypeVar
+from decimal import Decimal
+from typing import AsyncIterator, Callable, Collection, Iterable, Mapping, NamedTuple, Optional, TypeVar
 
 from kubernetes import client as k8s_client, config as k8s_config, watch
 from kubernetes.client.rest import ApiException
 from urllib3.util.ssl_ import create_urllib3_context
 
 from .log_fields import kv
+from .resources import (
+    DEFAULT_CLASS_RESOURCES,
+    DEFAULT_RESOURCE,
+    ClassResources,
+    node_units,
+    pod_units,
+    to_quantity,
+)
 
 log = logging.getLogger(__name__)
 
@@ -348,18 +359,155 @@ def get_pod_usage_group(pod) -> Optional[str]:
     return annotations.get(USAGE_GROUP_ANNOTATION) or None
 
 
-def get_pod_gpu_count(pod) -> int:
-    """Sum nvidia.com/gpu resource requests across all containers in *pod*."""
-    total = 0
-    for container in pod.spec.containers or []:
-        requests = (
-            (container.resources.requests or {}) if container.resources else {}
-        )
-        try:
-            total += int(requests.get("nvidia.com/gpu", 0))
-        except (ValueError, TypeError):
-            pass
+def _quantities(raw: Optional[Mapping]) -> dict[str, Decimal]:
+    """Parse a ``{resource: quantity}`` map, dropping what does not parse."""
+    out: dict[str, Decimal] = {}
+    for name, value in (raw or {}).items():
+        qty = to_quantity(value)
+        if qty is not None:
+            out[name] = qty
+    return out
+
+
+def _container_requests(container) -> dict[str, Decimal]:
+    """One container's requests, a limit standing in for an absent request.
+
+    That fallback is the API server's own defaulting ("a limit with no request
+    requests the limit"), so a pod read from the API never needs it -- but it
+    keeps a hand-built pod reading the same as the real one would.
+    """
+    res = getattr(container, "resources", None)
+    if res is None:
+        return {}
+    limits = _quantities(getattr(res, "limits", None))
+    limits.update(_quantities(getattr(res, "requests", None)))
+    return {name: qty for name, qty in limits.items() if qty > 0}
+
+
+def _add_into(total: dict[str, Decimal], extra: Mapping[str, Decimal]) -> None:
+    for name, qty in extra.items():
+        total[name] = total.get(name, Decimal(0)) + qty
+
+
+def _max_into(total: dict[str, Decimal], other: Mapping[str, Decimal]) -> None:
+    for name, qty in other.items():
+        if qty > total.get(name, Decimal(0)):
+            total[name] = qty
+
+
+# Resources a pod-level ``spec.resources`` may set (KEP-2837); for those it
+# replaces the per-container sum, as it does for the scheduler.
+_POD_LEVEL_RESOURCES = ("cpu", "memory")
+
+
+def get_pod_effective_requests(pod) -> dict[str, Decimal]:
+    """Return what *pod* requests of each resource, summed the way kube-scheduler sums it.
+
+    The regular containers plus every sidecar (an init container with
+    ``restartPolicy: Always``), against the largest single init container (plus
+    the sidecars started before it) -- whichever is larger, per resource -- then
+    a pod-level ``spec.resources`` request replacing that for cpu and memory, and
+    the RuntimeClass ``spec.overhead`` on top.  This is ``PodRequests`` in
+    ``k8s.io/component-helpers``; matching it is what keeps the controller's
+    arithmetic and the scheduler's in agreement.  Unparseable values count as
+    nothing.
+    """
+    spec = getattr(pod, "spec", None)
+    if spec is None:
+        return {}
+    total: dict[str, Decimal] = {}
+    for container in getattr(spec, "containers", None) or []:
+        _add_into(total, _container_requests(container))
+    sidecars: dict[str, Decimal] = {}
+    init_peak: dict[str, Decimal] = {}
+    for container in getattr(spec, "init_containers", None) or []:
+        requests = _container_requests(container)
+        if getattr(container, "restart_policy", None) == "Always":
+            _add_into(total, requests)
+            _add_into(sidecars, requests)
+            running = dict(sidecars)
+        else:
+            running = dict(requests)
+            _add_into(running, sidecars)
+        _max_into(init_peak, running)
+    _max_into(total, init_peak)
+    pod_resources = getattr(spec, "resources", None)
+    if pod_resources is not None:
+        pod_level = _quantities(getattr(pod_resources, "limits", None))
+        pod_level.update(_quantities(getattr(pod_resources, "requests", None)))
+        for name in _POD_LEVEL_RESOURCES:
+            if name in pod_level:
+                total[name] = pod_level[name]
+    _add_into(total, _quantities(getattr(spec, "overhead", None)))
     return total
+
+
+def get_pod_gpu_count(pod, spec: ClassResources = DEFAULT_CLASS_RESOURCES) -> int:
+    """Return how many units of its class *pod* needs.
+
+    For an ordinary class (*spec* the default) that is its ``nvidia.com/gpu``
+    request.  For a class with its own unit it is the largest, over the unit's
+    resources, of the pod's request divided by the unit's quantity, rounded up
+    (``resources.pod_units``).  ``0`` means the pod requests none of what the
+    class counts -- the controller ignores such a pod.
+    """
+    return pod_units(get_pod_effective_requests(pod), spec)
+
+
+class MemoryLimitProblem(NamedTuple):
+    """A container whose memory use its request does not bound.
+
+    ``reason`` is ``no_limit`` (no memory limit at all) or ``limit_not_request``
+    (a limit that differs from the request).  ``container`` is ``None`` for the
+    pod-level ``spec.resources`` case.
+    """
+
+    container: Optional[str]
+    reason: str
+
+
+def get_pod_memory_limit_problem(pod) -> Optional[MemoryLimitProblem]:
+    """Return the first container whose memory limit is not its memory request.
+
+    A class counted in memory reserves what a pod *requests*, but Kubernetes
+    bounds a container only by its *limit*: a pod with a request of 64Gi and a
+    limit of 1Ti books four 16Gi units and may use sixty-four, at the expense of
+    every other reservation on the node.  So such a class admits a pod only when
+    every container that runs for the pod's life -- the regular containers and
+    the sidecars -- has a memory limit equal to its request.  Ordinary init
+    containers run to completion before the job starts and are not checked (an
+    init container injected by the platform often sets no resources at all, and
+    would otherwise make every pod of the class inadmissible).  A pod-level
+    ``spec.resources`` memory limit bounds the whole pod and satisfies the rule
+    on its own.  ``None`` = the pod's memory is bounded by what it reserves.
+    """
+    spec = getattr(pod, "spec", None)
+    if spec is None:
+        return None
+    pod_resources = getattr(spec, "resources", None)
+    if pod_resources is not None:
+        limit = to_quantity((getattr(pod_resources, "limits", None) or {}).get("memory"))
+        if limit is not None:
+            request = to_quantity((getattr(pod_resources, "requests", None) or {}).get("memory"))
+            if request is not None and request != limit:
+                return MemoryLimitProblem(None, "limit_not_request")
+            return None
+    running = list(getattr(spec, "containers", None) or [])
+    running += [
+        c for c in getattr(spec, "init_containers", None) or []
+        if getattr(c, "restart_policy", None) == "Always"
+    ]
+    for container in running:
+        res = getattr(container, "resources", None)
+        limits = (getattr(res, "limits", None) or {}) if res else {}
+        requests = (getattr(res, "requests", None) or {}) if res else {}
+        limit = to_quantity(limits.get("memory"))
+        if limit is None:
+            return MemoryLimitProblem(getattr(container, "name", None), "no_limit")
+        request = to_quantity(requests.get("memory"))
+        if request is not None and request != limit:
+            return MemoryLimitProblem(getattr(container, "name", None), "limit_not_request")
+    return None
 
 
 def get_pod_booking_reference(pod) -> Optional[str]:
@@ -681,7 +829,9 @@ _TAINT_BUCKET_RE = re.compile(r"untolerated taint")
 _NAMED_TAINT_RE = re.compile(r"untolerated taint \{([^}=:]+)")
 
 
-def is_gpu_gated_pending(pod, taint_key: str) -> Optional[bool]:
+def is_gpu_gated_pending(
+    pod, taint_key: str, resources: Collection[str] = (DEFAULT_RESOURCE,),
+) -> Optional[bool]:
     """Guard 1: is *pod* Pending for something a lease + toleration could fix?
 
     Inspects ``pod.status.conditions[type=PodScheduled]`` and classifies the
@@ -697,6 +847,13 @@ def is_gpu_gated_pending(pod, taint_key: str) -> Optional[bool]:
 
     So the message is read for what it *can* still say reliably: which blockers
     rule the pod out for reasons a lease cannot fix.
+
+    *resources* are what the pod's class counts -- ``nvidia.com/gpu`` unless the
+    class defines its own unit (``resources.ClassResources.names``).  A shortage
+    of any of them is the class's own business, not a blocker: ``Insufficient
+    amd.com/gpu`` for an AMD class, and ``Insufficient memory`` / ``Insufficient
+    cpu`` from the ordinary nodes for a class of memory blocks, are exactly the
+    message such a pod is expected to get before it is admitted.
 
     Returns:
         ``True``  — the scheduler has ruled and named no blocker the controller
@@ -740,18 +897,20 @@ def is_gpu_gated_pending(pod, taint_key: str) -> Optional[bool]:
     if not message:
         return None
 
-    # (1) Any non-GPU resource shortage rules the pod out, even when GPU is
-    # also short — our toleration alone cannot help it.  Strip trailing
-    # punctuation from the match: the scheduler appends commas and periods
-    # (e.g. "Insufficient nvidia.com/gpu, 3 Insufficient memory.").
-    for m in _INSUFFICIENT_RE.finditer(message):
-        if m.group(1).rstrip(".,;)") != "nvidia.com/gpu":
-            return False
+    # (1) Any shortage of a resource the class does not count rules the pod
+    # out, even when the class's own is also short — our toleration alone
+    # cannot help it.  Strip trailing punctuation from the match: the scheduler
+    # appends commas and periods (e.g. "Insufficient nvidia.com/gpu, 3
+    # Insufficient memory.").
+    shortages = {m.group(1).rstrip(".,;)") for m in _INSUFFICIENT_RE.finditer(message)}
+    if shortages - set(resources):
+        return False
 
-    # (2) GPU shortage named outright — the unambiguous case, and the only one
-    # the pre-taint-aware version of this guard could recognise.  It still
-    # occurs for a class whose nodes carry no reservation taint.
-    if "Insufficient nvidia.com/gpu" in message:
+    # (2) A shortage of what the class counts, named outright — the unambiguous
+    # case, and the only one the pre-taint-aware version of this guard could
+    # recognise.  It still occurs for a class whose nodes carry no reservation
+    # taint.
+    if shortages:
         return True
 
     # (3) No node was rejected on a taint at all, and no GPU shortage was
@@ -1052,6 +1211,7 @@ async def snapshot_tolerated_pods(
     toleration_key: str,
     group_label_key: Optional[str] = None,
     group_label_default: Optional[str] = None,
+    class_resources: Optional[Mapping[str, ClassResources]] = None,
 ) -> list[ToleratedPodInfo]:
     """Return one ``ToleratedPodInfo`` per pod carrying a *toleration_key* toleration.
 
@@ -1068,6 +1228,12 @@ async def snapshot_tolerated_pods(
     pod carries no value for that label — it must be passed wherever routing
     applies the same default, or a pod admitted under the default group would
     read back as group-less and `_group_ok` would reject every reservation for it.
+
+    *class_resources* maps a ``gpu-class`` label to what one unit of that class
+    is; ``ToleratedPodInfo.gpu_count`` is the pod's count in those units, and a
+    class absent from it counts ``nvidia.com/gpu``.  Pass the same map the node
+    inventory was taken with, or a pod and the node it runs on are counted in
+    different units.
     """
     log.debug("%s", kv(event="k8s.list_pods", selector="gpu-class", purpose="tolerated_snapshot"))
     pod_list = await _run(
@@ -1092,7 +1258,12 @@ async def snapshot_tolerated_pods(
                 gpu_class=labels.get("gpu-class", ""),
                 booking_reference=booking,
                 reservation_id=parse_booking_reference(booking),
-                gpu_count=get_pod_gpu_count(pod),
+                gpu_count=get_pod_gpu_count(
+                    pod,
+                    (class_resources or {}).get(
+                        labels.get("gpu-class", ""), DEFAULT_CLASS_RESOURCES
+                    ),
+                ),
                 phase=get_pod_phase(pod),
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
                 deletion_timestamp=pod.metadata.deletion_timestamp,
@@ -1209,17 +1380,64 @@ def node_exclusion_reason(node) -> Optional[str]:
     return None
 
 
+async def _node_requests_outside_reservations(
+    node_name: str, toleration_key: str,
+) -> dict[str, Decimal]:
+    """What the pods on *node_name* that the controller does not count request.
+
+    A native resource (cpu, memory) is consumed by every pod on a node, not just
+    the ones admitted into a reservation: DaemonSets and static pods carry a
+    blanket toleration and land on reservation-tainted nodes too.  Their requests
+    are what the scheduler subtracts and the controller's own accounting never
+    sees, so ``snapshot_node_gpu_inventory`` takes them off the node's
+    allocatable before converting it to units.
+
+    "Not counted" is exactly the complement of ``snapshot_tolerated_pods``: a pod
+    carrying the ``gpu-class`` label *and* a *toleration_key* toleration is the
+    controller's, and is subtracted from the unit total later, by the planners.
+    Terminal and terminating pods are skipped -- the same "already freed" rule
+    the planners apply to the controller's own pods.  One LIST per node, by field
+    selector; only nodes of a class counted in a native resource pay for it.
+    """
+    log.debug("%s", kv(event="k8s.list_pods", purpose="node_overhead", node=node_name))
+    pod_list = await _run(
+        _core_v1.list_pod_for_all_namespaces, field_selector=f"spec.nodeName={node_name}"
+    )
+    used: dict[str, Decimal] = {}
+    counted = 0
+    for pod in pod_list.items:
+        if is_terminal_phase(pod) or pod.metadata.deletion_timestamp is not None:
+            continue
+        if "gpu-class" in (pod.metadata.labels or {}) and _pod_has_any_reservation_toleration(
+            pod, toleration_key
+        ):
+            continue
+        _add_into(used, get_pod_effective_requests(pod))
+        counted += 1
+    log.debug("%s", kv(
+        event="k8s.list_pods_done", purpose="node_overhead", node=node_name, count=counted,
+    ))
+    return used
+
+
 async def snapshot_node_gpu_inventory(
     taint_key: str,
-    gpu_resource: str = "nvidia.com/gpu",
+    class_resources: Optional[Mapping[str, ClassResources]] = None,
     *,
     labels_out: Optional[dict[str, dict[str, str]]] = None,
 ) -> dict[str, dict[str, int]]:
-    """Return allocatable GPUs per GPU-class label, broken down **per node**.
+    """Return allocatable units per GPU-class label, broken down **per node**.
 
-    LISTs all nodes and, for each node carrying a *taint_key* taint, records
-    ``status.allocatable[gpu_resource]`` under ``{taint_value: {node_name: gpus}}``
-    (the GPU-class label mirrors the toleration the controller applies to pods).
+    LISTs all nodes and, for each node carrying a *taint_key* taint, records what
+    it offers of that class under ``{taint_value: {node_name: units}}`` (the
+    GPU-class label mirrors the toleration the controller applies to pods).
+    *class_resources* says what one unit of each class is; a class absent from
+    it counts ``status.allocatable["nvidia.com/gpu"]``, one per unit, exactly as
+    before units existed.  Otherwise a node offers, per resource of the unit, its
+    allocatable divided by the unit's quantity and rounded down, and its units
+    are the smallest of those (``resources.node_units``) -- after subtracting,
+    for a native resource like cpu or memory, what pods the controller does not
+    count request there (``_node_requests_outside_reservations``).
     Nodes that are cordoned (``spec.unschedulable``), being deleted, or NotReady
     are excluded — their GPUs are not placeable (see ``node_exclusion_reason``).
     A pod still bound to an excluded node therefore occupies no capacity this map
@@ -1228,8 +1446,9 @@ async def snapshot_node_gpu_inventory(
     shortfall.
 
     A node carrying the ``galends/force-node-capacity`` annotation contributes
-    that number instead of its allocatable count (see
-    ``get_node_forced_gpu_capacity``).  This is the **only** place the override
+    that number instead (see ``get_node_forced_gpu_capacity``) -- in units, and
+    replacing the subtraction above as well, since it is the operator's own
+    statement of what the node offers.  This is the **only** place the override
     is applied, which is what makes it total: every notion of physical capacity
     in the controller — per-class totals, free capacity, headroom, the capacity
     audit, and the per-node feasibility guards — is derived from this one map.
@@ -1246,6 +1465,7 @@ async def snapshot_node_gpu_inventory(
     """
     log.debug("%s", kv(event="k8s.list_nodes", purpose="gpu_inventory"))
     node_list = await _run(_core_v1.list_node)
+    specs = class_resources or {}
     inventory: dict[str, dict[str, int]] = {}
     for node in node_list.items:
         taints = node.spec.taints if (node.spec and node.spec.taints) else []
@@ -1260,29 +1480,49 @@ async def snapshot_node_gpu_inventory(
                 event="k8s.node_excluded", node=node.metadata.name, reason=excluded,
             ))
             continue
-        allocatable = (node.status.allocatable or {}) if node.status else {}
-        raw = allocatable.get(gpu_resource, "0")
-        try:
-            gpus = int(raw)
-        except (ValueError, TypeError):
-            log.warning("%s", kv(
-                event="k8s.node_allocatable_invalid", node=node.metadata.name,
-                resource=gpu_resource, value=raw,
-            ))
-            gpus = 0
+        raw_allocatable = (node.status.allocatable or {}) if node.status else {}
+        parsed: dict[str, Optional[Decimal]] = {}
+
+        def allocatable_of(name: str) -> Optional[Decimal]:
+            # Parsed once per node and resource, so an unparseable reading is
+            # reported once however many classes the node serves.
+            if name not in parsed:
+                raw = raw_allocatable.get(name, "0")
+                qty = to_quantity(raw)
+                if qty is None:
+                    log.warning("%s", kv(
+                        event="k8s.node_allocatable_invalid", node=node.metadata.name,
+                        resource=name, value=raw,
+                    ))
+                parsed[name] = qty
+            return parsed[name]
+
         forced = get_node_forced_gpu_capacity(node)
         if forced is not None:
-            # The override replaces the *result* of the allocatable read rather
-            # than short-circuiting it, so a node whose allocatable is also
-            # unparseable still reports that separately — being overridden is
-            # not a reason to stop saying the underlying reading is broken.
             log.debug("%s", kv(
                 event="k8s.node_capacity_forced", node=node.metadata.name,
                 total=forced,
             ))
-            gpus = forced
+        others: Optional[dict[str, Decimal]] = None
         for gpu_class in classes:
-            inventory.setdefault(gpu_class, {})[node.metadata.name] = gpus
+            spec = specs.get(gpu_class, DEFAULT_CLASS_RESOURCES)
+            allocatable = {
+                name: qty for name in spec.names
+                if (qty := allocatable_of(name)) is not None
+            }
+            used: Optional[dict[str, Decimal]] = None
+            if forced is None and spec.native:
+                if others is None:
+                    others = await _node_requests_outside_reservations(
+                        node.metadata.name, taint_key
+                    )
+                used = others
+            # The override replaces the *result* of the allocatable read rather
+            # than short-circuiting it, so a node whose allocatable is also
+            # unparseable still reports that separately — being overridden is
+            # not a reason to stop saying the underlying reading is broken.
+            units = forced if forced is not None else node_units(allocatable, spec, used)
+            inventory.setdefault(gpu_class, {})[node.metadata.name] = units
         if labels_out is not None:
             labels_out[node.metadata.name] = dict(
                 getattr(node.metadata, "labels", None) or {}
@@ -1298,16 +1538,16 @@ async def snapshot_node_gpu_inventory(
 
 
 async def snapshot_node_gpu_capacity(
-    taint_key: str, gpu_resource: str = "nvidia.com/gpu"
+    taint_key: str, class_resources: Optional[Mapping[str, ClassResources]] = None,
 ) -> dict[str, int]:
-    """Return total allocatable GPUs per GPU-class label, from node taints.
+    """Return total allocatable units per GPU-class label, from node taints.
 
     Thin per-class collapse of ``snapshot_node_gpu_inventory`` (one node LIST,
     summed across the nodes of each class).  Feeds preemption planning's and the
     capacity audit's notion of physical capacity per class; the controller has
     no other source of "how many GPUs actually exist".
     """
-    inventory = await snapshot_node_gpu_inventory(taint_key, gpu_resource)
+    inventory = await snapshot_node_gpu_inventory(taint_key, class_resources)
     return {
         gpu_class: sum(per_node.values())
         for gpu_class, per_node in inventory.items()
@@ -1834,7 +2074,7 @@ async def emit_admission_paused_event(
 # Events telling a pending pod's owner why it is not running yet, whose
 # message ``main`` renders -- the siblings of OnDemandLeaseDenied and
 # OnDemandAdmissionPaused, which report the app refusing or a class being
-# paused.  The first six say something *about the pod* stops the controller
+# paused.  The first seven say something *about the pod* stops the controller
 # admitting it; the rest, that it is waiting -- for a reservation it is queued
 # on, for room on the nodes it asked for, or for GPU capacity the app gave to
 # requests ahead of it.  Each reason maps to the Event's
@@ -1844,6 +2084,7 @@ LEASE_REJECTED_REASON = "OnDemandLeaseRejected"
 UNKNOWN_GPU_CLASS_REASON = "UnknownGpuClass"
 NO_RESERVATION_REASON = "NoReservation"
 NO_GPU_REQUEST_REASON = "NoGpuRequest"
+MEMORY_LIMIT_MISMATCH_REASON = "MemoryLimitMismatch"
 ANNOTATION_IGNORED_REASON = "AnnotationIgnored"
 NO_MATCHING_NODE_REASON = "NoMatchingNode"
 WAITING_FOR_NODE_REASON = "WaitingForNode"
@@ -1857,6 +2098,7 @@ _PENDING_POD_EVENTS: dict[str, tuple[str, str, str]] = {
     UNKNOWN_GPU_CLASS_REASON: ("Warning", "AdmitPod", "gpu-unknown-class-"),
     NO_RESERVATION_REASON: ("Warning", "AdmitPod", "gpu-no-reservation-"),
     NO_GPU_REQUEST_REASON: ("Warning", "AdmitPod", "gpu-no-request-"),
+    MEMORY_LIMIT_MISMATCH_REASON: ("Warning", "AdmitPod", "gpu-memory-limit-"),
     ANNOTATION_IGNORED_REASON: ("Warning", "ReadAnnotations", "gpu-annotation-ignored-"),
     NO_MATCHING_NODE_REASON: ("Warning", "RequestOnDemandLease", "gpu-no-matching-node-"),
     # Normal, like WaitingForReservation: the owner chose the nodes, and they
@@ -1901,7 +2143,11 @@ async def emit_pending_pod_event(
     - ``NoReservation`` -- no reservation matches the pod and it does not
       qualify for on-demand admission either.
     - ``NoGpuRequest`` -- the pod carries a ``gpu-class`` label but requests
-      no ``nvidia.com/gpu``, so the controller ignores it.
+      none of what its class counts (``nvidia.com/gpu``, unless the class
+      defines its own unit), so the controller ignores it.
+    - ``MemoryLimitMismatch`` -- its class counts memory, and a container's
+      memory limit is missing or differs from its request, so what it reserves
+      would not bound what it uses; the controller does not admit it.
     - ``AnnotationIgnored`` -- one of its ``galends/*`` job-input annotations
       was invalid, or asks for something this deployment does not offer.
     - ``NoMatchingNode`` -- its node selector or required node affinity allows

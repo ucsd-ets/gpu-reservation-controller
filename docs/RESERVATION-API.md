@@ -1054,6 +1054,8 @@ either service-key scope.
   "relax_min_available_far": null,
   "relax_min_available_junior": null,
   "attach_all_groups": false,
+  "k8s_resources": null,
+  "unit_name": null,
   "is_active": true,
   "created_at": "2026-01-15T09:00:00Z"
 }
@@ -1092,6 +1094,43 @@ attachment.
 
 `label_value` is `null` when the class has no Kubernetes mapping; the
 controller skips reservations for such classes.
+
+**What one unit of a class is.** Every count the app keeps for a class —
+`total_gpus`, `effective_gpus_today`, a reservation's `gpu_count`, and every
+other GPU count in this document — is a whole number of the class's **units**.
+`k8s_resources` says what one unit is in Kubernetes resources, as an object of
+resource name to quantity, and `unit_name` is the word users see for one unit.
+Both are `null` for an ordinary class, which means one `nvidia.com/gpu`, called
+a GPU:
+
+| Class | `k8s_resources` | `unit_name` |
+|---|---|---|
+| NVIDIA GPUs | `null` — one `nvidia.com/gpu` | `null` — "GPU" |
+| AMD GPUs | `{"amd.com/gpu": "1"}` | `null` |
+| Large-memory nodes | `{"memory": "16Gi", "cpu": "2"}` | `"block"` |
+
+Names are Kubernetes resource names: unprefixed ones are limited to `cpu`,
+`memory`, `ephemeral-storage` and `hugepages-<size>`, and anything else carries a
+domain. Quantities use Kubernetes' own syntax and are always positive, and are
+returned as strings. The app validates both fields on every write, and does no
+arithmetic with them: its calendar, pricing and ceilings count units, whatever a
+unit is.
+
+A controller converts with them in both directions:
+
+- **A pod** needs, for each listed resource, its effective request of that
+  resource — as kube-scheduler computes it — divided by the unit's quantity and
+  **rounded up**. Its units are the **largest** of those: a pod requesting 40 GiB
+  and 2 cores of a `{"memory": "16Gi", "cpu": "2"}` class needs 3 units.
+- **A node** offers, for each listed resource, its allocatable quantity divided
+  by the unit's quantity and **rounded down**, after subtracting — for a resource
+  Kubernetes itself defines, which pods outside the reservation system consume
+  too — what pods the controller did not admit request of it there. Its units
+  are the **smallest** of those.
+
+A unit is therefore atomic: a reservation of N units admits pods whose units sum
+to at most N, however the pods split them. Changing a class's `k8s_resources`
+re-denominates every reservation already booked on it.
 
 **Errors**
 

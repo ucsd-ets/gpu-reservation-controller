@@ -80,6 +80,7 @@ curl http://localhost:8000/health
 | `reservation_client.py` | All HTTP calls to the reservation management API |
 | `k8s_client.py` | All Kubernetes API calls (watch, list, patch, singleton Lease); no business logic |
 | `controller.py` | Business logic: matching, time-window arithmetic, queue management |
+| `resources.py` | What one unit of a GPU class is, and converting Kubernetes quantities to units — pure, no `kubernetes` import |
 | `main.py` | Wiring only: creates state, starts tasks, owns the FastAPI app |
 
 ### Kubernetes client note
@@ -99,7 +100,7 @@ is sufficient.
 
 ### Testing
 
-The core logic modules (`controller.py`, `schemas.py`, `config.py`) have no
+The core logic modules (`controller.py`, `resources.py`, `schemas.py`, `config.py`) have no
 Kubernetes or HTTP dependencies and can be exercised with plain `pytest` and
 in-process mocks.  For the boundary modules the suite stays dependency-free
 (`requirements-dev.txt` is `pytest` only): `reservation_client.py` is tested with

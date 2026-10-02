@@ -79,6 +79,7 @@ from .k8s_client import (
     ANNOTATION_IGNORED_REASON,
     LEASE_NAME,
     LEASE_REJECTED_REASON,
+    MEMORY_LIMIT_MISMATCH_REASON,
     MIN_RUNTIME_ANNOTATION,
     NO_MATCHING_NODE_REASON,
     NO_GPU_REQUEST_REASON,
@@ -94,6 +95,7 @@ from .k8s_client import (
     WAITING_FOR_NODE_REASON,
     WAITING_FOR_RESERVATION_REASON,
     AnnotationProblem,
+    MemoryLimitProblem,
     NodePlacement,
     PodWatcher,
     ReservationFacts,
@@ -121,6 +123,7 @@ from .k8s_client import (
     get_pod_galends_annotations,
     get_pod_gpu_count,
     get_pod_guarantee_status,
+    get_pod_memory_limit_problem,
     get_pod_min_runtime_seconds,
     get_pod_node_placement,
     get_pod_runtime_guarantee_request,
@@ -143,6 +146,7 @@ from .k8s_client import (
     snapshot_tolerated_pods,
     utc_iso,
 )
+from .resources import DEFAULT_CLASS_RESOURCES, ClassResources, class_resources, plural
 from .reservation_client import (
     CAPACITY_DENIAL_CODES,
     LEASE_DENIED_STATUS,
@@ -400,6 +404,30 @@ class GpuClassMaps(NamedTuple):
     # only through the per-id fallback holds just the classes some reservation
     # happened to name, which cannot say a label is *unknown* to the app.
     complete: bool = False
+    # label_value → what one unit of the class is (resources.ClassResources),
+    # or None for a class whose unit did not parse.  The field itself None
+    # reads as empty.
+    resources: Optional[dict[str, Optional[ClassResources]]] = None
+
+
+def _class_resources_of(gc) -> Optional[ClassResources]:
+    """The unit a class row declares, or ``None`` (logged) when it cannot be used.
+
+    The app validates ``k8s_resources`` on every write, so a value that does not
+    parse here is a contract break -- an app/controller version mismatch, or a
+    hand-edited database.  Counting such a class as NVIDIA GPUs would be a guess
+    with real consequences (a memory class reading as zero GPUs looks drained to
+    guard 1b and over-committed to guard 4), so its unit is left unknown and the
+    class is said to be unusable, every reconcile, until it is fixed.
+    """
+    try:
+        return class_resources(gc.k8s_resources, gc.unit_name)
+    except ValueError as exc:
+        log.warning("%s", kv(
+            event="class.unresolvable", cid=gc.id, clabel=gc.label_value,
+            reason="invalid_unit", err=exc,
+        ))
+        return None
 
 
 async def _resolve_gpu_class_maps(
@@ -426,6 +454,7 @@ async def _resolve_gpu_class_maps(
         new_labels: dict[int, str] = {}
         new_ids: dict[str, int] = {}
         new_capacity: dict[str, int] = {}
+        new_resources: dict[str, Optional[ClassResources]] = {}
         for gc in gpu_classes:
             if gc.label_value:
                 new_labels[gc.id] = gc.label_value
@@ -436,10 +465,12 @@ async def _resolve_gpu_class_maps(
                 # GpuClassDetail.audit_gpus).
                 if gc.audit_gpus is not None:
                     new_capacity[gc.label_value] = gc.audit_gpus
+                new_resources[gc.label_value] = _class_resources_of(gc)
     else:
         new_labels = dict(prior.labels)
         new_ids = dict(prior.ids)
         new_capacity = dict(prior.capacity)
+        new_resources = dict(prior.resources or {})
     complete = gpu_classes is not None or prior.complete
 
     # Fallback: resolve any class the bulk list didn't cover (e.g. one created
@@ -454,13 +485,14 @@ async def _resolve_gpu_class_maps(
             new_ids[gpu_class.label_value] = cid
             if gpu_class.audit_gpus is not None:
                 new_capacity[gpu_class.label_value] = gpu_class.audit_gpus
+            new_resources[gpu_class.label_value] = _class_resources_of(gpu_class)
             log.info("%s", kv(event="class.resolved", cid=cid, class_=gpu_class.name, clabel=gpu_class.label_value))
         else:
             log.warning("%s", kv(
                 event="class.unresolvable", cid=cid, reason="no_label_value",
             ))
 
-    return GpuClassMaps(new_labels, new_ids, new_capacity, complete)
+    return GpuClassMaps(new_labels, new_ids, new_capacity, complete, new_resources)
 
 
 async def _reconcile_after_reservation_change(
@@ -499,6 +531,9 @@ async def _reconcile_after_reservation_change(
     state.gpu_class_ids = gpu_class_maps.ids
     state.gpu_class_capacity = gpu_class_maps.capacity
     state.gpu_classes_known = gpu_class_maps.complete
+    # Replaced wholesale, never mutated in place: a snapshot that took the old
+    # dict keeps counting pods and nodes in one consistent set of units.
+    state.gpu_class_resources = gpu_class_maps.resources or {}
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
@@ -512,7 +547,7 @@ async def _reconcile_after_reservation_change(
 
     # One snapshot serves both planners, taken lazily — we only know whether it
     # is needed after detection, and detection happens under the lock.
-    pod_snapshot = await _snapshot_pods_for_eviction(config)
+    pod_snapshot = await _snapshot_pods_for_eviction(config, state.counting_resources())
 
     evictions: list[_PodEviction] = []
     # Mid-window cancellations: re-link each admitted pod onto another open
@@ -557,6 +592,7 @@ async def _refresh_reservations(
             dict(state.gpu_class_ids),
             dict(state.gpu_class_capacity),
             state.gpu_classes_known,
+            dict(state.gpu_class_resources),
         ),
     )
 
@@ -617,7 +653,9 @@ class _PodEviction(NamedTuple):
     emit: Callable         # emit_reservation_{cancelled,reassigned}_event
 
 
-async def _snapshot_pods_for_eviction(config: Config) -> list:
+async def _snapshot_pods_for_eviction(
+    config: Config, units: Optional[dict[str, ClassResources]] = None,
+) -> list:
     """One tolerated-pod snapshot, shared by both eviction planners.
 
     Taken lazily — only when a reconcile actually has something to evict.  A
@@ -628,11 +666,14 @@ async def _snapshot_pods_for_eviction(config: Config) -> list:
     carries group_label=None, `_group_ok` then rejects every reservation while
     the feature is enabled, and the adoption re-link can never find a booking to
     carry the pod onto.  default_usage_group rides along for the same reason: a
-    pod admitted under the default group must read back carrying it.
+    pod admitted under the default group must read back carrying it.  *units*
+    (``ControllerState.counting_resources``) counts each pod in its class's
+    units, which the adoption re-link weighs against a booking's budget.
     """
     try:
         return await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group,
+            class_resources=units,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(
@@ -1218,7 +1259,10 @@ async def _preflight_with_fit(
     # scheduler's verdict is read for the blockers it can still name — it
     # cannot name a GPU shortage on this pod's own class, whose nodes it
     # rejected on our untolerated taint before ever weighing resources.
-    gpu_gated = is_gpu_gated_pending(fresh_pod, TOLERATION_KEY)
+    gpu_gated = is_gpu_gated_pending(
+        fresh_pod, TOLERATION_KEY,
+        state.resources_for(candidate.gpu_class_label).names,
+    )
     # Record *why* the candidate is (or isn't) waiting: True only when the
     # scheduler has not yet recorded a verdict (gpu_gated is None), so the
     # MODIFIED-driven fast re-attempt in pod_watch_loop fires solely for this
@@ -1835,19 +1879,40 @@ async def _emit_unknown_class_event(
     )
 
 
-def _no_gpu_request_message(gpu_class: str, config: Config) -> str:
-    """What the owner of a gpu-class pod that requests no GPUs reads.
+def _counted_in(spec: ClassResources) -> str:
+    """How a class is counted, for a sentence: ``amd.com/gpu``, or
+    ``blocks of memory 16Gi + cpu 2`` when a unit is a bundle or a multiple."""
+    if len(spec.units) == 1 and spec.units[0][1] == 1:
+        return spec.units[0][0]
+    return f"{plural(spec.unit_name, 2)} of {spec.describe()}"
+
+
+def _no_gpu_request_message(
+    gpu_class: str, config: Config, spec: ClassResources = DEFAULT_CLASS_RESOURCES,
+) -> str:
+    """What the owner of a gpu-class pod that requests none of what its class counts reads.
 
     Constant per class, so the shared throttle restates it only on its repeat.
     """
+    if spec.is_default:
+        return (
+            f"This pod has the gpu-class label {_plain(gpu_class)} but requests no "
+            f"GPUs: no container sets an nvidia.com/gpu resource limit or request. "
+            f"The GPU reservation controller ignores it -- it will not be admitted "
+            f"under a reservation or on demand. Set resources.limits nvidia.com/gpu "
+            f"on the container that needs the GPU and recreate the pod, or remove the "
+            f"gpu-class label if it needs none; if this is wrong, "
+            f"{_support_phrase(config)}"
+        )
+    names = " or ".join(spec.names)
     return (
-        f"This pod has the gpu-class label {_plain(gpu_class)} but requests no "
-        f"GPUs: no container sets an nvidia.com/gpu resource limit or request. "
-        f"The GPU reservation controller ignores it -- it will not be admitted "
-        f"under a reservation or on demand. Set resources.limits nvidia.com/gpu "
-        f"on the container that needs the GPU and recreate the pod, or remove the "
-        f"gpu-class label if it needs none; if this is wrong, "
-        f"{_support_phrase(config)}"
+        f"This pod has the gpu-class label {_plain(gpu_class)}, a class counted "
+        f"in {_counted_in(spec)}, but requests none of that: no container sets a "
+        f"{names} resource limit or request. The GPU reservation controller "
+        f"ignores it -- it will not be admitted under a reservation or on demand. "
+        f"Set resources.limits {names} on the container that needs it and recreate "
+        f"the pod, or remove the gpu-class label if it needs none; if this is "
+        f"wrong, {_support_phrase(config)}"
     )
 
 
@@ -1859,6 +1924,7 @@ async def _emit_no_gpu_request_event(
     namespace: str,
     gpu_class: str,
     now: datetime,
+    spec: ClassResources = DEFAULT_CLASS_RESOURCES,
 ) -> None:
     """Tell the pod's owner a gpu-class pod requesting no GPUs is ignored.
 
@@ -1871,13 +1937,73 @@ async def _emit_no_gpu_request_event(
     """
     if not config.pod_problem_event_enabled:
         return
-    message = _no_gpu_request_message(gpu_class, config)
+    message = _no_gpu_request_message(gpu_class, config, spec)
     await _post_pending_status(
         config, state, uid, pod_name, namespace,
         (NO_GPU_REQUEST_REASON, message), now,
         lambda: emit_pending_pod_event(
             uid, pod_name, namespace, message,
             reason=NO_GPU_REQUEST_REASON, gpu_class=gpu_class, gpu_count=0,
+        ),
+    )
+
+
+def _memory_limit_message(
+    gpu_class: str, spec: ClassResources, problem: MemoryLimitProblem, config: Config,
+) -> str:
+    """What the owner of a pod whose memory a reservation would not bound reads.
+
+    Constant per pod (resources are immutable), so the shared throttle restates
+    it only on its repeat.
+    """
+    if problem.container is None:
+        where = "its pod-level memory limit differs from its pod-level memory request"
+    elif problem.reason == "no_limit":
+        where = f"its container {_plain(problem.container)} sets no memory limit"
+    else:
+        where = (
+            f"its container {_plain(problem.container)} sets a memory limit "
+            f"different from its memory request"
+        )
+    return (
+        f"This pod has the gpu-class label {_plain(gpu_class)}, a class counted in "
+        f"{_counted_in(spec)}, and {where}. A reservation of this class holds what "
+        f"a pod requests, so no container may be able to use more: the GPU "
+        f"reservation controller will not admit it under a reservation or on "
+        f"demand. Set resources.limits.memory equal to resources.requests.memory on "
+        f"every container and recreate the pod; if this is wrong, "
+        f"{_support_phrase(config)}"
+    )
+
+
+async def _emit_memory_limit_event(
+    config: Config,
+    state: ControllerState,
+    uid: str,
+    pod_name: str,
+    namespace: str,
+    gpu_class: str,
+    spec: ClassResources,
+    problem: MemoryLimitProblem,
+    gpu_count: int,
+    now: datetime,
+) -> None:
+    """Tell the pod's owner a pod of a memory-counted class is not admitted.
+
+    The sibling of ``NoGpuRequest``: something about the pod as written stops
+    every path, so this Event is the controller's whole response -- told on
+    first sight and each watch resync, on the shared pending-status throttle.
+    """
+    if not config.pod_problem_event_enabled:
+        return
+    message = _memory_limit_message(gpu_class, spec, problem, config)
+    await _post_pending_status(
+        config, state, uid, pod_name, namespace,
+        (MEMORY_LIMIT_MISMATCH_REASON, message), now,
+        lambda: emit_pending_pod_event(
+            uid, pod_name, namespace, message,
+            reason=MEMORY_LIMIT_MISMATCH_REASON, gpu_class=gpu_class,
+            gpu_count=gpu_count,
         ),
     )
 
@@ -2206,11 +2332,6 @@ async def _emit_no_reservation_event(
     )
 
 
-def _gpus(n: int) -> str:
-    """``1 GPU``, ``2 GPUs``."""
-    return f"{n} GPU" if n == 1 else f"{n} GPUs"
-
-
 def _reservation_phrase(entry: QueueEntry) -> str:
     """A queued pod's reservation, as its owner would find it in the calendar.
 
@@ -2259,7 +2380,8 @@ def _waiting_for_reservation_message(entry: QueueEntry) -> str:
 
 
 def _reservation_full_message(
-    entry: QueueEntry, free: int, names: tuple[str, ...], others: int
+    entry: QueueEntry, free: int, names: tuple[str, ...], others: int,
+    spec: ClassResources = DEFAULT_CLASS_RESOURCES,
 ) -> str:
     """What the owner of a pod whose reservation is open but taken reads.
 
@@ -2271,8 +2393,9 @@ def _reservation_full_message(
     if free:
         what = (
             f"Your {_reservation_phrase(entry)} has only {free} of its "
-            f"{entry.reservation.gpu_count} GPUs free, and this pod requests "
-            f"{entry.gpu_requested}" + (f"; the rest are in use by {held}" if held else "")
+            f"{entry.reservation.gpu_count} {plural(spec.unit_name, 2)} free, and "
+            f"this pod requests {entry.gpu_requested}"
+            + (f"; the rest are in use by {held}" if held else "")
             + "."
         )
     else:
@@ -2280,7 +2403,7 @@ def _reservation_full_message(
             f"Your {_reservation_phrase(entry)} is fully in use"
             + (f" by {held}" if held else "") + "."
         )
-    enough = _gpus(entry.gpu_requested) + (" is" if entry.gpu_requested == 1 else " are")
+    enough = spec.amount(entry.gpu_requested) + (" is" if entry.gpu_requested == 1 else " are")
     return " ".join(part for part in (
         what,
         f"This pod will be admitted as soon as {enough} free.",
@@ -2288,20 +2411,23 @@ def _reservation_full_message(
     ) if part)
 
 
-def _reservation_too_small_message(entry: QueueEntry) -> str:
+def _reservation_too_small_message(
+    entry: QueueEntry, spec: ClassResources = DEFAULT_CLASS_RESOURCES,
+) -> str:
     """What the owner of a pod asking for more GPUs than its reservation holds reads.
 
     Routing queues a pod on a reservation too small for it only when its owner
-    holds no larger one of the class, so booking one is the fix.
+    holds no larger one of the class, so booking one is the fix.  *spec* is what
+    the class counts, which is also what the pod would have to ask for less of.
     """
     return " ".join(part for part in (
-        f"This pod requests {_gpus(entry.gpu_requested)}, but your "
+        f"This pod requests {spec.amount(entry.gpu_requested)}, but your "
         f"{_reservation_phrase(entry)} holds only {entry.reservation.gpu_count}, "
         f"so the pod can never be admitted under it.",
         _ondemand_meanwhile(entry, "either"),
         f"Book a gpu-class {entry.gpu_class_label} reservation of at least "
-        f"{_gpus(entry.gpu_requested)}, or lower the pod's nvidia.com/gpu request "
-        f"and recreate it.",
+        f"{spec.amount(entry.gpu_requested)}, or lower the pod's "
+        f"{' and '.join(spec.names)} request and recreate it.",
     ) if part)
 
 
@@ -2324,7 +2450,9 @@ def _queued_status(
         # larger -- which only a full fetch can show (a push is a delta).
         if not state.reservations_known:
             return None
-        return RESERVATION_TOO_SMALL_REASON, _reservation_too_small_message(entry)
+        return RESERVATION_TOO_SMALL_REASON, _reservation_too_small_message(
+            entry, state.resources_for(entry.gpu_class_label)
+        )
     if now < slot_start(r):
         return WAITING_FOR_RESERVATION_REASON, _waiting_for_reservation_message(entry)
     free = state.available(r, exclude_uid=entry.pod_uid)
@@ -2332,7 +2460,9 @@ def _queued_status(
         names, others = state.reservation_holders(
             r.id, entry.pod_namespace, exclude_uid=entry.pod_uid
         )
-        return RESERVATION_FULL_REASON, _reservation_full_message(entry, free, names, others)
+        return RESERVATION_FULL_REASON, _reservation_full_message(
+            entry, free, names, others, state.resources_for(entry.gpu_class_label)
+        )
     return None
 
 
@@ -3088,7 +3218,9 @@ async def _report_overstay_if_any(
         reservation_id,
         OverstayReportRequest(
             pod_uid=pod.metadata.uid,
-            gpu_count=get_pod_gpu_count(pod),
+            gpu_count=get_pod_gpu_count(
+                pod, state.resources_for((pod.metadata.labels or {}).get("gpu-class", ""))
+            ),
             start_utc=start,
             end_utc=now,
             end_reason=end_reason,
@@ -3250,23 +3382,54 @@ async def pod_watch_loop(
                         # Keep occupancy warm between ticks: record this admitted pod under
                         # its booking-reference id, so capacity accounting survives a restart.
                         if booking_id is not None:
-                            state.record_placement(booking_id, uid, get_pod_gpu_count(pod))
+                            state.record_placement(
+                                booking_id, uid,
+                                get_pod_gpu_count(pod, state.resources_for(gpu_class_label)),
+                            )
                             state.holder_names[uid] = (namespace, name)
                         continue
 
-                    gpu_count = get_pod_gpu_count(pod)
+                    # What the pod's class counts: one nvidia.com/gpu, or the
+                    # unit the class defines (an AMD GPU, a memory block).
+                    # Unknown until the app's class list has named the label
+                    # with a usable unit; the pod is then counted in
+                    # nvidia.com/gpu like everything else (resources_for).
+                    spec = state.class_resources(gpu_class_label)
+                    gpu_count = get_pod_gpu_count(pod, state.resources_for(gpu_class_label))
                     now = datetime.now(timezone.utc)
                     if gpu_count < 1:
-                        # A gpu-class pod asking for no GPUs is ignored: there is
-                        # nothing for a reservation to hold, the app refuses a
-                        # 0-GPU lease (a 422 that used to be retried forever),
-                        # and a toleration would only put a CPU-only pod on a
-                        # GPU node.  Its owner is told why, on first sight and
-                        # each resync -- pod resources are immutable, so a
-                        # MODIFIED cannot change the verdict.
+                        # A gpu-class pod asking for none of what its class
+                        # counts is ignored: there is nothing for a reservation
+                        # to hold, the app refuses a 0-GPU lease (a 422 that used
+                        # to be retried forever), and a toleration would only put
+                        # a pod on a node it has no use for.  Its owner is told
+                        # why, on first sight and each resync -- pod resources
+                        # are immutable, so a MODIFIED cannot change the verdict.
                         state.remove_ondemand_candidate(uid)
                         state.dequeue_pod(uid)
                         if event_type == "ADDED":
+                            if spec is None:
+                                # Counted in the default only because the class's
+                                # own unit is not known yet (or did not parse):
+                                # an AMD pod would read as "no GPUs" here.  The
+                                # pod is not blamed for that gap -- it is re-read
+                                # at the next resync, once the class list has
+                                # settled it; a class the app does not list at
+                                # all is told as such, exactly as below.
+                                log.debug("%s", kv(
+                                    event="pod.left_pending", ns=namespace, pod=name,
+                                    reason="class_unit_unknown",
+                                ))
+                                if (
+                                    phase == "Pending"
+                                    and state.gpu_classes_known
+                                    and gpu_class_label not in state.gpu_class_ids
+                                ):
+                                    await _emit_unknown_class_event(
+                                        config, state, uid, name, namespace,
+                                        gpu_class_label, now,
+                                    )
+                                continue
                             log.debug("%s", kv(
                                 event="pod.left_pending", ns=namespace, pod=name,
                                 reason="no_gpu_request",
@@ -3274,9 +3437,35 @@ async def pod_watch_loop(
                             if phase == "Pending":
                                 await _emit_no_gpu_request_event(
                                     config, state, uid, name, namespace,
-                                    gpu_class_label, now,
+                                    gpu_class_label, now, spec,
                                 )
                         continue
+                    if spec is not None and spec.counts_memory:
+                        # A class counted in memory reserves what a pod
+                        # requests, and only a limit bounds what it uses: a
+                        # 64Gi request with a 1Ti limit books four 16Gi blocks
+                        # and can take sixty-four.  Such a pod takes no path,
+                        # and its owner is told how to fix it.
+                        memory_problem = get_pod_memory_limit_problem(pod)
+                        if memory_problem is not None:
+                            state.remove_ondemand_candidate(uid)
+                            state.dequeue_pod(uid)
+                            if event_type == "ADDED":
+                                log.debug("%s", kv(
+                                    event="pod.left_pending", ns=namespace, pod=name,
+                                    reason="memory_limit_mismatch",
+                                    detail=(
+                                        f"{memory_problem.container or 'pod'} "
+                                        f"{memory_problem.reason}"
+                                    ),
+                                ))
+                                if phase == "Pending":
+                                    await _emit_memory_limit_event(
+                                        config, state, uid, name, namespace,
+                                        gpu_class_label, spec, memory_problem,
+                                        gpu_count, now,
+                                    )
+                            continue
                     admittable = state.find_admittable_reservation(
                         namespace, gpu_class_label, gpu_count, now, horizon, group_label
                     )
@@ -3440,7 +3629,10 @@ async def pod_watch_loop(
                             if (
                                 candidate is not None
                                 and candidate.awaiting_schedule_signal
-                                and is_gpu_gated_pending(pod, TOLERATION_KEY) is not None
+                                and is_gpu_gated_pending(
+                                    pod, TOLERATION_KEY,
+                                    state.resources_for(gpu_class_label).names,
+                                ) is not None
                             ):
                                 candidate.awaiting_schedule_signal = False
                                 candidate.next_attempt_at = datetime.now(timezone.utc)
@@ -3621,9 +3813,13 @@ async def _run_queue_tick(
     # separate guard scans.  On failure, keep the previous state rather than
     # dropping budget / no-show protection.
     snapshot = None
+    # Taken once: the pod snapshot and the node inventory below must count in
+    # the same units, and the class list can be refreshed between their awaits.
+    units = state.counting_resources()
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group,
+            class_resources=units,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="queue.snapshot_failed", target="pods", err=exc), exc_info=True)
@@ -3715,7 +3911,7 @@ async def _run_queue_tick(
     if config.ondemand_lease_enabled and snapshot is not None:
         try:
             inventory = await snapshot_node_gpu_inventory(
-                TOLERATION_KEY, labels_out=node_labels
+                TOLERATION_KEY, units, labels_out=node_labels
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("%s", kv(
@@ -4596,15 +4792,18 @@ async def _run_preemption_sweep(
     ):
         return
 
+    # One set of units for both snapshots (see _run_queue_tick).
+    units = state.counting_resources()
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group,
+            class_resources=units,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="preempt.snapshot_failed", target="pods", err=exc), exc_info=True)
         return
     try:
-        inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)
+        inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY, units)
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
             event="preempt.snapshot_failed", target="node_capacity", err=exc,
@@ -4797,7 +4996,9 @@ async def _run_capacity_audit(
     preemption sweep follows).
     """
     try:
-        physical = await snapshot_node_gpu_capacity(TOLERATION_KEY)
+        physical = await snapshot_node_gpu_capacity(
+            TOLERATION_KEY, state.counting_resources()
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
             event="capacity_audit.snapshot_failed", target="node_capacity", err=exc,
@@ -4867,10 +5068,14 @@ async def capacity_audit_loop(
 ONDEMAND_GATE_WARNING_INTERVAL_S = 60
 
 
-def _ondemand_gate_detail(gate: OnDemandGate, config: Config) -> str:
+def _ondemand_gate_detail(
+    gate: OnDemandGate, config: Config, spec: ClassResources = DEFAULT_CLASS_RESOURCES,
+) -> str:
     """Plain-English account of *gate*: what is paused, why, what to check,
     and what lifts it — written for an operator who has never seen this
-    service.  Rendered into the ``detail=`` field of ``ondemand.gated``."""
+    service.  Rendered into the ``detail=`` field of ``ondemand.gated``.
+    *spec* is what the class counts, which decides what its nodes' capacity
+    is read from and what is likely to be wrong with them."""
     c = gate.label
     paused = (
         f"On-demand GPU jobs for GPU class '{c}' are paused: the controller is "
@@ -4906,13 +5111,31 @@ def _ondemand_gate_detail(gate: OnDemandGate, config: Config) -> str:
             "counts agree"
             + (", and for each pod as soon as its lease fits." if fit else ".")
         )
+        if spec.is_default:
+            units, source, suspect = "GPUs", "allocatable nvidia.com/gpu", (
+                "a failing NVIDIA device plugin"
+            )
+        else:
+            units = plural(spec.unit_name, 2)
+            source = (
+                f"allocatable {' and '.join(spec.names)} in {units} of "
+                f"{spec.describe()}"
+                + (", less what pods outside the reservation system request there"
+                   if spec.native else "")
+            )
+            suspect = (
+                "pods outside the reservation system (DaemonSets) requesting more "
+                f"of the nodes' {' and '.join(spec.native)} than before"
+                if spec.native else "a failing device plugin"
+            )
         return (
             f"{head} Cause: capacity mismatch. The reservation app believes this "
-            f"class has {app} GPUs today, but schedulable Kubernetes nodes tainted "
-            f"{TOLERATION_KEY}={c} provide {phys} (allocatable nvidia.com/gpu, or "
+            f"class has {app} {units} today, but schedulable Kubernetes nodes tainted "
+            f"{TOLERATION_KEY}={c} provide {phys} ({source}, or "
             f"the node's galends/force-node-capacity annotation). {why} To fix: "
-            f"check for cordoned, NotReady or missing GPU nodes and a failing "
-            f"NVIDIA device plugin (kubectl get nodes; kubectl describe node "
+            f"check for cordoned, NotReady or missing "
+            f"{'GPU nodes' if spec.is_default else 'nodes'} and {suspect} "
+            f"(kubectl get nodes; kubectl describe node "
             f"<node>), or, if the hardware is really gone, lower the class's GPU "
             f"count or add a capacity override for today in the reservation "
             f"app.{best_effort} {clears}"
@@ -4954,7 +5177,7 @@ def _warn_ondemand_gates(state: ControllerState, config: Config) -> None:
             reason=gate.reason, dur_s=int((now - gate.since).total_seconds()),
             candidates=gate.waiting, app_gpus=gate.app_gpus,
             phys_gpus=gate.phys_gpus, pods=list(gate.stuck_pods) or None,
-            detail=_ondemand_gate_detail(gate, config),
+            detail=_ondemand_gate_detail(gate, config, state.resources_for(gate.label)),
         ))
 
 
@@ -5342,6 +5565,7 @@ async def push_reservations(
             dict(state.gpu_class_ids),
             dict(state.gpu_class_capacity),
             state.gpu_classes_known,
+            dict(state.gpu_class_resources),
         ),
     )
 
@@ -5483,9 +5707,12 @@ async def preemption_risk_forecast(
     now = datetime.now(timezone.utc)
 
     # Snapshots are awaited OUTSIDE the lock, mirroring the preemption sweep.
+    # One set of units for both snapshots (see _run_queue_tick).
+    units = state.counting_resources()
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group,
+            class_resources=units,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="forecast.snapshot_failed", target="pods", err=exc), exc_info=True)
@@ -5494,7 +5721,7 @@ async def preemption_risk_forecast(
             detail="Cluster pod snapshot unavailable; forecast cannot be computed",
         )
     try:
-        inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)
+        inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY, units)
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
             event="forecast.snapshot_failed", target="node_capacity", err=exc,

@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Collection, Iterable, Literal, NamedTuple, Optional
 
 from .log_fields import kv
+from .resources import DEFAULT_CLASS_RESOURCES, ClassResources
 from .schemas import ReservationResponse
 
 log = logging.getLogger(__name__)
@@ -906,6 +907,14 @@ class ControllerState:
         # main._run_capacity_audit).
         self.gpu_class_capacity: dict[str, int] = {}
 
+        # What one unit of each class is: label → resources.ClassResources,
+        # refreshed alongside the label maps from the class list's
+        # k8s_resources / unit_name.  Every class the app lists has an entry,
+        # the NVIDIA default included; ``None`` marks one whose unit did not
+        # parse.  Read through class_resources() (may a pod be judged by its
+        # count?) and counting_resources() / resources_for() (what to count in).
+        self.gpu_class_resources: dict[str, Optional[ClassResources]] = {}
+
         # GPU class labels found over-committed (app-side effective count >
         # physical capacity).  Guard 4 applies to any class in this set: new
         # on-demand admissions are held unless they fit in the physical GPUs
@@ -1133,6 +1142,44 @@ class ControllerState:
     # ------------------------------------------------------------------
     # No-show tracking
     # ------------------------------------------------------------------
+
+    def class_resources(self, gpu_class_label: str) -> Optional[ClassResources]:
+        """What one unit of *gpu_class_label* is, or ``None`` when that is unknown.
+
+        Unknown means the app's class list has not named the label (yet), or
+        named it with a unit that did not parse.  A caller deciding something
+        *about the pod* from its unit count -- that it requests none of what its
+        class counts -- must not decide it on a guess.  A label the class maps
+        know but that carries no unit record (a state assembled without one)
+        reads as the NVIDIA default, which is what the class list implies when
+        it says nothing.
+        """
+        if gpu_class_label in self.gpu_class_resources:
+            return self.gpu_class_resources[gpu_class_label]
+        if gpu_class_label in self.gpu_class_ids:
+            return DEFAULT_CLASS_RESOURCES
+        return None
+
+    def counting_resources(self) -> dict[str, ClassResources]:
+        """The units to count pods and nodes in, one consistent set.
+
+        Every class whose unit is known; any other is counted in
+        ``nvidia.com/gpu``, the way every class was before units existed -- on
+        pods and nodes alike, so the two sides of every comparison stay in the
+        same units.  Take it **once** per snapshot and pass the same dict to the
+        node inventory and the pod snapshot: the class list can be refreshed
+        between the two awaits, and a pod counted in one unit against a node
+        counted in another is a capacity figure that means nothing.
+        """
+        return {
+            label: spec
+            for label, spec in self.gpu_class_resources.items()
+            if spec is not None
+        }
+
+    def resources_for(self, gpu_class_label: str) -> ClassResources:
+        """The unit to count *gpu_class_label* in (see ``counting_resources``)."""
+        return self.gpu_class_resources.get(gpu_class_label) or DEFAULT_CLASS_RESOURCES
 
     def update_noshow_tracking(
         self,
@@ -1546,7 +1593,13 @@ class ControllerState:
 
         existing = self.task_queue.get(pod_uid)
         if existing and existing.reservation.id == reservation.id:
-            return  # already queued for the same reservation
+            # Already queued for the same reservation -- but a re-route (each
+            # watch resync replays the pod) brings a fresh count, which differs
+            # only when the class's unit was redefined meanwhile.  Take it, or
+            # the pod is admitted against its budget in units that no longer
+            # exist.
+            existing.gpu_requested = gpu_requested
+            return
 
         entry = QueueEntry(
             pod_uid=pod_uid,
@@ -1811,8 +1864,13 @@ class ControllerState:
             if pod_uid in occupants:
                 return
 
-        if pod_uid in self.ondemand_candidates:
-            return  # already registered
+        existing = self.ondemand_candidates.get(pod_uid)
+        if existing is not None:
+            # Already registered; refresh the count for the same reason as
+            # enqueue_pod -- a redefined unit -- so the lease asks for units of
+            # the class as it is now.
+            existing.gpu_requested = gpu_requested
+            return
 
         candidate = OnDemandCandidate(
             pod_uid=pod_uid,

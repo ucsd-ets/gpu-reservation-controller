@@ -257,7 +257,8 @@ guarantee for "how long you are safe".
 
 `reservation-gpu-count` is how many GPUs the *reservation* holds — compare it
 against the pod's own `nvidia.com/gpu` request to tell a user they are using 1 of
-the 4 GPUs they booked. It is not a per-pod figure: a user running several pods
+the 4 GPUs they booked.  On a class counted in something else (§3.2) it is a
+count of that class's units. It is not a per-pod figure: a user running several pods
 under one booking sees the same count on each.
 
 **`galends/admitted-at` — when this pod got its GPU.** Written once, on the pod's
@@ -333,8 +334,9 @@ the controller's log, wherever ignoring it changes what happens to the pod — s
 **Wait or lease.** These annotations decide whether a pod *can* be admitted on
 demand; whether it *is* depends first on its owner's bookings. The controller
 routes a pod by taking the first of these that applies — unless the pod requests
-no `nvidia.com/gpu` at all, in which case it is ignored by every path and told
-so (`NoGpuRequest`, §5.3):
+none of what its GPU class counts (`nvidia.com/gpu`, unless the class counts
+something else, §3.2), in which case it is ignored by every path and told so
+(`NoGpuRequest`, §5.3):
 
 1. A booking of the owner's for the pod's GPU class (and usage group, where the
    cluster matches by group) that is open now, or opens within
@@ -430,6 +432,40 @@ for the pod, the pod is moved onto it and gains that booking's guarantee
 
 This is an opt-in the **deployment** must also enable (`BEST_EFFORT_ENABLED`);
 where it is off, the annotation is ignored and the pod is handled as before.
+
+### 3.2 Classes counted in something other than NVIDIA GPUs
+
+Most GPU classes count `nvidia.com/gpu`, one per GPU.  A class may instead count
+another resource — AMD GPUs — or a **block** of resources, for large-memory nodes
+that have no GPUs at all.  Ask your administrator what one unit of the class is;
+the reservation screens still call every unit a "GPU" for now.
+
+- **AMD GPUs** — request `amd.com/gpu` instead of `nvidia.com/gpu`; everything
+  else is as for any GPU class.
+- **Blocks of a large-memory node** — say one block is 16 GiB of memory and 2
+  cores.  Request memory and cpu as usual; the pod needs, for each of the two,
+  its request divided by the block's share, **rounded up**, and the larger of
+  those is how many blocks it takes from a reservation.  40 GiB and 2 cores is 3
+  blocks (40 ÷ 16 = 2.5 → 3); 16 GiB and 13 cores is 7 (13 ÷ 2 = 6.5 → 7) — cores
+  count, because a node's cores run out too.  Book the blocks, then start the
+  pod.
+
+On a class counted in memory, **every container's memory limit must equal its
+memory request** (plain init containers excepted).  A reservation holds what a
+pod requests, and only a limit stops a container using more, so a pod without
+matching limits is not admitted and is told why (`MemoryLimitMismatch`, §5.3):
+
+```yaml
+metadata:
+  labels:
+    gpu-class: bigmem          # the class's label, as for any GPU class
+spec:
+  containers:
+    - name: analysis
+      resources:
+        requests: {memory: 200Gi, cpu: "8"}
+        limits:   {memory: 200Gi}   # = the request: 13 blocks (200 ÷ 16 = 12.5 → 13)
+```
 
 ### The whole `galends/` namespace leaves the cluster
 
@@ -719,7 +755,7 @@ begins.
 
 ### 5.3 When the pod itself needs fixing
 
-§5.1 and §5.2 report things outside the pod.  These five report the pod: the
+§5.1 and §5.2 report things outside the pod.  These report the pod: the
 controller cannot act on it *as written*, and waiting will not change that —
 the pod has to be corrected (usually: fix it and recreate it) or, if it looks
 right, reported to support.
@@ -728,7 +764,8 @@ right, reported to support.
 |---|---|
 | `OnDemandLeaseRejected` | The reservation service did not recognise something the pod's on-demand request named: its **usage group** (the usual cause — a mistyped group label or `galends/usage-group` annotation), its user (the pod's namespace) or its GPU class. The Event quotes the service's reason, the user and group that were sent, and where the group came from — the pod's label, its annotation, or the cluster's default when the pod named none. If you hold a booking of this class under a *different* usage group, it says so. |
 | `UnknownGpuClass` | The pod's `gpu-class` label is not a GPU class the reservation service knows, so no reservation can match it and it cannot be admitted on demand. The Event lists the classes that do exist. |
-| `NoGpuRequest` | The pod has a `gpu-class` label but no container requests an `nvidia.com/gpu`, so the controller ignores it: it is not admitted under a reservation or on demand. Set `resources.limits` `nvidia.com/gpu` on the container that needs the GPU and recreate the pod — or drop the `gpu-class` label if it needs none. |
+| `NoGpuRequest` | The pod has a `gpu-class` label but no container requests an `nvidia.com/gpu` — or, on a class counted in something else (§3.2), any of what that class counts — so the controller ignores it: it is not admitted under a reservation or on demand. Set `resources.limits` for what the Event names on the container that needs it and recreate the pod — or drop the `gpu-class` label if it needs none. |
+| `MemoryLimitMismatch` | The pod's class is counted in memory (§3.2), and one of its containers sets no memory limit, or a limit different from its memory request, so the pod could use more than its reservation holds. The controller does not admit it. Set `resources.limits.memory` equal to `resources.requests.memory` on every container and recreate the pod; the Event names the container. |
 | `NoReservation` | No reservation matches the pod, and it does not qualify for on-demand admission either, so nothing will ever admit it as it stands. The Event gives every reason — on-demand admission is not enabled on this cluster; or the pod has no (or an invalid) `galends/minimum-runtime-seconds`; or it names no usage group — and names any booking you hold that the pod narrowly misses: the right class under another usage group, or another class. |
 | `AnnotationIgnored` | One of the pod's `galends/*` annotations was invalid, or asks for something this cluster does not offer, and was ignored in a way that changes what happens: the cluster's default minimum runtime is used instead of yours, or the pod is admitted with a guaranteed runtime (charged like any on-demand lease) instead of on a best-effort basis.  A pod that waits for its reservation instead of being admitted now because of one is told in its §5.4 Event instead. |
 | `NoMatchingNode` | The pod's `nodeSelector`, or the required part of its node affinity, rules out every schedulable node of its GPU class — a mistyped host name, a hardware label the class does not have, or a node that is cordoned or down — so it could not start there and no on-demand lease is requested for it. The Event quotes the constraint, and names any other GPU class whose nodes it *does* match, since asking for one class's hardware under another's `gpu-class` label is a common cause. The controller keeps checking on its queue interval (5 minutes by default), so a pod waiting on a cordoned or down node goes ahead once the node is back. |
@@ -784,7 +821,7 @@ newest thing on the pod is not kube-scheduler's "untolerated taint" — or a
 |---|---|---|
 | `WaitingForReservation` | `Normal` | The reservation has not opened yet.  The Event gives its id and window; the pod is admitted shortly after the window opens (within the controller's queue interval, 5 minutes by default). |
 | `ReservationFull` | `Warning` | The reservation is open, but your other pods hold its GPUs.  The Event names them — a notebook server you forgot to stop is the usual cause.  The pod is admitted as soon as enough of them end; stop one to start it sooner. |
-| `ReservationTooSmall` | `Warning` | The reservation holds fewer GPUs than the pod requests, so it can never admit it — the pod is queued on it only because you hold no larger one of the class.  Book a reservation of at least the pod's `nvidia.com/gpu` request, or lower the request and recreate the pod. |
+| `ReservationTooSmall` | `Warning` | The reservation holds fewer GPUs than the pod requests, so it can never admit it — the pod is queued on it only because you hold no larger one of the class.  Book a reservation of at least the pod's request — its `nvidia.com/gpu`, or its units of a class counted in something else (§3.2) — or lower the request and recreate the pod. |
 
 ```console
 $ kubectl describe pod my-training-job

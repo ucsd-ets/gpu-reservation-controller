@@ -89,10 +89,10 @@ def _patch_snapshots(
     if inventory is None:
         inventory = _one_node_per_class(capacity)
 
-    async def _snapshot_pods(_key, _group_label_key=None, _group_label_default=None):
+    async def _snapshot_pods(_key, _group_label_key=None, _group_label_default=None, class_resources=None):
         return pods
 
-    async def _snapshot_inventory(_key):
+    async def _snapshot_inventory(_key, _class_resources=None):
         return inventory
 
     deleted: list[tuple[str, str]] = []
@@ -139,7 +139,7 @@ class TestNoBoundariesInScope:
 
         called = []
 
-        async def _boom(_key, _group_label_key=None, _group_label_default=None):
+        async def _boom(_key, _group_label_key=None, _group_label_default=None, class_resources=None):
             called.append(_key)
             raise AssertionError("should not be called")
 
@@ -156,7 +156,7 @@ class TestSnapshotFailureFailsSafe:
         state = _state(_boundary_reservation())
         config = _config()
 
-        async def _boom(_key, _group_label_key=None, _group_label_default=None):
+        async def _boom(_key, _group_label_key=None, _group_label_default=None, class_resources=None):
             raise RuntimeError("apiserver down")
 
         deleted = []
@@ -173,10 +173,10 @@ class TestSnapshotFailureFailsSafe:
         state = _state(_boundary_reservation())
         config = _config()
 
-        async def _ok_pods(_key, _group_label_key=None, _group_label_default=None):
+        async def _ok_pods(_key, _group_label_key=None, _group_label_default=None, class_resources=None):
             return []
 
-        async def _boom(_key):
+        async def _boom(_key, _class_resources=None):
             raise RuntimeError("apiserver down")
 
         deleted = []

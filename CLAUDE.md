@@ -52,7 +52,8 @@ app/
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
 ├── log_fields.py         kv() — renders log message bodies as key=value fields (see docs/LOG-FIELDS.md)
 ├── trace.py              Per-unit-of-work trace ids + X-Client-Trace propagation (see **Trace ids**)
-├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node, cordoned/deleting/NotReady nodes excluded, honouring the galends/force-node-capacity node annotation; optionally node labels too) / snapshot_node_gpu_capacity (per-class collapse of it), get_pod_node_placement (a pod's nodeSelector + required node affinity, as a matchable NodePlacement)
+├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node units of each class, cordoned/deleting/NotReady nodes excluded, honouring the galends/force-node-capacity node annotation; optionally node labels too) / snapshot_node_gpu_capacity (per-class collapse of it), get_pod_effective_requests / get_pod_gpu_count (a pod's requests as kube-scheduler sums them, and its units of its class), get_pod_node_placement (a pod's nodeSelector + required node affinity, as a matchable NodePlacement)
+├── resources.py          What one unit of a class is (ClassResources — one nvidia.com/gpu unless the class defines its own) and the quantity ↔ unit arithmetic: pod_units / node_units
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning, preemption-risk forecast
 ```
 
@@ -1212,7 +1213,11 @@ Both scheduler message formats are handled: older versions name the offending
 taint inline (`untolerated taint {key=value: NoSchedule}`), current ones emit an
 anonymous count (`25 node(s) had untolerated taint(s)`).  Named taints are
 checked against `TOLERATION_KEY`; an anonymous bucket gets the benefit of the
-doubt.
+doubt.  "GPU shortage" means a shortage of whatever the pod's class counts:
+`nvidia.com/gpu` by default, or the resources of the class's own unit (see
+**Class resource units**), so `Insufficient amd.com/gpu` on an AMD class, and
+`Insufficient memory` / `cpu` from the ordinary nodes on a memory class, read as
+that class's shortage rather than a blocker.
 
 **1b — the physical half**, since 1a establishes only that *something* we might
 tolerate is in the way.  `ControllerState.class_node_counts` (class → schedulable
@@ -1532,7 +1537,7 @@ User-facing documentation is `docs/POD-ANNOTATIONS.md` §5.2.
 ### Telling the pod's owner the pod itself is the problem
 
 The two sections above cover the app refusing a lease and a class being paused.
-Four more ways a `gpu-class` pod could be held or ignored reached only the
+Other ways a `gpu-class` pod could be held or ignored reached only the
 controller's log — or nothing at all — although in each the thing to fix is the
 pod itself, which only its owner can change:
 
@@ -1541,7 +1546,8 @@ pod itself, which only its owner can change:
 | `OnDemandLeaseRejected` | The app answered the lease ask **404**: it does not recognise the user, usage group or GPU class the ask named — all of which came off the pod | `lease.error` WARNING, filed with the operator faults |
 | `UnknownGpuClass` | The pod's `gpu-class` label names no class the app knows | `ondemand.candidate_held reason=class_id_unknown` WARNING, every 2–5 min |
 | `NoReservation` | No reservation matches the pod and it does not qualify for on-demand admission, so no path will ever pick it up | `pod.left_pending` at **DEBUG** |
-| `NoGpuRequest` | The pod has a `gpu-class` label but requests no `nvidia.com/gpu`, so the controller ignores it — no reserved path, no lease | A JIT candidate asking the app for a 0-GPU lease: a 422 on every create shape, retried on backoff forever |
+| `NoGpuRequest` | The pod has a `gpu-class` label but requests none of what its class counts (`nvidia.com/gpu`, unless the class defines its own unit), so the controller ignores it — no reserved path, no lease | A JIT candidate asking the app for a 0-GPU lease: a 422 on every create shape, retried on backoff forever |
+| `MemoryLimitMismatch` | The pod's class counts memory, and a container's memory limit is missing or differs from its request, so what the pod reserves would not bound what it uses (see **Class resource units**) | — (new with memory classes) |
 | `AnnotationIgnored` | A `galends/*` job-input annotation was invalid, or asks for something the deployment does not offer, and ignoring it changed what happens | `pod.annotation_invalid` WARNING, or nothing (`galends/runtime-guarantee` while `BEST_EFFORT_ENABLED` is off) |
 
 Each message says what is wrong, what the controller did instead, and what to
@@ -1622,7 +1628,7 @@ Four properties are load-bearing:
   caught.
 
 **RBAC / config**: none new.  `POD_PROBLEM_EVENT_ENABLED=false`
-disables `UnknownGpuClass`, `NoReservation`, `NoGpuRequest` and `AnnotationIgnored` (and the
+disables `UnknownGpuClass`, `NoReservation`, `NoGpuRequest`, `MemoryLimitMismatch` and `AnnotationIgnored` (and the
 two placement Events of **Pods that narrow their nodes**);
 `OnDemandLeaseRejected` rides `ONDEMAND_DENIAL_EVENT_ENABLED`.  User-facing
 documentation is `docs/POD-ANNOTATIONS.md` §5.3.
@@ -1928,8 +1934,10 @@ User-facing documentation is `docs/POD-ANNOTATIONS.md` §5.3.
 
 ### Forcing a node's GPU capacity
 
-`status.allocatable["nvidia.com/gpu"]` is the controller's only evidence of how
-many GPUs physically exist, and it is not always the number the reservation
+`status.allocatable["nvidia.com/gpu"]` (or, for a class with its own unit, the
+allocatable of that unit's resources, converted — see **Class resource units**)
+is the controller's only evidence of how many GPUs physically exist, and the
+override is in the same units; it is not always the number the reservation
 system should account against — some of a node's GPUs are failing, or are held
 back for non-reservation work, or the device plugin reports nonsense.  The
 **node** annotation `galends/force-node-capacity` (`k8s_client.FORCE_NODE_CAPACITY`)
@@ -1978,6 +1986,90 @@ reconciliation**: forcing a class below the app's `effective_gpus_today` makes i
 read over-committed, which gates JIT admission for it (guard 4) and logs the
 hourly mismatch WARNING — usually the point of forcing capacity down.  Forcing it
 *up* to silence that audit conceals a real shortage instead of fixing it.
+
+### Class resource units (AMD GPUs, memory blocks)
+
+The app's `GpuClass` may say what **one unit** of a class is (RESERVATION-API.md
+§4, "What one unit of a class is"): `k8s_resources` — `{"amd.com/gpu": "1"}` for
+an AMD class, `{"memory": "16Gi", "cpu": "2"}` for a class of large-memory nodes —
+and `unit_name`, the word users see ("block").  Both null is one `nvidia.com/gpu`,
+which is every class that predates them.  Every count the controller keeps —
+budgets, occupancy, free capacity, preemption demand, the guards, the forecast —
+was already an integer per class, so nothing downstream changed:
+`app/resources.py` is the one place quantities become units, and
+`GpuClassMaps.resources` / `ControllerState.gpu_class_resources` carry each
+class's `ClassResources` from the class list.
+
+- **A pod's units**: for each resource of the unit, the pod's effective request
+  (`k8s_client.get_pod_effective_requests` — kube-scheduler's `PodRequests`:
+  containers plus sidecars against the largest init container, pod-level
+  `spec.resources`, RuntimeClass overhead) divided by the unit's quantity and
+  rounded **up**; the **largest** wins (`resources.pod_units`).
+  `get_pod_gpu_count(pod, spec)` returns that, keeping its name.
+- **A node's units**: per resource, allocatable divided by the unit's quantity and
+  rounded **down**; the **smallest** wins (`resources.node_units`).  For a
+  **native** resource — cpu, memory, hugepages, anything Kubernetes itself
+  defines — what pods the controller does not count request on the node is
+  subtracted first (`k8s_client._node_requests_outside_reservations`: one pod
+  LIST per such node, by `spec.nodeName`; a pod with the `gpu-class` label *and*
+  our toleration is the planners' to count, and terminal or terminating pods are
+  skipped).  DaemonSets with a blanket toleration land on reservation-tainted
+  nodes and request memory and cpu that the tolerated-pod snapshot never sees.
+  Nothing else on a tainted node requests a vendor resource, so GPU classes LIST
+  nothing extra.  `galends/force-node-capacity` is in units and replaces the
+  subtraction too.
+- **Why largest and smallest**: it makes a unit atomic.  If the units of the pods
+  on a node fit its units, the pods fit it in *every* resource — Slurm's
+  `MAX_TRES` billing idea.  A CPU-heavy pod on a memory class is charged for the
+  memory it locks out, and the controller never believes a node has room in
+  memory that is gone in cpu, which would mint leases whose pods stick Pending on
+  `Insufficient cpu` and trip guard 3 for the whole class.
+- **One set of units per snapshot.**  `ControllerState.counting_resources()` is
+  taken once and passed to both the node inventory and the tolerated-pod
+  snapshot.  A class's pods counted in its unit and its nodes in
+  `nvidia.com/gpu` read as zero capacity with pods using it — negative free
+  capacity, which the boundary sweep takes for a shortfall at every booking start
+  and kills overstayers to cover.  `tests/test_class_units.py` pins the
+  consistent case and the mixed one.
+- **Unit unknown is not "requests nothing".**  `ControllerState.class_resources(label)`
+  is `None` until the class list names the label with a unit that parses (a label
+  the maps know with no unit record reads as the default).  Meanwhile a pod is
+  counted in `nvidia.com/gpu` (`resources_for`), but a zero count is **not** told
+  as `NoGpuRequest` — an AMD pod would read as requesting nothing — and the pod
+  is re-read at the next resync (`pod.left_pending reason=class_unit_unknown`;
+  `UnknownGpuClass` only when the class list does not name the label at all).  A
+  unit that does not parse is a contract break, since the app validates it on
+  every write: `class.unresolvable reason=invalid_unit`, every reconcile.
+- **Guard 1a** takes the class's resources (see **Guard 1: what the scheduler can
+  and cannot tell us**); with the default it reads exactly as before.
+- **Memory classes require limit == request.**  A class whose unit includes
+  `memory` reserves what a pod requests, but only a limit bounds what a container
+  uses: a 64Gi request with a 1Ti limit would book four blocks and take
+  sixty-four, pushing other reservations' pods into kubelet eviction.  So every
+  container that runs for the pod's life — regular containers and sidecars; plain
+  init containers run to completion first and are exempt, since a platform often
+  injects one with no resources at all — must set a memory limit equal to its
+  request, or the pod a pod-level `spec.resources` memory limit
+  (`k8s_client.get_pod_memory_limit_problem`).  Otherwise the pod takes no path
+  and its owner is told `MemoryLimitMismatch`.  Checked before routing, so a
+  booking does not exempt the pod.
+- **A redefined unit** re-denominates the class's reservations app-side;
+  controller-side, queued pods and candidates take their count afresh when the
+  watch resync re-routes them (`enqueue_pod` / `add_ondemand_candidate` refresh
+  `gpu_requested`).
+- **Wording.**  Event and operator text that names a resource names the class's
+  own (`NoGpuRequest`, `MemoryLimitMismatch`, `ReservationTooSmall`,
+  `ReservationFull`, the guard-4 `ondemand.gated` detail); default-class text is
+  unchanged, and the rest still says "GPU" — showing units multiplied out is
+  deferred.
+
+**Known limitations**: a node serves one class (taints are unique per key and
+effect, and the toleration is `NoSchedule`), so a machine cannot be in both a GPU
+class and a memory class; GPU classes still account no cpu or memory; and only
+the resources in a unit are accounted, so a memory class should list cpu as well
+as memory.  **RBAC / config**: none new — the per-node LIST reuses the
+cluster-wide `pods: list` the watch already needs; no flag, since a class without
+a unit behaves exactly as before.
 
 ### Inbound push API
 
@@ -2247,7 +2339,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** status is suppressed before being restated on a pending pod — a lease denial or rejection, a capacity-wait notice, an admission pause, a pod-problem Event or a reservation-wait Event, which all share one throttle (the name predates all but the first) — the retry cadence is 2–5 min, and Events expire, so neither "every attempt" nor "once only" is right. A **changed** status, including a switch between any two, emits immediately regardless; `0` emits on every attempt |
 | `ONDEMAND_PAUSE_EVENT_ENABLED` | `true` | Put a `Warning` Event (`reason=OnDemandAdmissionPaused`) on every pod held by guard 1b (no schedulable node in the class), guard 3 (stuck reservation holder) or guard 4 (app-side overcommit), saying on-demand admission for its class is paused (or, for a guard-4 hold under `ONDEMAND_OVERCOMMIT_FIT`, limited) and to contact support if it persists (see **Telling the pod's owner that admission is paused**). Throttled with the denial Event, on its cadence; `false` disables |
 | `SUPPORT_CONTACT` | *(absent)* | How a pod's owner reaches support — an email address or URL — named at the end of the "contact support" suggestion in that Event and the pod-problem Events. Unset = the suggestion names no one |
-| `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), it requests no `nvidia.com/gpu` and is ignored (`NoGpuRequest`), one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**), or its node selector / required node affinity allows none of its class's nodes (`NoMatchingNode`) — plus a `Normal` `WaitingForNode` while the nodes it allows are all full (see **Pods that narrow their nodes**). Throttled with the denial Event, on its cadence; `false` disables |
+| `POD_PROBLEM_EVENT_ENABLED` | `true` | Put a `Warning` Event on a pod the controller cannot act on as written: its `gpu-class` label names no class the app knows (`UnknownGpuClass`), no reservation matches it and it does not qualify for on-demand admission (`NoReservation`), it requests none of what its class counts and is ignored (`NoGpuRequest`), its class counts memory and a container's memory limit is not its request (`MemoryLimitMismatch`), one of its `galends/*` annotations was ignored (`AnnotationIgnored`) (see **Telling the pod's owner the pod itself is the problem**), or its node selector / required node affinity allows none of its class's nodes (`NoMatchingNode`) — plus a `Normal` `WaitingForNode` while the nodes it allows are all full (see **Pods that narrow their nodes**). Throttled with the denial Event, on its cadence; `false` disables |
 | `RESERVATION_WAIT_EVENT_ENABLED` | `true` | Put an Event on a pod queued for one of its owner's reservations, saying what it waits on: the window has not opened (`WaitingForReservation`, `Normal`), the owner's other pods hold its GPUs (`ReservationFull`, naming them) or it holds fewer GPUs than the pod requests (`ReservationTooSmall`) (see **Telling the pod's owner what its reservation is waiting on**). Throttled with the denial Event, on its cadence; `false` disables |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period before a booking whose window is already open is declared a no-show: one mid-window when the controller starts, or one vacated mid-window when its last holder pod ends (re-armed by `update_noshow_tracking` on the next refresh — see **In-memory state only**) |
