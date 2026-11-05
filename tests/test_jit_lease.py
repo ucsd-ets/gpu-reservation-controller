@@ -23,6 +23,7 @@ from app.controller import ControllerState, OnDemandCandidate, slot_start
 from app.reservation_client import AdmissionSelection, AdmissionWithheld, LeaseAttempt
 
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, GROUP_NAME, USERNAME, kv_fields
+from tests.conftest import make_config
 from tests.conftest import make_state as _state
 from tests.conftest import ondemand_block as _ondemand_block
 from tests.conftest import reservation, user_reservation as _user_reservation
@@ -1492,19 +1493,6 @@ class _FakeWatcher:
             yield ev
 
 
-def _watch_config():
-    """Minimal config for driving pod_watch_loop (only the attributes it reads)."""
-    return SimpleNamespace(
-        ondemand_horizon_minutes=30,
-        required_group_label=None,
-        ondemand_lease_enabled=True,
-        scheduling_gate_name=None,
-        best_effort_enabled=False,
-        default_min_runtime_seconds=0,
-        default_usage_group=None,
-    )
-
-
 def _pending_jit_pod(*, uid="uid-1", conditions=None):
     """A Pending, JIT-eligible pod: gpu-class label + min-runtime / usage-group
     annotations, no toleration.  *conditions* drives is_gpu_gated_pending."""
@@ -1541,7 +1529,11 @@ class TestScheduleSignalFastPath:
 
         monkeypatch.setattr(m, "_run_ondemand_admission", fake_admission)
         monkeypatch.setattr(m, "PodWatcher", lambda **kw: _FakeWatcher(events))
-        asyncio.run(m.pod_watch_loop(state, None, _watch_config()))
+        # A full Config, not a SimpleNamespace of the attributes the loop reads
+        # today: the loop swallows each event's exception, so a partial config
+        # ends an event's handling at the first attribute it lacks -- and three
+        # of these tests assert that *no* batch ran, which that would satisfy.
+        asyncio.run(m.pod_watch_loop(state, None, make_config()))
         return calls
 
     def test_verdict_modified_retriggers_parked_candidate(self, monkeypatch):

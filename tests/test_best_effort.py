@@ -39,7 +39,7 @@ from app.reservation_client import LeaseAttempt
 from app.schemas import BestEffortReservationRequest, OnDemandReservationRequest
 
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, GROUP_NAME, USERNAME
-from tests.conftest import reservation
+from tests.conftest import make_config, reservation
 from tests.test_jit_lease import (
     _candidate,
     _FakeClient,
@@ -239,27 +239,31 @@ class _FakeWatcher:
 
 
 def _watch_config(**overrides):
-    base = dict(
-        ondemand_horizon_minutes=30,
-        required_group_label=None,
-        ondemand_lease_enabled=True,
-        scheduling_gate_name=None,
-        best_effort_enabled=True,
-        default_min_runtime_seconds=0,
-        default_usage_group=None,
-    )
-    base.update(overrides)
-    return SimpleNamespace(**base)
+    """A full ``Config`` with best-effort admission on.
+
+    Not a ``SimpleNamespace`` of the attributes the loop happens to read: the
+    loop swallows each event's exception, so a config missing one ends that
+    event's handling at the first read of it, silently.  These tests passed
+    that way for as long as the config lacked ``pod_problem_event_enabled``,
+    never reaching the annotation notice or the admission batch.
+    """
+    return make_config(**{"best_effort_enabled": True} | overrides)
 
 
 def _route(monkeypatch, m, state, pod, config):
+    """Feed one ADDED *pod* through the watch loop.
+
+    Returns the candidates it left, and how many admission batches it kicked.
+    """
+    batches: list[bool] = []
+
     async def fake_admission(st, cl, cfg):
-        pass
+        batches.append(True)
 
     monkeypatch.setattr(m, "_run_ondemand_admission", fake_admission)
     monkeypatch.setattr(m, "PodWatcher", lambda **kw: _FakeWatcher([("ADDED", pod)]))
     asyncio.run(m.pod_watch_loop(state, None, config))
-    return state.ondemand_candidates
+    return state.ondemand_candidates, len(batches)
 
 
 class TestRouting:
@@ -267,28 +271,32 @@ class TestRouting:
         # The whole point: this pod had no way to be admitted before.
         m = _main_module(monkeypatch)
         state = _state_ready()
-        candidates = _route(
+        candidates, batches = _route(
             monkeypatch, m, state, _best_effort_pod(), _watch_config()
         )
         assert candidates["uid-1"].best_effort is True
         assert candidates["uid-1"].min_runtime_seconds == 0
+        # Offered for admission at once, as a guaranteed candidate would be.
+        assert batches == 1
 
     def test_a_zero_minimum_runtime_no_longer_disqualifies_it(self, monkeypatch):
         m = _main_module(monkeypatch)
         state = _state_ready()
-        candidates = _route(
+        candidates, batches = _route(
             monkeypatch, m, state, _best_effort_pod(min_runtime="0"), _watch_config()
         )
         assert candidates["uid-1"].best_effort is True
+        assert batches == 1
 
     def test_the_flag_off_leaves_the_pod_pending(self, monkeypatch):
         m = _main_module(monkeypatch)
         state = _state_ready()
-        candidates = _route(
+        candidates, batches = _route(
             monkeypatch, m, state, _best_effort_pod(),
             _watch_config(best_effort_enabled=False),
         )
         assert candidates == {}
+        assert batches == 0
 
     def test_a_group_is_still_required(self, monkeypatch):
         # group_name is a required natural key on the app's create, so a pod
@@ -297,19 +305,21 @@ class TestRouting:
         state = _state_ready()
         pod = _best_effort_pod()
         pod.metadata.annotations.pop("galends/usage-group")
-        candidates = _route(monkeypatch, m, state, pod, _watch_config())
+        candidates, batches = _route(monkeypatch, m, state, pod, _watch_config())
         assert candidates == {}
+        assert batches == 0
 
     def test_a_declared_runtime_is_still_carried(self, monkeypatch):
         # The two annotations compose: a pod may name a runtime and still waive
         # the guarantee. The runtime just sizes nothing on this path.
         m = _main_module(monkeypatch)
         state = _state_ready()
-        candidates = _route(
+        candidates, batches = _route(
             monkeypatch, m, state, _best_effort_pod(min_runtime="600"), _watch_config()
         )
         assert candidates["uid-1"].best_effort is True
         assert candidates["uid-1"].min_runtime_seconds == 600
+        assert batches == 1
 
 
 # ---------------------------------------------------------------------------
