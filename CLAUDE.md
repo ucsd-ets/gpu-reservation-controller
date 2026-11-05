@@ -61,8 +61,8 @@ app/
 | Task | Cadence | Responsibility |
 |------|---------|----------------|
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
-| `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease and starts an admission batch; retries the pods waiting on a reservation a deleted/terminated pod held; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
-| `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; moves a queued pod to an open reservation with room; tells each pod still queued what it waits on; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
+| `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease and starts an admission batch; retries the pods waiting on a reservation a deleted/terminated pod held; keeps per-node GPU accounting current as admitted pods bind, terminate or end, and re-attempts at once a candidate guard 5 holds that now fits (see **Keeping guard 5's view current**); **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
+| `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; moves a queued pod to an open reservation with room; tells each pod still queued what it waits on; requests/retries JIT leases; cancels declared no-shows; rebuilds per-node GPU accounting from its snapshots and reports pods unbound under a charged lease (`lease.unbound`); schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee: reactively, when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**), and — throttled to `HEADROOM_CHECK_INTERVAL` — anticipatorily, to hold a fixed fraction of each class free for on-demand jobs that have not arrived yet (see **Anticipatory headroom preemption**) |
 | `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and gates on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation** and **Guard 4: admitting what fits on an over-counted class**) |
 | `ondemand_gate_warning_loop` | every 60 s (only when `ONDEMAND_LEASE_ENABLED`) | Restates at WARNING (`ondemand.gated`) every GPU class whose JIT admission is paused by a class-wide gate — guard 1b, 3 or 4 (guard 4 only while it holds a pod, under `ONDEMAND_OVERCOMMIT_FIT`) — with a plain-English cause and remedy for an operator (see **Operator warning for paused on-demand admission**) |
@@ -948,11 +948,12 @@ Four things keep the controller from undoing that choice:
   against what the grants ahead of it took (`_hold_on_fit`, fed the
   `_FitInputs` preflight read).  A tally accrued at preflight in creation order
   would have spent the scarcest physical capacity before the app was asked.
-  Guard 4 needs no tally for it — a granted lease is upserted into
-  `state.reservations` before the next grant is judged — while guard 5 nets the
-  batch's grants (`node_claimed`) off a node snapshot nothing else updates
-  between ticks.  A candidate held here keeps the preflight hold's retry and
-  Events.
+  Neither guard needs a tally for it: a granted lease is upserted into
+  `state.reservations` before the next grant is judged (guard 4), and its
+  admitted pod is a **claim** on the node openings until it binds (guard 5,
+  `ControllerState.node_claims` — see **Keeping guard 5's view current**), in
+  this batch and every later one.  A candidate held here keeps the preflight
+  hold's retry and Events.
 - **A candidate waiting for capacity is offered in every batch.**
   `OnDemandCandidate.awaiting_capacity` is set when the app withholds it as
   `outranked` (or without a readable reason), or a capacity gate refuses it as
@@ -969,7 +970,9 @@ Four things keep the controller from undoing that choice:
   `_run_ondemand_admission` (outside `reservation_lock`, which teardown holds
   across its cancel): the lease's capacity is back in the app's calendar, and a
   waiter should not wait for the next tick to be offered it.  A booking's pod
-  ending starts nothing — the booking keeps its window.
+  ending returns nothing to the calendar — the booking keeps its window — so it
+  starts a batch only when its GPUs make room for a candidate guard 5 holds
+  (see **Keeping guard 5's view current**).
 
 **What the order is measured by.**  The app's `scripts/ondemand_commitment_report.py`
 counts how often an on-demand ask within its allocation lost to use beyond one — the
@@ -1098,12 +1101,12 @@ Three consequences worth knowing, each pinned by a test:
   the first would sit Pending.  The app's own 10-minute capacity probe is an
   anti-thrash heuristic ("is this class about to be booked solid?"), **not**
   admission control, for exactly this reason.
-- **An in-batch tally** (`node_claimed`, accrued in the grant loop of
-  `_run_ondemand_admission_once`) nets GPUs already taken by the grants ahead of
-  a candidate off `node_free_by_class`, so a burst is not all measured against
-  the same opening.  It does not close the window between queue ticks, which is
-  acceptable because an over-admitted best-effort pod costs nothing: no SU, no
-  capacity, it just waits.
+- **Claims** net GPUs already taken by the grants ahead of a candidate off
+  `node_free_by_class` — every admitted pod not yet bound, in this batch or an
+  earlier one (`ControllerState.node_claims`) — so a burst is not all measured
+  against the same opening.  What remains is the race between a grant and its
+  bind, which is acceptable here because an over-admitted best-effort pod costs
+  nothing: no SU, no capacity, it just waits.
 
 **App side**: `_prioritize_candidates` now sacrifices by what the reservation
 promised — `best_effort`, then `on_demand`, then `booking` — replacing the
@@ -1747,9 +1750,10 @@ data already fetched (no new API calls, no new RBAC):
 - `ControllerState.node_free_by_class` (largest single-node free GPUs per class) is
   refreshed every `queue_processor_loop` tick from a node-inventory + tolerated-pod
   snapshot, alongside `ControllerState.class_node_counts` (nodes per class, which
-  guard 1b reads — see **Guard 1: what the scheduler can and cannot tell us**).
-  **Fail-safe**: if either snapshot fails, both prior maps are left unchanged
-  (never open admission on unknown physical state).
+  guard 1b reads — see **Guard 1: what the scheduler can and cannot tell us**), is
+  seeded at startup, and is kept current between ticks (next section).
+  **Fail-safe**: if the node snapshot fails, the inventory-derived maps are left
+  unchanged (never open admission on unknown physical state).
 
 **Guard 5** (`_preflight_ondemand_candidate`): a JIT candidate requesting **≥2
 GPUs** whose `gpu-class` has a *known* largest-single-node-free below the ask is
@@ -1764,9 +1768,76 @@ Two node-aware consumers are **deliberately deferred** to a follow-up: preemptio
 victim-targeting (concentrating kills on one node so a reserved multi-GPU booking
 can land — today the sweep still frees GPUs per class, count-based) and the
 preemption-risk forecast's shortfall (still per-class).  Guard 5 is a per-candidate
-feasibility check against a snapshot, not batch-level bin-packing: two ≥2-GPU
-candidates can both pass against the same single-node opening in one batch, with
-guard 3 backstopping the loser.
+feasibility check, not bin-packing: claims stop two grants landing on one
+opening, but which node a claim binds to is the scheduler's choice, so a claim is
+counted against every opening it *could* take (conservative — the cost is a
+short retry until it binds).
+
+### Keeping guard 5's view current
+
+Guard 5 used to read a node map rebuilt only on the queue tick, which leaked in
+three ways.  **Late**: a GPU coming free was invisible until the next tick, so a
+held pod waited up to a `QUEUE_PROCESSOR_INTERVAL` while anything else could take
+the GPU — even the "a lease's release starts a batch" path read the stale map and
+held the pod again.  **Early**: the tally stopping two grants from landing on one
+opening lived only inside one admission batch, so the next batch (any new pod's
+ADDED, 30 s later) granted the same opening again, and the loser sat Pending
+under a charged lease.  **At startup**: nothing filled the map before the pod
+watch replayed every pending pod as ADDED, so guards 1b, 3 and 5 all failed open
+and every pod waiting at a rollout — a pod pinned to full nodes above all — was
+granted a lease it could not start under.
+
+- **`ControllerState.gpu_pods`** (uid → `GpuPod`, built by
+  `controller.gpu_pod_record`) records every live tolerated pod's GPUs: on a node,
+  or not bound yet — a **claim** on the next opening its own placement allows.
+  `node_free_by_node_class` / `node_free_by_class` are derived from it and
+  `ControllerState.node_inventory` (allocatable per node, from the last good node
+  snapshot) and re-derived on every change.  The rule is `free_gpus_by_node_class`'s
+  (bound, node-resident, not terminating), so the live map and a snapshot agree.
+- **Who updates it.**  Admission records the pod it just tolerated as a claim
+  (`main._note_admitted`) — the watch sees the toleration patch only after the
+  grant loop has judged the next candidate.  The pod watch records a pod binding,
+  starting to terminate (its GPUs are being recovered) or ending
+  (`main._note_gpu_pod`, from the has-toleration, terminal-phase and DELETED
+  branches).  Every queue tick rebuilds it from the tolerated-pod snapshot,
+  self-healing a missed event; a change made after the snapshot's LIST went out
+  is re-applied over it (`ControllerState.rebuild_gpu_pods`, which keeps each
+  change's time), so a pod deleted while the LIST was in flight is not
+  resurrected.  A tick whose node snapshot fails still rebuilds the pod side.
+- **Claims are netted off the opening** (`ControllerState.node_claims`): a claim
+  counts against an ask when the nodes its own placement allows overlap the ask's.
+  Counting a pending booking holder is not merely cautious — it already tolerates
+  the node, so the scheduler hands it the opening before a lease round-trip
+  completes.  A claim allowing no node of the class counts against nothing.  This
+  replaced the batch-local `node_claimed` tally.
+- **A held candidate is retried the moment it fits.**  A guard-5 hold sets
+  `OnDemandCandidate.held_by_node_fit` (reset at every preflight) and keeps the
+  placement preflight read.  When a watch change can only have helped
+  (`controller.capacity_frees_up`: GPUs left a node, or a claim bound or went
+  away), `main._retry_node_fit_holds` re-judges those candidates **in memory**
+  with the hold's own arithmetic (`main._node_fit`) and makes due the ones that
+  now fit; only then does the watch start a batch (`ondemand.node_fit_retry` at
+  DEBUG).  So a busy class's churn costs no app call unless room actually opened.
+- **Seeded at startup** (`main._seed_node_feasibility`, in `lifespan` after the
+  capacity audit and before the loops start): one tolerated-pod LIST and one node
+  LIST through the same `main._refresh_node_feasibility` the tick runs (guard 3,
+  the guard 1b counts and the guard-4 pause too).  A failed seed logs
+  `startup.node_feasibility_failed` and leaves the maps empty, as before.
+- **What it does not prevent, measured**: a lease granted against an opening
+  that something else takes before the pod binds — a pod the controller does not
+  track, the scheduler preferring another pending pod, or a constraint it cannot
+  see (another resource on the node, pod affinity).  Each queue tick logs
+  `lease.unbound` (WARNING) for every pod still unbound
+  `LEASE_UNBOUND_WARNING_SECONDS` (120 s, fixed) after its `kind="on_demand"`
+  lease started, with `unbound_s` — the time charged with no GPU in use — and,
+  when its own placement explains the wait, `reason` (`placement_stall_reason`).
+  A booking's pod is not reported (its window was paid for either way, and a stuck
+  holder is guard 3's), nor a best-effort pod (it costs nothing).  Its rate is
+  what decides whether charging should start at bind rather than at grant, which
+  needs the app.
+
+**RBAC / config**: none new — the watch already sees every `gpu-class` pod, and
+the seed reuses the tick's two LISTs.
 
 ### Which nodes count as capacity
 
@@ -1890,9 +1961,10 @@ never asked for a pod held here):
   one busy host is exactly as unable to start as a fragmented 4-GPU one.  Held
   with the short retry and its owner told with a `Normal` `WaitingForNode` Event
   (the scheduler's own message names only our taint, so the pod would otherwise
-  wait silently).  The grant loop's `claimed` tally is per class, so for such a
-  pod it is **conservative** — a GPU a grant ahead of it this batch took counts
-  against these nodes even if it lands elsewhere; the cost is a retry.
+  wait silently).  Claims are netted off these nodes only when the claiming
+  pod's own placement lets it land on one of them — an unconstrained claim
+  always can, so it counts (**conservative**: it may bind elsewhere; the cost is
+  a short retry until it does), while one pinned to other nodes does not.
 
 Both Events use `_post_pending_status` (the `hold` topic) and
 `POD_PROBLEM_EVENT_ENABLED`.  Their messages carry no free-GPU counts, which
@@ -1920,9 +1992,10 @@ to withhold; guard 3 now ignores it if its placement explains the wait); pod
 affinity/anti-affinity, topology spread and non-GPU resources on the chosen node
 (still invisible, per the guard-1 known limitation); `spec.nodeName` set directly
 (bypasses the scheduler, and the kubelet does not enforce `NoSchedule` taints);
-and node-aware preemption, still count-based per class.  The snapshot can be up
-to one `QUEUE_PROCESSOR_INTERVAL` old, so a node that filled since can still let
-a lease through — which is the case the narrowed guard 3 exists for.  **RBAC /
+and node-aware preemption, still count-based per class.  The node map is kept
+current between ticks (see **Keeping guard 5's view current**), but an opening
+can still be taken between a grant and the pod binding — the case the narrowed
+guard 3 exists for, and which `lease.unbound` reports.  **RBAC /
 config**: none new — node labels arrive with the node LIST already issued.
 User-facing documentation is `docs/POD-ANNOTATIONS.md` §5.3.
 
@@ -2090,10 +2163,12 @@ never report risk from unknown physical state).
 
 ### Startup behaviour
 
-On startup, the controller performs an initial reservation fetch and then issues
-a LIST of all current pods before entering the WATCH stream.  This ensures that
-pods created before the controller was running (e.g. during a restart) are not
-missed.
+On startup, the controller performs an initial reservation fetch, a capacity
+audit and a node-feasibility seed (see **Keeping guard 5's view current**), and
+then issues a LIST of all current pods before entering the WATCH stream.  This
+ensures that pods created before the controller was running (e.g. during a
+restart) are not missed — and, because the seed comes first, that the replay of
+every pending pod is judged against real node data rather than none.
 
 The watch itself maintains **resourceVersion continuity** (bookmarks enabled):
 a clean stream close — the server honouring the ~4.5 min `timeout_seconds` —

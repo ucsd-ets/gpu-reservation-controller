@@ -30,7 +30,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.controller import ControllerState, PodRuntimeView
+from app.controller import ControllerState, GpuPod, PodRuntimeView
 from app.k8s_client import (
     get_pod_min_runtime_seconds,
     get_pod_runtime_guarantee_request,
@@ -340,11 +340,13 @@ def _run_preflight(monkeypatch, m, state, candidate):
     )
 
 
-def _held_at_grant(monkeypatch, m, state, candidate, node_claimed):
+def _held_at_grant(monkeypatch, m, state, candidate, claimed):
     """Guards 4 and 5 as the grant loop judges them, after earlier grants.
 
-    Preflight must find the candidate ready on its own first; the grant loop
-    then judges it again, netting *node_claimed* off the node snapshot.
+    Preflight must find the candidate ready on its own first; then a grant
+    ahead of it admits a pod asking for *claimed* GPUs -- not yet bound, so a
+    claim on the opening (``ControllerState.node_claims``) -- and the grant
+    loop judges the candidate again.
     """
     async def fake_read_pod(name, namespace):
         return _best_effort_pod(conditions=[_gpu_only_condition()])
@@ -355,9 +357,15 @@ def _held_at_grant(monkeypatch, m, state, candidate, node_claimed):
     async def run():
         status, _ask, fit = await m._preflight_with_fit(state, config, "uid-1", candidate)
         assert status == m._PREFLIGHT_READY
+        if claimed:
+            state.set_gpu_pod(
+                "uid-ahead",
+                GpuPod(namespace=USERNAME, name="pod-ahead",
+                       gpu_class=GPU_CLASS_LABEL, gpu_count=claimed),
+                datetime.now(timezone.utc),
+            )
         return await m._hold_on_fit(
             state, config, "uid-1", candidate, fit, datetime.now(timezone.utc),
-            node_claimed=node_claimed,
         )
 
     return asyncio.run(run())
@@ -449,9 +457,9 @@ class TestGuardFiveAtEveryGpuCount:
         assert status == m._PREFLIGHT_READY
 
     def test_the_batch_tally_is_netted_off_at_grant_time(self, monkeypatch):
-        # One GPU free, one already taken by a grant earlier in this batch ->
-        # nothing left. Without the tally both candidates would clear the same
-        # opening.
+        # One GPU free, one already claimed by a pod a grant earlier in this
+        # batch admitted -> nothing left. Without the claim both candidates
+        # would clear the same opening.
         m = _main_module(monkeypatch)
         state = _state_ready()
         state.node_free_by_class = {GPU_CLASS_LABEL: 1}

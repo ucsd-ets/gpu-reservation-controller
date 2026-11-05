@@ -377,6 +377,19 @@ onto fragmented capacity.  A class with no per-node data yet does not block
 whole node for a reserved multi-GPU booking — is planned follow-up work; the
 preemption sweep is still per-class.)
 
+That map is kept current *between* ticks, which is what makes the hold cheap to
+be in: the pod watch records admitted pods binding, terminating and ending, and
+re-attempts a held pod the moment a GPU it could use comes free, rather than at
+its next retry after the next tick.  Every pod admitted but not yet bound is a
+**claim** on the openings its own placement allows, netted off before a lease
+is requested, so two grants — in one admission batch or in successive ones —
+cannot both be measured against the same free GPU.  The map is also seeded at
+startup, before the watch replays every pending pod, so a restart no longer
+grants a lease to each of them against no data at all.  What none of this
+prevents — an opening taken between a grant and its pod binding — is reported:
+`lease.unbound` names every pod still unbound two minutes after its on-demand
+lease started, with the time it has been charged for.
+
 **No-show → cancel** — if a reservation holder fails to launch a pod within
 `NOSHOW_TIMEOUT_MINUTES` of the window opening, the controller durably
 cancels the reservation (`POST /api/reservations/{id}/cancel`,

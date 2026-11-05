@@ -49,6 +49,7 @@ from app import k8s_client
 from app.controller import (
     TOLERATION_KEY,
     ControllerState,
+    GpuPod,
     OnDemandCandidate,
     placement_stall_reason,
 )
@@ -549,11 +550,11 @@ class TestPreflightWaitingForNode:
         assert status == m._PREFLIGHT_READY
         assert rec.calls == []
 
-    def test_the_batch_tally_is_netted_off_the_allowed_nodes(self, monkeypatch):
-        # Conservative by design: the tally is per class, so a GPU a grant
-        # earlier in the batch took counts against these nodes too.  Preflight
-        # judges the pod on its own (h1 has its GPU); the grant loop, after
-        # that grant, holds it.
+    def test_a_claim_is_netted_off_the_allowed_nodes(self, monkeypatch):
+        # Conservative by design: an unconstrained pod a grant earlier in the
+        # batch admitted may land on h1, so its GPU counts against h1 although
+        # h2 has room for it too.  Preflight judges the pod on its own (h1 has
+        # its GPU); the grant loop, after that grant, holds it.
         state = _state(h1_free=1, h2_free=4)
         m, status, _a, candidate, rec = _preflight(
             monkeypatch, state, _pod(node_selector={HOST: "h1"}),
@@ -564,13 +565,42 @@ class TestPreflightWaitingForNode:
             _s, _ask, fit = await m._preflight_with_fit(
                 state, make_config(), candidate.pod_uid, candidate,
             )
+            state.set_gpu_pod("ahead", GpuPod(
+                namespace=USERNAME, name="pod-ahead", gpu_class=GPU_CLASS_LABEL,
+                gpu_count=1,
+            ), datetime.now(timezone.utc))
             return await m._hold_on_fit(
                 state, make_config(), candidate.pod_uid, candidate, fit,
-                datetime.now(timezone.utc), node_claimed=1,
+                datetime.now(timezone.utc),
             )
 
         assert asyncio.run(at_grant()) is True
         assert rec.reasons == [WAITING_FOR_NODE_REASON]
+
+    def test_a_claim_pinned_elsewhere_is_not(self, monkeypatch):
+        # A claim whose own placement allows only h2 can never take h1's GPU,
+        # so a pod pinned to h1 is not held for it.
+        state = _state(h1_free=1, h2_free=4)
+        m, status, _a, candidate, rec = _preflight(
+            monkeypatch, state, _pod(node_selector={HOST: "h1"}),
+        )
+        assert status == m._PREFLIGHT_READY
+
+        async def at_grant():
+            _s, _ask, fit = await m._preflight_with_fit(
+                state, make_config(), candidate.pod_uid, candidate,
+            )
+            state.set_gpu_pod("ahead", GpuPod(
+                namespace=USERNAME, name="pod-ahead", gpu_class=GPU_CLASS_LABEL,
+                gpu_count=1, placement=NodePlacement(node_selector=((HOST, "h2"),)),
+            ), datetime.now(timezone.utc))
+            return await m._hold_on_fit(
+                state, make_config(), candidate.pod_uid, candidate, fit,
+                datetime.now(timezone.utc),
+            )
+
+        assert asyncio.run(at_grant()) is False
+        assert rec.calls == []
 
 
 class _LeaseRecorder:
