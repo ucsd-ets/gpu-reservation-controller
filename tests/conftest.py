@@ -13,9 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
+
+# app.main builds its FastAPI app at import, and Config.from_env() raises
+# without these.  Set here because this module is imported before any test
+# module.  In the full suite, two modules happen to setdefault them at
+# collection, so a module importing app.main without setting them passed there
+# and failed when run on its own.  Tests of the missing-variable error delete
+# them with monkeypatch first.
+os.environ.setdefault("RESERVATION_API_URL", "http://reservations.local")
+os.environ.setdefault("RESERVATION_API_KEY", "gpures_test")
 
 from app.config import Config
 from app.controller import ControllerState
