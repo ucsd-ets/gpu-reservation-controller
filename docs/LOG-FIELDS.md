@@ -224,6 +224,7 @@ follow this grammar and are not expected to.
 | `lease_dur_s` | int seconds | granted JIT lease length (`min_runtime_s` + buffer) |
 | `probe_min` | int minutes | best-effort admission probe window checked for capacity |
 | `waited_s` | int seconds | how long a JIT candidate waited before being deleted unplaced |
+| `unbound_s` | int seconds | how long a pod admitted under an on-demand lease has gone without being bound to a node, counted from the lease's start — time charged with no GPU in use |
 | `guarantee_s` | int seconds | runtime-guarantee duration |
 
 ### Capacity
@@ -237,7 +238,7 @@ follow this grammar and are not expected to.
 | `total` | int | physical GPUs allocatable |
 | `app_gpus` / `phys_gpus` | int | capacity-audit counts |
 | `node_free` | int | largest single-node free GPUs for a class |
-| `claimed` | int | GPUs already claimed earlier in the same admission batch, netted off `node_free` (emitted only when non-zero) |
+| `claimed` | int | GPUs claimed by pods already admitted but not yet bound to a node, on nodes the ask could use, netted off `node_free` (emitted only when non-zero) |
 | `demand` | int | GPUs demanded at a boundary, per class |
 | `committed` | int | peak GPUs a class's reservations commit, placed or not, over a window (on-demand guard 4) |
 | `overstay_gpus` | int | GPUs of a class held by pods past their runtime guarantee — overstayers and best-effort pods — on nodes the inventory counts; what reclaim could free (guard 3's activation) |

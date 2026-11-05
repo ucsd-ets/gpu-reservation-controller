@@ -765,7 +765,7 @@ to fix, so it is told with a `Normal` Event instead:
 
 | Event | Type | What it means |
 |---|---|---|
-| `WaitingForNode` | `Normal` | None of the nodes the pod's `nodeSelector` or node affinity allows has the GPUs it requests free right now, so no on-demand lease is requested yet — one would be charged while the pod waited. It is re-checked on the controller's queue interval (5 minutes by default), and a lease is requested once one of those nodes has room. Other nodes of the class may well be free: widening or removing the constraint lets the pod use them. |
+| `WaitingForNode` | `Normal` | None of the nodes the pod's `nodeSelector` or node affinity allows has the GPUs it requests free right now, so no on-demand lease is requested yet — one would be charged while the pod waited. It is re-checked as soon as a GPU on one of those nodes comes free (and at least on the controller's queue interval, 5 minutes by default), and a lease is requested once one of them has room. Other nodes of the class may well be free: widening or removing the constraint lets the pod use them. |
 
 A constraint that allows **every** node of the class (a `nodeSelector` on the
 class's own hardware label, say) narrows nothing and changes nothing.  Only
@@ -863,8 +863,8 @@ is expected in these cases:
 - **No single node has room for it.** A pod asking for 2 or more GPUs — or any
   best-effort pod — waits quietly while its class's free GPUs are spread across
   nodes with none holding enough on its own (a pod cannot span nodes). It is
-  retried on the controller's queue interval (5 minutes by default) until one
-  node does. (A pod whose own node selector or affinity is what rules the free
+  retried as soon as GPUs come free on a node it could use (and at least on the
+  controller's queue interval, 5 minutes by default) until one node does. (A pod whose own node selector or affinity is what rules the free
   nodes out is told, with `WaitingForNode` — §5.3.)
 - **A lease was granted but the pod could not be admitted under it** (a
   transient Kubernetes error, say): the lease is cancelled at once (reason

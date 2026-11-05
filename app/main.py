@@ -62,13 +62,15 @@ from .controller import (
     PreemptionForecast,
     QueueEntry,
     TerminationWarning,
+    GpuPod,
     apply_push_to_active,
     build_preemption_plan,
     canceller_description,
-    free_gpus_by_node_class,
+    capacity_frees_up,
     gpu_capacity_by_class,
-    largest_node_free_by_class,
+    gpu_pod_record,
     node_counts_by_class,
+    placement_nodes,
     placement_stall_reason,
     reconcile_capacity,
     select_victims_locally,
@@ -904,6 +906,85 @@ async def _enforce_scheduling_gate_removal(
         ))
 
 
+def _gpu_pod_of_snapshot(p) -> Optional[GpuPod]:
+    """What a ``k8s_client.ToleratedPodInfo`` holds, for ``state.gpu_pods``."""
+    return gpu_pod_record(
+        namespace=p.namespace,
+        name=p.name,
+        gpu_class=p.gpu_class,
+        gpu_count=p.gpu_count,
+        phase=p.phase,
+        scheduled_false=p.scheduled_false,
+        terminating=p.deletion_timestamp is not None,
+        node_name=p.node_name,
+        placement=p.placement,
+        reservation_id=p.reservation_id,
+    )
+
+
+def _gpu_pod_of_watched(pod, gpu_class_label: str) -> Optional[GpuPod]:
+    """What a pod the watch saw carrying our toleration holds, for
+    ``state.gpu_pods`` -- the same digest ``snapshot_tolerated_pods`` makes, so
+    the live map and the tick's rebuild agree."""
+    status = getattr(pod, "status", None)
+    conditions = getattr(status, "conditions", None) or []
+    scheduled = next(
+        (c for c in conditions if getattr(c, "type", None) == "PodScheduled"), None
+    )
+    return gpu_pod_record(
+        namespace=pod.metadata.namespace,
+        name=pod.metadata.name,
+        gpu_class=gpu_class_label,
+        gpu_count=get_pod_gpu_count(pod),
+        phase=get_pod_phase(pod),
+        scheduled_false=scheduled is not None and getattr(scheduled, "status", None) == "False",
+        terminating=getattr(pod.metadata, "deletion_timestamp", None) is not None,
+        node_name=getattr(getattr(pod, "spec", None), "node_name", None),
+        placement=get_pod_node_placement(pod),
+        reservation_id=parse_booking_reference(get_pod_booking_reference(pod)),
+    )
+
+
+def _note_gpu_pod(
+    state: ControllerState, uid: str, record: Optional[GpuPod], now: datetime
+) -> bool:
+    """Record what pod *uid* now holds (``state.set_gpu_pod``) and say whether
+    an admission batch should run: the change made room, and a candidate guard
+    5 was holding now fits (made due by ``_retry_node_fit_holds``)."""
+    previous = state.set_gpu_pod(uid, record, now)
+    if previous is None or not capacity_frees_up(previous, record):
+        return False
+    return _retry_node_fit_holds(state, previous.gpu_class, now)
+
+
+def _note_admitted(state: ControllerState, uid: str, entry: QueueEntry, pod) -> None:
+    """Record a pod just admitted under *entry* as a claim on its class's nodes.
+
+    The watch records it too, from the MODIFIED the toleration patch causes --
+    but only after this coroutine yields, and the grant loop judges the next
+    candidate before then.  Nothing is recorded for a pod the watch already
+    tracks (it has the fresher view) or one already bound, nor for one released
+    while the patch was in flight: it was deleted or went terminal, and a claim
+    for it would hold guard 5 until the next tick's rebuild.
+    """
+    if uid not in state.occupancy.get(entry.reservation.id, {}):
+        return
+    if uid in state.gpu_pods or getattr(getattr(pod, "spec", None), "node_name", None):
+        return
+    state.set_gpu_pod(
+        uid,
+        GpuPod(
+            namespace=entry.pod_namespace,
+            name=entry.pod_name,
+            gpu_class=entry.gpu_class_label,
+            gpu_count=entry.gpu_requested,
+            placement=get_pod_node_placement(pod),
+            reservation_id=entry.reservation.id,
+        ),
+        datetime.now(timezone.utc),
+    )
+
+
 async def _try_apply_toleration(
     state: ControllerState, uid: str, entry: QueueEntry,
     scheduling_gate_name: str | None = None,
@@ -993,6 +1074,7 @@ async def _try_apply_toleration(
                 gpus=entry.gpu_requested, free=state.available(entry.reservation),
                 reserved=entry.reservation.gpu_count, until=guaranteed_until,
             ))
+        _note_admitted(state, uid, entry, fresh_pod)
         return True
 
     except Exception as exc:  # noqa: BLE001
@@ -1059,12 +1141,11 @@ class _FitInputs(NamedTuple):
     Preflight judges every candidate of a batch on its own; the grant loop
     judges each again in grant order, against the GPUs the grants ahead of it
     took (``_hold_on_fit``).  The placement comes off the pod preflight read,
-    which the grant loop does not re-read.
+    which the grant loop does not re-read; the node maps are read live each
+    time, since they move as pods bind and end (``ControllerState.gpu_pods``).
     """
 
     placement: Optional[NodePlacement]
-    placement_nodes: Optional[frozenset[str]]
-    class_free_by_node: Optional[dict[str, int]]
     duration_seconds: int
 
 
@@ -1133,8 +1214,10 @@ async def _preflight_with_fit(
     can judge it again at grant time without re-reading the pod.
     """
     now = datetime.now(timezone.utc)
-    # Describes this attempt only; guard 4 sets it again if it still holds.
+    # Describes this attempt only; guards 4 and 5 set them again if they still
+    # hold.
     candidate.held_by_overcommit = False
+    candidate.held_by_node_fit = False
     try:
         fresh_pod = await read_pod(candidate.pod_name, candidate.pod_namespace)
     except Exception as exc:  # noqa: BLE001
@@ -1273,9 +1356,11 @@ async def _preflight_with_fit(
     # and once admitted and stuck it would trip guard 3 for the whole class.
     # Unknown stays open: no inventory yet, or a placement it cannot read.
     placement = get_pod_node_placement(fresh_pod)
+    # Kept for the watch, which re-judges a guard-5 hold without the pod.
+    candidate.placement = placement
     class_free_by_node = state.node_free_by_node_class.get(candidate.gpu_class_label)
-    placement_nodes = _placement_nodes(placement, class_free_by_node, state.node_labels)
-    if placement_nodes is not None and not placement_nodes:
+    allowed_nodes = _placement_nodes(placement, class_free_by_node, state.node_labels)
+    if allowed_nodes is not None and not allowed_nodes:
         assert placement is not None and class_free_by_node is not None
         log.info("%s", kv(
             event="ondemand.candidate_held", guard=1, reason="no_matching_node",
@@ -1322,12 +1407,7 @@ async def _preflight_with_fit(
     # Guards 4 and 5 judge whether the ask could physically land -- see
     # _hold_on_fit.  Judged here on its own, and again in the grant loop, in the
     # order the grants are made.
-    fit = _FitInputs(
-        placement=placement,
-        placement_nodes=placement_nodes,
-        class_free_by_node=class_free_by_node,
-        duration_seconds=duration_seconds,
-    )
+    fit = _FitInputs(placement=placement, duration_seconds=duration_seconds)
     if await _hold_on_fit(state, config, uid, candidate, fit, now):
         return _PREFLIGHT_RETRY, None, None
 
@@ -1350,6 +1430,48 @@ async def _preflight_with_fit(
     return _PREFLIGHT_READY, ask, fit
 
 
+class _NodeFit(NamedTuple):
+    """Guard 5's arithmetic for one candidate (:func:`_node_fit`)."""
+
+    largest_free: int    # the largest single-node opening the ask may use
+    claimed: int         # GPUs admitted, unbound pods may take from those nodes
+    narrowing: Optional[NodePlacement]  # the placement, when it narrows the class
+
+    def fits(self, gpus: int) -> bool:
+        return self.largest_free - self.claimed >= gpus
+
+
+def _node_fit(
+    state: ControllerState,
+    uid: str,
+    candidate: OnDemandCandidate,
+    placement: Optional[NodePlacement],
+) -> Optional[_NodeFit]:
+    """Guard 5 for *candidate* against the live node maps, or ``None`` when it
+    does not apply (a 1-GPU guaranteed ask its placement does not narrow) or has
+    nothing to go on (fail-open: no data for the class).
+
+    Shared by the hold (``_hold_on_fit``) and the watch's re-judgment of a held
+    candidate (``_retry_node_fit_holds``), so the two cannot disagree about
+    whether the ask now fits.
+    """
+    class_free_by_node = state.node_free_by_node_class.get(candidate.gpu_class_label)
+    allowed = _placement_nodes(placement, class_free_by_node, state.node_labels)
+    narrowing = placement if allowed is not None else None
+    if not (narrowing is not None or candidate.gpu_requested >= 2 or candidate.best_effort):
+        return None
+    if allowed is not None:
+        assert class_free_by_node is not None
+        largest_free = max((class_free_by_node.get(n, 0) for n in allowed), default=0)
+    else:
+        known = state.node_free_by_class.get(candidate.gpu_class_label)
+        if known is None:
+            return None
+        largest_free = known
+    claimed = state.node_claims(candidate.gpu_class_label, allowed, exclude_uid=uid)
+    return _NodeFit(largest_free, claimed, narrowing)
+
+
 async def _hold_on_fit(
     state: ControllerState,
     config: Config,
@@ -1357,8 +1479,6 @@ async def _hold_on_fit(
     candidate: OnDemandCandidate,
     fit: _FitInputs,
     now: datetime,
-    *,
-    node_claimed: int = 0,
 ) -> bool:
     """Guards 4 and 5: hold an ask whose GPUs could not physically land.
 
@@ -1368,8 +1488,10 @@ async def _hold_on_fit(
     a tally accrued at preflight, in creation order, would have chosen before
     the app was asked.  Guard 4 needs no tally for it -- a lease granted
     earlier in the batch is upserted into ``state.reservations`` before the
-    next grant is judged -- but guard 5 reads a node snapshot no grant
-    updates, so *node_claimed* is the GPUs the batch's earlier grants took.
+    next grant is judged -- and nor does guard 5: a grant admits its pod, and
+    an admitted pod not yet bound is a claim (``ControllerState.node_claims``)
+    netted off the openings the next ask is measured against, in this batch
+    and every later one until the pod binds.
 
     Returns ``True`` when held: ``candidate.next_attempt_at`` has been pushed
     forward, and the hold logged and told to the pod's owner.
@@ -1442,59 +1564,82 @@ async def _hold_on_fit(
     # under.  Nothing else closes that; this is the only physical bound on
     # best-effort admission.
     #
-    # *node_claimed* is the GPUs the batch's earlier grants took, which the
-    # node snapshot does not show, so a burst of candidates cannot each be
-    # measured against the same single-node opening.  It does not close the
-    # window between queue ticks (the snapshot refreshes on
-    # QUEUE_PROCESSOR_INTERVAL), which is acceptable precisely because a
-    # best-effort over-admission is cheap: no SU is charged, no capacity is
-    # held, and the pod simply waits.
-    #
     # A pod whose node placement narrows the class is checked at every GPU
     # count too, against only the nodes it allows: pinned to one busy host, a
     # 1-GPU pod is exactly as unable to start as a fragmented 4-GPU one, and
     # the class's free GPUs elsewhere are no use to it.  Its owner is told
     # (WaitingForNode), since the scheduler's own message names only our taint.
-    # The batch tally is per class, not per node, so for such a pod it is
-    # conservative: a GPU claimed by an earlier candidate is netted off these
-    # nodes even if it will land elsewhere, costing at most a short retry.
-    narrowing = fit.placement if fit.placement_nodes is not None else None
-    if (
-        narrowing is not None
-        or candidate.gpu_requested >= 2
-        or candidate.best_effort
-    ):
-        if fit.placement_nodes is not None:
-            assert fit.class_free_by_node is not None
-            largest_free: Optional[int] = max(
-                fit.class_free_by_node.get(n, 0) for n in fit.placement_nodes
+    #
+    # The openings are net of *claims*: pods already admitted -- by a grant
+    # ahead of this one in the batch, an earlier batch, or the reserved path --
+    # that have not been bound yet, and whose own placement lets them land on a
+    # node this ask could use.  The scheduler hands an opening to a pod that
+    # already tolerates the node before a lease for another pod could land, so
+    # granting against a claimed opening charges SU for a pod that will not
+    # start.  A claim that may land elsewhere is still counted, which costs at
+    # most a short retry: it binds in seconds, and the watch then re-judges
+    # this ask (_retry_node_fit_holds).
+    node_fit = _node_fit(state, uid, candidate, fit.placement)
+    if node_fit is not None and not node_fit.fits(candidate.gpu_requested):
+        narrowing = node_fit.narrowing
+        log.info("%s", kv(
+            event="ondemand.candidate_held", guard=5,
+            reason="no_single_node_fit",
+            ns=candidate.pod_namespace, pod=candidate.pod_name,
+            clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+            node_free=node_fit.largest_free, claimed=node_fit.claimed or None,
+            # Present only when node_free is over the nodes the pod's
+            # placement allows rather than the whole class.
+            detail=_placement_text(narrowing) if narrowing else None,
+        ))
+        candidate.next_attempt_at = _short_retry_at(now)
+        candidate.held_by_node_fit = True
+        if narrowing is not None:
+            await _emit_placement_event(
+                config, state, uid, candidate, WAITING_FOR_NODE_REASON,
+                _waiting_for_node_message(
+                    candidate.gpu_class_label, narrowing,
+                    candidate.gpu_requested,
+                ),
+                now,
             )
-        else:
-            largest_free = state.node_free_by_class.get(candidate.gpu_class_label)
-        if largest_free is not None:
-            if largest_free - node_claimed < candidate.gpu_requested:
-                log.info("%s", kv(
-                    event="ondemand.candidate_held", guard=5,
-                    reason="no_single_node_fit",
-                    ns=candidate.pod_namespace, pod=candidate.pod_name,
-                    clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
-                    node_free=largest_free, claimed=node_claimed or None,
-                    # Present only when node_free is over the nodes the pod's
-                    # placement allows rather than the whole class.
-                    detail=_placement_text(narrowing) if narrowing else None,
-                ))
-                candidate.next_attempt_at = _short_retry_at(now)
-                if narrowing is not None:
-                    await _emit_placement_event(
-                        config, state, uid, candidate, WAITING_FOR_NODE_REASON,
-                        _waiting_for_node_message(
-                            candidate.gpu_class_label, narrowing,
-                            candidate.gpu_requested,
-                        ),
-                        now,
-                    )
-                return True
+        return True
     return False
+
+
+def _retry_node_fit_holds(state: ControllerState, gpu_class: str, now: datetime) -> bool:
+    """GPUs of *gpu_class* just came free: make due every candidate guard 5
+    was holding that would now fit, and say whether there was one.
+
+    A guard-5 hold used to wait for its retry clock *and* for the next queue
+    tick's node snapshot, since nothing else refreshed the map it was measured
+    against -- up to a ``QUEUE_PROCESSOR_INTERVAL`` of an idle GPU after the
+    pod ahead of it ended, during which anything else could take the GPU.  The
+    pod watch now keeps that map current, and calls this whenever a change to
+    it can only have helped (``controller.capacity_frees_up``).  The re-judgment
+    is in memory (:func:`_node_fit`, the hold's own arithmetic, over the
+    placement preflight last read), so a change that does not make room costs
+    no batch: a busy class's churn cannot hammer the app's selection endpoint.
+    The caller runs the batch; preflight then re-reads each pod and judges it
+    again in full.
+    """
+    woken = False
+    for uid, candidate in state.ondemand_candidates.items():
+        if not candidate.held_by_node_fit or candidate.gpu_class_label != gpu_class:
+            continue
+        node_fit = _node_fit(state, uid, candidate, candidate.placement)
+        if node_fit is not None and not node_fit.fits(candidate.gpu_requested):
+            continue
+        candidate.held_by_node_fit = False
+        candidate.next_attempt_at = min(candidate.next_attempt_at, now)
+        log.debug("%s", kv(
+            event="ondemand.node_fit_retry", ns=candidate.pod_namespace,
+            pod=candidate.pod_name, clabel=gpu_class, gpus=candidate.gpu_requested,
+            node_free=node_fit.largest_free if node_fit else None,
+            claimed=(node_fit.claimed or None) if node_fit else None,
+        ))
+        woken = True
+    return woken
 
 
 async def _post_pending_status(
@@ -1894,15 +2039,10 @@ def _placement_nodes(
     labels (a pod is never held on data the controller lacks, as with guards 1b
     and 5), or when the placement allows every node of the class (a node
     selector that restates the GPU class, say).  Otherwise the allowed subset,
-    which may be empty.
+    which may be empty.  ``controller.placement_nodes``, which claims are
+    measured with too, so a claim and the ask it is netted off agree.
     """
-    if placement is None or class_nodes is None:
-        return None
-    nodes = tuple(class_nodes)
-    if any(n not in node_labels for n in nodes):
-        return None
-    allowed = placement.matching_nodes(nodes, node_labels)
-    return None if len(allowed) == len(nodes) else allowed
+    return placement_nodes(placement, class_nodes, node_labels)
 
 
 # A pod's placement is quoted back to its owner and logged, and nothing bounds
@@ -2829,10 +2969,11 @@ async def _run_ondemand_admission_once(
     its own; the grant loop judges each again, in grant order, against what
     the grants ahead of it took (``_hold_on_fit``) -- so on the scarcest
     physical capacity it is the app's order, not creation order, that decides.
-    Guard 4 needs no tally there: a granted lease is upserted into
-    ``state.reservations`` before the next grant is judged.  Guard 5 nets the
-    GPUs of this batch's grants off the node snapshot, which nothing else
-    updates until the next queue tick.
+    Neither needs a tally there: a granted lease is upserted into
+    ``state.reservations`` before the next grant is judged (guard 4), and its
+    admitted pod is a claim on the node openings until it binds (guard 5,
+    ``ControllerState.node_claims``) -- a claim that outlives the batch, so the
+    next batch cannot grant the same opening again either.
 
     **What is not granted.**  A candidate the app withheld is handled by its
     reason (``_handle_withheld``).  If the app cannot be asked, every *due*
@@ -2885,19 +3026,15 @@ async def _run_ondemand_admission_once(
             ))
 
     by_uid = {r.uid: r for r in ready}
-    node_claimed: dict[str, int] = {}
     for uid in granted:
         r = by_uid[uid]
-        label = r.candidate.gpu_class_label
         if await _hold_on_fit(
             state, config, uid, r.candidate, r.fit, datetime.now(timezone.utc),
-            node_claimed=node_claimed.get(label, 0),
         ):
             r.candidate.awaiting_capacity = False
             continue
         if await _grant_and_admit(state, client, config, uid, r.candidate, r.ask):
             state.remove_ondemand_candidate(uid)
-            node_claimed[label] = node_claimed.get(label, 0) + r.candidate.gpu_requested
 
     if not answered:
         return
@@ -3185,6 +3322,9 @@ async def pod_watch_loop(
                     # placement being enabled (otherwise reserved-path budget leaks until
                     # the next reconcile).
                     released = state.release_pod(uid)
+                    # And off its node, before anything awaits: a candidate
+                    # guard 5 holds for room there may now fit.
+                    node_freed = _note_gpu_pod(state, uid, None, datetime.now(timezone.utc))
                     # Record any overstay before teardown removes the lease from
                     # state.reservations (so guarantee_end can still resolve the window).
                     await _report_overstay_if_any(
@@ -3196,9 +3336,10 @@ async def pod_watch_loop(
                     # Its GPUs are free: a pod waiting on the same reservation
                     # need not wait for the next tick to take them.
                     await _retry_waiters(state, config, released)
-                    if lease_released:
+                    if lease_released or node_freed:
                         # Nor need an on-demand candidate: the lease's capacity
-                        # is back in the app's calendar.
+                        # is back in the app's calendar, or the pod's GPUs are
+                        # free on a node a held candidate may use.
                         await _run_ondemand_admission(state, client, config)
 
                 elif event_type in ("ADDED", "MODIFIED"):
@@ -3218,6 +3359,9 @@ async def pod_watch_loop(
                         state.remove_ondemand_candidate(uid)
                         state.forget_pending_status(uid)
                         released = state.release_pod(uid)
+                        node_freed = _note_gpu_pod(
+                            state, uid, None, datetime.now(timezone.utc)
+                        )
                         # Record any overstay before teardown removes the lease from
                         # state.reservations (so guarantee_end can still resolve).
                         await _report_overstay_if_any(
@@ -3229,9 +3373,10 @@ async def pod_watch_loop(
                         # The next job queued on the same reservation starts now,
                         # not on the next tick.
                         await _retry_waiters(state, config, released)
-                        if lease_released:
+                        if lease_released or node_freed:
                             # And an on-demand candidate waiting on capacity is
-                            # offered the lease's now.
+                            # offered the lease's now, or the GPUs the pod held
+                            # on a node it may use.
                             await _run_ondemand_admission(state, client, config)
                         continue
 
@@ -3252,6 +3397,15 @@ async def pod_watch_loop(
                         if booking_id is not None:
                             state.record_placement(booking_id, uid, get_pod_gpu_count(pod))
                             state.holder_names[uid] = (namespace, name)
+                        # And keep per-node accounting current: the pod binding to a
+                        # node, or starting to terminate (its GPUs are being
+                        # recovered), moves GPUs there.  A change that made room
+                        # re-attempts a candidate guard 5 holds that now fits.
+                        if _note_gpu_pod(
+                            state, uid, _gpu_pod_of_watched(pod, gpu_class_label),
+                            datetime.now(timezone.utc),
+                        ):
+                            await _run_ondemand_admission(state, client, config)
                         continue
 
                     gpu_count = get_pod_gpu_count(pod)
@@ -3577,6 +3731,198 @@ async def _cancel_pending_noshows(
 # ---------------------------------------------------------------------------
 
 
+def _refresh_node_feasibility(
+    state: ControllerState,
+    config: Config,
+    snapshot: list,
+    taken_at: datetime,
+    inventory: Optional[dict[str, dict[str, int]]],
+    node_labels: dict[str, dict[str, str]],
+    now: datetime,
+) -> None:
+    """Rebuild what guards 1b, 3, 4 and 5 read from one tolerated-pod snapshot
+    (LISTed no earlier than *taken_at*) and one node inventory (``None`` when
+    that snapshot failed).
+
+    Every queue tick runs it, and so does startup, before the pod watch replays
+    every pending pod as ADDED (``_seed_node_feasibility``): with nothing
+    recorded yet every guard fails open, and each replayed candidate would be
+    judged -- and granted -- against no data at all.
+
+    The per-pod GPU map is rebuilt whatever the inventory did: it is pod facts,
+    and rebuilding it is what self-heals a watch event the controller missed.
+    """
+    state.rebuild_gpu_pods(
+        {
+            p.uid: record
+            for p in snapshot
+            if (record := _gpu_pod_of_snapshot(p)) is not None
+        },
+        taken_at,
+    )
+    # Guards 1 and 5: free GPUs per node, per class, and node labels -- the
+    # per-node detail a pod with a node placement is measured against, and its
+    # collapse to the largest single-node opening.
+    if inventory is not None:
+        state.install_node_inventory(inventory, node_labels)
+    free_by_node = state.node_free_by_node_class if inventory is not None else None
+
+    # Guard 3: refresh safety interlock from the same snapshot.  A holder kept
+    # Pending by its own node selector or affinity -- it allows none of the
+    # class's nodes, or only full ones while another has room -- is left out:
+    # it says nothing about the class, and counting it would let one pod pinned
+    # to a busy host pause on-demand admission for everyone on the class.  With
+    # no inventory this tick every stuck holder counts, as it always did.
+    if config.ondemand_lease_enabled:
+        stuck = []
+        for p in snapshot:
+            if not (p.phase == "Pending" and p.scheduled_false and p.gpu_class):
+                continue
+            class_free = free_by_node.get(p.gpu_class) if free_by_node is not None else None
+            if class_free is not None and p.placement is not None:
+                excused = placement_stall_reason(
+                    p.gpu_count, class_free,
+                    _placement_nodes(p.placement, class_free, state.node_labels),
+                )
+                if excused is not None:
+                    log.debug("%s", kv(
+                        event="interlock.holder_excluded", ns=p.namespace,
+                        pod=p.name, clabel=p.gpu_class, guard=3, reason=excused,
+                        detail=_placement_text(p.placement),
+                    ))
+                    continue
+            stuck.append((p.namespace, p.name, p.gpu_class, p.reservation_id))
+        new_classes = {gpu_class for _, _, gpu_class, _ in stuck}
+        old_classes = state.stuck_holder_gpu_classes
+        state.stuck_holder_gpu_classes = new_classes
+        state.stuck_holder_pods = {
+            gpu_class: [f"{ns}.{name}" for ns, name, gc, _ in stuck if gc == gpu_class]
+            for gpu_class in new_classes
+        }
+        activated = new_classes - old_classes
+        # What held the class when it stalled, for the on-demand commitment's
+        # measure: which reservations the stuck pods run under (so a report can
+        # tell a within-allocation lease from anything else, off the ledger), and
+        # the GPUs pods past their runtime guarantee held on nodes the inventory
+        # counts -- the pool boundary preemption and headroom reclaim from.  A
+        # synchronous read of the reservation state, like the rest of guard 3.
+        views = [_pod_view(p, inventory) for p in snapshot] if activated else []
+        for gpu_class in activated:
+            affected = [(ns, name, rid) for ns, name, gc, rid in stuck if gc == gpu_class]
+            log.warning("%s", kv(
+                event="interlock.activated", clabel=gpu_class, guard=3,
+                count=len(affected),
+                pods=[f"{ns}.{name}" for ns, name, _ in affected],
+                rids=sorted({rid for _, _, rid in affected if rid is not None}),
+                overstay_gpus=state.overstay_gpus(gpu_class, views, now),
+            ))
+        for gpu_class in old_classes - new_classes:
+            log.info("%s", kv(event="interlock.cleared", clabel=gpu_class, guard=3))
+
+    # Guards 1b and 4 read the rest of the same inventory.  The free maps
+    # guards 1 and 5 read were re-derived above, by install_node_inventory.
+    if config.ondemand_lease_enabled and inventory is not None:
+        # Guard 1b reads the node *count* from the same inventory: free
+        # GPUs cannot distinguish "class is full" from "class has no nodes
+        # left", and those want opposite treatment (grant and wait, versus
+        # do not mint a lease at all).  The classes the app knows are passed
+        # in because a drained class is absent from the inventory, not zero.
+        state.class_node_counts = node_counts_by_class(inventory, state.gpu_class_ids)
+        # Guard 4: re-check the overcommit pause from the same inventory, so
+        # it lifts (or engages) on this tick's cadence instead of waiting
+        # for the hourly audit.
+        _refresh_overcommit_pause(state, gpu_capacity_by_class(inventory))
+        for _cls, _free in sorted(state.node_free_by_class.items()):
+            log.debug("%s", kv(
+                event="queue.node_feasibility", clabel=_cls, node_free=_free,
+                nodes=state.class_node_counts.get(_cls, 0),
+            ))
+
+
+async def _seed_node_feasibility(state: ControllerState, config: Config) -> None:
+    """Take the node-feasibility snapshot once before the pod watch starts.
+
+    The queue tick is the only other thing that takes it, and its loop sleeps
+    one ``QUEUE_PROCESSOR_INTERVAL`` before its first tick -- while the watch's
+    opening LIST replays every pending pod as ADDED, each starting an admission
+    batch.  With no maps yet, guards 1b, 3 and 5 all fail open, so every pod
+    waiting at a restart or rollout -- a pod pinned to full nodes above all --
+    was granted an SU-charged lease it could not start under.  Best-effort: a
+    failure is logged and leaves the maps empty, which is how they started.
+    """
+    if not config.ondemand_lease_enabled:
+        return
+    taken_at = datetime.now(timezone.utc)
+    node_labels: dict[str, dict[str, str]] = {}
+    try:
+        snapshot = await snapshot_tolerated_pods(
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+        )
+        inventory = await snapshot_node_gpu_inventory(
+            TOLERATION_KEY, labels_out=node_labels
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("%s", kv(event="startup.node_feasibility_failed", err=exc), exc_info=True)
+        return
+    _refresh_node_feasibility(
+        state, config, snapshot, taken_at, inventory, node_labels,
+        datetime.now(timezone.utc),
+    )
+    log.info("%s", kv(
+        event="startup.node_feasibility", classes=len(inventory),
+        nodes=sum(len(nodes) for nodes in inventory.values()),
+    ))
+
+
+# A pod admitted under an on-demand lease is normally bound within seconds; one
+# still unbound this long after its lease started is being charged SU for a GPU
+# it is not using.  Fixed rather than configurable: it only decides when the
+# condition is worth a line, and the line carries how long it has lasted.
+LEASE_UNBOUND_WARNING_SECONDS = 120
+
+
+def _warn_unbound_leases(state: ControllerState, now: datetime) -> None:
+    """Log ``lease.unbound`` for every pod admitted under an on-demand lease
+    that is still not bound to a node ``LEASE_UNBOUND_WARNING_SECONDS`` after
+    the lease started.
+
+    The measure of what guard 5 does not prevent: a lease charged while its pod
+    sat Pending, because something took the opening between the grant and the
+    bind, or the pod waits on something the controller cannot see.  The app
+    anchors a lease at its own "now" when it grants it, so ``unbound_s`` is the
+    time charged so far without a GPU.  Restated every queue tick for as long as
+    it lasts.  A booking's pod waiting is not reported -- its window was paid
+    for whether or not the pod binds, and a stuck holder is guard 3's to report
+    -- and nor is a best-effort pod, which costs nothing.
+    """
+    by_id = {r.id: r for r in state.reservations}
+    for p in state.gpu_pods.values():
+        if p.node_name is not None or p.reservation_id is None:
+            continue
+        lease = by_id.get(p.reservation_id)
+        if lease is None or lease.kind != "on_demand" or lease.status != "active":
+            continue
+        unbound_s = int((now - slot_start(lease)).total_seconds())
+        if unbound_s < LEASE_UNBOUND_WARNING_SECONDS:
+            continue
+        # Whether the pod's own placement explains the wait, as guard 3 judges
+        # it: none of its nodes has room while another node of the class does,
+        # or it allows none.  Absent when it does not.
+        class_free = state.node_free_by_node_class.get(p.gpu_class)
+        reason = None
+        if class_free is not None and p.placement is not None:
+            reason = placement_stall_reason(
+                p.gpu_count, class_free,
+                _placement_nodes(p.placement, class_free, state.node_labels),
+            )
+        log.warning("%s", kv(
+            event="lease.unbound", rid=p.reservation_id, ns=p.namespace,
+            pod=p.name, clabel=p.gpu_class, gpus=p.gpu_count,
+            unbound_s=unbound_s, reason=reason,
+            detail=_placement_text(p.placement) if p.placement is not None else None,
+        ))
+
+
 async def queue_processor_loop(
     state: ControllerState, client: ReservationClient, config: Config
 ) -> None:
@@ -3703,15 +4049,13 @@ async def _run_queue_tick(
     # One node inventory per tick feeds guards 1b, 3, 4 and 5.  It is joined
     # with this tick's tolerated `snapshot`, deliberately reused rather than
     # re-fetched alongside `inventory` (avoids a second wide pod LIST this
-    # tick); the two calls are not atomic, so a pod that finishes scheduling in
-    # the gap is briefly invisible here, making the per-node free count
-    # optimistic for the node it actually landed on.  Accepted: guard 3 and the
-    # compensating cancel in _grant_and_admit backstop any grant this skew lets
-    # through.  Fail-safe: if either snapshot is missing, leave every prior map
-    # intact — never open admission for a class based on unknown physical state.
+    # tick).  The two calls are not atomic; a pod that binds or ends in the gap
+    # is covered by the watch, whose changes since the snapshot survive the
+    # rebuild (ControllerState.rebuild_gpu_pods).  Fail-safe: if the node
+    # snapshot fails, leave every inventory-derived map intact -- never open
+    # admission for a class based on unknown physical state.
     inventory: Optional[dict[str, dict[str, int]]] = None
     node_labels: dict[str, dict[str, str]] = {}
-    free_by_node: Optional[dict[str, dict[str, int]]] = None
     if config.ondemand_lease_enabled and snapshot is not None:
         try:
             inventory = await snapshot_node_gpu_inventory(
@@ -3721,86 +4065,11 @@ async def _run_queue_tick(
             log.warning("%s", kv(
                 event="queue.snapshot_failed", target="node_inventory", err=exc,
             ), exc_info=True)
-        else:
-            free_by_node = free_gpus_by_node_class(
-                inventory, [_pod_view(p) for p in snapshot]
-            )
-
-    # Guard 3: refresh safety interlock from the same snapshot.  A holder kept
-    # Pending by its own node selector or affinity -- it allows none of the
-    # class's nodes, or only full ones while another has room -- is left out:
-    # it says nothing about the class, and counting it would let one pod pinned
-    # to a busy host pause on-demand admission for everyone on the class.  With
-    # no inventory this tick every stuck holder counts, as it always did.
-    if config.ondemand_lease_enabled and snapshot is not None:
-        stuck = []
-        for p in snapshot:
-            if not (p.phase == "Pending" and p.scheduled_false and p.gpu_class):
-                continue
-            class_free = free_by_node.get(p.gpu_class) if free_by_node is not None else None
-            if class_free is not None and p.placement is not None:
-                excused = placement_stall_reason(
-                    p.gpu_count, class_free,
-                    _placement_nodes(p.placement, class_free, node_labels),
-                )
-                if excused is not None:
-                    log.debug("%s", kv(
-                        event="interlock.holder_excluded", ns=p.namespace,
-                        pod=p.name, clabel=p.gpu_class, guard=3, reason=excused,
-                        detail=_placement_text(p.placement),
-                    ))
-                    continue
-            stuck.append((p.namespace, p.name, p.gpu_class, p.reservation_id))
-        new_classes = {gpu_class for _, _, gpu_class, _ in stuck}
-        old_classes = state.stuck_holder_gpu_classes
-        state.stuck_holder_gpu_classes = new_classes
-        state.stuck_holder_pods = {
-            gpu_class: [f"{ns}.{name}" for ns, name, gc, _ in stuck if gc == gpu_class]
-            for gpu_class in new_classes
-        }
-        activated = new_classes - old_classes
-        # What held the class when it stalled, for the on-demand commitment's
-        # measure: which reservations the stuck pods run under (so a report can
-        # tell a within-allocation lease from anything else, off the ledger), and
-        # the GPUs pods past their runtime guarantee held on nodes the inventory
-        # counts -- the pool boundary preemption and headroom reclaim from.  A
-        # synchronous read of the reservation state, like the rest of guard 3.
-        views = [_pod_view(p, inventory) for p in snapshot] if activated else []
-        for gpu_class in activated:
-            affected = [(ns, name, rid) for ns, name, gc, rid in stuck if gc == gpu_class]
-            log.warning("%s", kv(
-                event="interlock.activated", clabel=gpu_class, guard=3,
-                count=len(affected),
-                pods=[f"{ns}.{name}" for ns, name, _ in affected],
-                rids=sorted({rid for _, _, rid in affected if rid is not None}),
-                overstay_gpus=state.overstay_gpus(gpu_class, views, now),
-            ))
-        for gpu_class in old_classes - new_classes:
-            log.info("%s", kv(event="interlock.cleared", clabel=gpu_class, guard=3))
-
-    # Guards 1b, 4 and 5: refresh per-node feasibility (largest single-node free
-    # GPUs per class, the node count behind each class, and the per-node detail
-    # a pod with a node placement is measured against) from the same inventory.
-    # Consulted synchronously by _preflight_ondemand_candidate.
-    if inventory is not None and free_by_node is not None:
-        state.node_free_by_node_class = free_by_node
-        state.node_labels = node_labels
-        state.node_free_by_class = largest_node_free_by_class(free_by_node)
-        # Guard 1b reads the node *count* from the same inventory: free
-        # GPUs cannot distinguish "class is full" from "class has no nodes
-        # left", and those want opposite treatment (grant and wait, versus
-        # do not mint a lease at all).  The classes the app knows are passed
-        # in because a drained class is absent from the inventory, not zero.
-        state.class_node_counts = node_counts_by_class(inventory, state.gpu_class_ids)
-        # Guard 4: re-check the overcommit pause from the same inventory, so
-        # it lifts (or engages) on this tick's cadence instead of waiting
-        # for the hourly audit.
-        _refresh_overcommit_pause(state, gpu_capacity_by_class(inventory))
-        for _cls, _free in sorted(state.node_free_by_class.items()):
-            log.debug("%s", kv(
-                event="queue.node_feasibility", clabel=_cls, node_free=_free,
-                nodes=state.class_node_counts.get(_cls, 0),
-            ))
+    if snapshot is not None:
+        # *now* was read before the pod LIST went out, so it bounds the
+        # snapshot from below, which is what the rebuild needs.
+        _refresh_node_feasibility(state, config, snapshot, now, inventory, node_labels, now)
+        _warn_unbound_leases(state, now)
 
     to_remove: list[str] = []
 
@@ -5153,6 +5422,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await _run_capacity_audit(state, config)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s", kv(event="startup.capacity_audit_failed", err=exc), exc_info=True)
+
+        # And give guards 1b, 3 and 5 their maps before the pod watch replays
+        # every pending pod, each replay starting an admission batch.  After the
+        # initial fetch, so a class the app knows but no node backs reads as a
+        # known zero (guard 1b) rather than unknown.
+        await _seed_node_feasibility(state, config)
 
     # Launch the background loops as asyncio tasks, each supervised by
     # _on_task_done so an unhandled crash is logged and flips /health to 503.

@@ -21,7 +21,7 @@ import math
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Collection, Iterable, Literal, NamedTuple, Optional
+from typing import Collection, Iterable, Literal, NamedTuple, Optional, Protocol
 
 from .log_fields import kv
 from .schemas import ReservationResponse
@@ -248,6 +248,143 @@ def node_counts_by_class(
         (gpu_class, len(nodes)) for gpu_class, nodes in capacity_by_node_class.items()
     )
     return counts
+
+
+class NodeMatcher(Protocol):
+    """What per-node accounting needs of a pod's node placement.
+
+    ``k8s_client.NodePlacement`` satisfies it.  Named structurally so this
+    module can match a placement against node labels without importing the
+    Kubernetes-facing one.
+    """
+
+    def matching_nodes(
+        self, node_names: Iterable[str], labels_by_node: dict[str, dict[str, str]]
+    ) -> frozenset[str]: ...
+
+
+def placement_nodes(
+    placement: Optional[NodeMatcher],
+    class_nodes: Optional[Iterable[str]],
+    node_labels: dict[str, dict[str, str]],
+) -> Optional[frozenset[str]]:
+    """The nodes of a GPU class a pod's node placement allows, if it narrows them.
+
+    ``None`` -- treat the pod as unconstrained -- when it has no placement,
+    when the class's nodes are not known yet, when any of them has no recorded
+    labels (a pod is never held on data the controller lacks, as with guards 1b
+    and 5), or when the placement allows every node of the class (a node
+    selector that restates the GPU class, say).  Otherwise the allowed subset,
+    which may be empty.  Pure.
+    """
+    if placement is None or class_nodes is None:
+        return None
+    nodes = tuple(class_nodes)
+    if any(n not in node_labels for n in nodes):
+        return None
+    allowed = placement.matching_nodes(nodes, node_labels)
+    return None if len(allowed) == len(nodes) else allowed
+
+
+@dataclass(frozen=True)
+class GpuPod:
+    """Where one live tolerated pod's GPUs are, for per-node accounting.
+
+    With *node_name* set the pod occupies *gpu_count* GPUs on that node.
+    Without it the pod carries the toleration but has not been bound yet: a
+    **claim** on the next opening on a node its *placement* allows.  The
+    scheduler hands an opening to a pod that already tolerates the node before
+    a lease request for another pod could land, so guard 5 nets claims off the
+    openings it measures (``ControllerState.node_claims``).  Kept per pod uid
+    in ``ControllerState.gpu_pods``; build one with :func:`gpu_pod_record`.
+    """
+
+    namespace: str
+    name: str
+    gpu_class: str
+    gpu_count: int
+    node_name: Optional[str] = None
+    placement: Optional[NodeMatcher] = None
+    # The reservation the pod was admitted under (galends/booking-reference),
+    # so an unbound pod can be traced to the lease it is being charged under.
+    reservation_id: Optional[int] = None
+
+
+def gpu_pod_record(
+    *,
+    namespace: str,
+    name: str,
+    gpu_class: str,
+    gpu_count: int,
+    phase: str,
+    scheduled_false: bool,
+    terminating: bool,
+    node_name: Optional[str],
+    placement: Optional[NodeMatcher] = None,
+    reservation_id: Optional[int] = None,
+) -> Optional[GpuPod]:
+    """Classify one tolerated pod for ``ControllerState.gpu_pods``, or ``None``.
+
+    The rule ``free_gpus_by_node_class`` applies to a snapshot, so the live
+    map and a rebuild from a snapshot agree: a pod bound to a node occupies it
+    while node-resident (Running, or Pending without ``PodScheduled=False``)
+    and not terminating -- a terminating pod's GPUs are already being
+    recovered; an unbound Pending pod that is not terminating is a claim; a
+    terminal, Unknown or terminating pod, or one asking for no GPU, holds
+    nothing.  Pure.
+    """
+    if terminating or gpu_count < 1 or not gpu_class:
+        return None
+    if node_name:
+        if not (phase == "Running" or (phase == "Pending" and not scheduled_false)):
+            return None
+    elif phase != "Pending":
+        return None
+    return GpuPod(
+        namespace=namespace,
+        name=name,
+        gpu_class=gpu_class,
+        gpu_count=gpu_count,
+        node_name=node_name or None,
+        placement=placement,
+        reservation_id=reservation_id,
+    )
+
+
+def node_free_from_pods(
+    capacity_by_node_class: dict[str, dict[str, int]],
+    pods: Iterable[GpuPod],
+) -> dict[str, dict[str, int]]:
+    """Free GPUs per node, per class: allocatable minus the pods bound there.
+
+    :func:`free_gpus_by_node_class` over ``GpuPod`` records rather than pod
+    views -- the records already apply its residency rule
+    (:func:`gpu_pod_record`).  A claim (no node) counts against no node; a pod
+    on a node or class absent from the inventory is ignored.  Pure.
+    """
+    free = {gpu_class: dict(nodes) for gpu_class, nodes in capacity_by_node_class.items()}
+    for p in pods:
+        if p.node_name is None:
+            continue
+        per_node = free.get(p.gpu_class)
+        if per_node is not None and p.node_name in per_node:
+            per_node[p.node_name] -= p.gpu_count
+    return free
+
+
+def capacity_frees_up(previous: Optional[GpuPod], current: Optional[GpuPod]) -> bool:
+    """Whether a pod's record moving from *previous* to *current* can help a
+    pod waiting for room: GPUs left a node, or a claim stopped claiming.
+
+    The other moves only take capacity -- a pod appearing, binding onto a node
+    with no claim before it, or a claim appearing.  Pure.
+    """
+    if previous is None or previous == current:
+        return False
+    if previous.node_name is None:
+        # A claim resolved: it bound somewhere, or went away.
+        return current is None or current.node_name is not None
+    return current is None or current.node_name != previous.node_name
 
 
 class LockContractError(RuntimeError):
@@ -506,6 +643,18 @@ class OnDemandCandidate:
     # only the asks that do not fit, so an over-counted class is a gate only
     # while it is holding someone -- plan_ondemand_gates counts these.
     held_by_overcommit: bool = False
+    # True while the candidate's latest preflight or grant-time judgment held it
+    # at guard 5 -- no node it may use has room, net of claims (reset at the top
+    # of every preflight).  The pod watch re-judges such a candidate in memory
+    # whenever GPUs of its class come free, and re-attempts it at once when it
+    # now fits, instead of leaving it to its retry clock and the next queue
+    # tick's node snapshot.  See main._retry_node_fit_holds.
+    held_by_node_fit: bool = False
+    # The pod's node selector / required node affinity as preflight last read it
+    # (a k8s_client.NodePlacement), or None for none.  Kept so the watch can
+    # re-judge guard 5 without re-reading the pod.  Only a trigger reads it:
+    # the attempt it triggers runs preflight, which re-reads the pod.
+    placement: Optional[NodeMatcher] = None
     # The app's latest answer about this ask was "it fits, but not now, for want
     # of capacity": a create refused by a capacity gate as contended, or the
     # admission selection withholding it as outranked.  With delegation on, such
@@ -996,9 +1145,11 @@ class ControllerState:
         # multi-GPU on-demand candidate is held when no single node can host it,
         # so the controller does not mint an SU-charged lease that can never
         # schedule.  Refreshed each queue_processor_loop tick from a node-inventory
-        # + tolerated-pod snapshot; a class absent from the map is "unknown" and
-        # never blocks (fail-open); a failed snapshot leaves the prior map intact
-        # (fail-safe).  Empty = no data yet.
+        # + tolerated-pod snapshot, seeded at startup before the pod watch
+        # starts, and kept current in between (see gpu_pods below); a class
+        # absent from the map is "unknown" and never blocks (fail-open); a
+        # failed snapshot leaves the prior map intact (fail-safe).  Empty = no
+        # data yet.
         self.node_free_by_class: dict[str, int] = {}
 
         # Node existence (guard 1): number of schedulable nodes carrying each
@@ -1015,10 +1166,31 @@ class ControllerState:
         # node's labels, from the same inventory snapshot.  node_free_by_class
         # is the collapse of the first; a pod that may run on only some of a
         # class's nodes is measured against those nodes instead.  Same
-        # lifecycle: refreshed each tick, left intact on a failed snapshot, and
+        # lifecycle: refreshed each tick and seeded at startup (the free map
+        # also kept current in between), left intact on a failed snapshot, and
         # a class or node absent from either is unknown and never blocks.
         self.node_free_by_node_class: dict[str, dict[str, int]] = {}
         self.node_labels: dict[str, dict[str, str]] = {}
+
+        # What node_free_by_node_class and node_free_by_class are derived from,
+        # kept so the two stay current *between* node snapshots.  node_inventory is allocatable GPUs per
+        # node, per class, from the last good snapshot.  gpu_pods is every live
+        # tolerated pod's GPUs, keyed by uid: on a node, or not bound yet -- a
+        # claim on the next opening its placement allows (see GpuPod).
+        # Admission and the pod watch update gpu_pods as pods are admitted,
+        # bind, start terminating or end; each queue tick rebuilds it from the
+        # tolerated-pod snapshot (self-healing a missed event, as occupancy
+        # does).  node_free_by_node_class / node_free_by_class are re-derived
+        # on every change, so guard 5 sees a GPU come free when it does, not
+        # one QUEUE_PROCESSOR_INTERVAL later, and never double-books an opening
+        # an earlier grant -- in this batch or any since the snapshot -- has
+        # already claimed.
+        self.node_inventory: dict[str, dict[str, int]] = {}
+        self.gpu_pods: dict[str, GpuPod] = {}
+        # Changes made to gpu_pods, with when, so a rebuild from a snapshot
+        # taken *before* a change does not undo it: uid -> (when, the record
+        # set, or None for removed).  Pruned by each rebuild.
+        self._gpu_pod_changes: dict[str, tuple[datetime, Optional[GpuPod]]] = {}
 
         # No-show tracking:
         # Maps reservation_id → deadline by which a matching pod must appear.
@@ -2284,6 +2456,123 @@ class ControllerState:
             and r.id not in fetched_ids
             and slot_end(r) > now
         ]
+
+    # -- per-node GPU accounting (guards 1 and 5) ----------------------------
+
+    def install_node_inventory(
+        self,
+        inventory: dict[str, dict[str, int]],
+        node_labels: dict[str, dict[str, str]],
+    ) -> None:
+        """Adopt a good node snapshot: allocatable per node, and node labels.
+
+        Replaces ``node_free_by_node_class`` / ``node_free_by_class`` wholesale
+        -- a class the snapshot no longer lists leaves both -- re-deriving them
+        against ``gpu_pods``.  Called only with a snapshot that succeeded: a
+        failed one leaves every map as it was.
+        """
+        self.node_inventory = {c: dict(nodes) for c, nodes in inventory.items()}
+        self.node_labels = node_labels
+        free = node_free_from_pods(self.node_inventory, self.gpu_pods.values())
+        self.node_free_by_node_class = free
+        self.node_free_by_class = largest_node_free_by_class(free)
+
+    def rebuild_gpu_pods(self, pods: dict[str, GpuPod], taken_at: datetime) -> None:
+        """Replace ``gpu_pods`` with a snapshot's records, keeping later changes.
+
+        *pods* is a record per live tolerated pod from a snapshot LISTed at
+        *taken_at* (read before the LIST was issued).  A change admission or the
+        watch made at or after *taken_at* may not be in the snapshot, so it is
+        re-applied over it -- including a removal, so a pod deleted while the
+        LIST was in flight is not resurrected.  Older changes are what the
+        snapshot reflects, and are pruned.  The free maps are re-derived for
+        every class the inventory knows, in place.
+        """
+        merged = dict(pods)
+        for uid, (when, record) in list(self._gpu_pod_changes.items()):
+            if when < taken_at:
+                del self._gpu_pod_changes[uid]
+            elif record is None:
+                merged.pop(uid, None)
+            else:
+                merged[uid] = record
+        self.gpu_pods = merged
+        self._derive_node_free(self.node_inventory.keys())
+
+    def set_gpu_pod(
+        self, uid: str, record: Optional[GpuPod], now: datetime
+    ) -> Optional[GpuPod]:
+        """Record what pod *uid* now holds (``None``: nothing) and return what it
+        held before, re-deriving the free maps of the classes involved.
+
+        Idempotent, so a watch event replayed by a re-LIST, or admission and the
+        watch both reporting the same change, counts once.  Every call is
+        remembered until the next rebuild, so the rebuild cannot undo it.
+        """
+        previous = self.gpu_pods.get(uid)
+        if record is None:
+            self.gpu_pods.pop(uid, None)
+        else:
+            self.gpu_pods[uid] = record
+        self._gpu_pod_changes[uid] = (now, record)
+        if previous != record:
+            self._derive_node_free(
+                {p.gpu_class for p in (previous, record) if p is not None}
+            )
+        return previous
+
+    def _derive_node_free(self, classes: Iterable[str]) -> None:
+        """Re-derive the free maps for *classes*, in place.
+
+        Only a class the node inventory knows is touched: without allocatable
+        counts there is nothing to derive from, and the maps keep whatever they
+        held (no data still means unknown, never blocking).
+        """
+        targets = [c for c in classes if c in self.node_inventory]
+        if not targets:
+            return
+        free = node_free_from_pods(
+            {c: self.node_inventory[c] for c in targets},
+            (p for p in self.gpu_pods.values() if p.gpu_class in targets),
+        )
+        for gpu_class, per_node in free.items():
+            self.node_free_by_node_class[gpu_class] = per_node
+            self.node_free_by_class[gpu_class] = max(per_node.values(), default=0)
+
+    def node_claims(
+        self,
+        gpu_class: str,
+        allowed: Optional[frozenset[str]],
+        *,
+        exclude_uid: Optional[str] = None,
+    ) -> int:
+        """GPUs that admitted, not-yet-bound pods of *gpu_class* may take from
+        the nodes in *allowed* (``None``: any node of the class).
+
+        A claim counts when the nodes its own placement allows overlap
+        *allowed*.  Conservative: a claim that could land on either side of the
+        overlap is counted in full, which costs a waiting ask a short retry
+        until the claim binds -- at which point the watch re-judges it
+        (``main._retry_node_fit_holds``).  A claim allowing no node of the class
+        can never bind there and counts against nothing.
+        """
+        class_nodes = self.node_free_by_node_class.get(gpu_class)
+        total = 0
+        for uid, p in self.gpu_pods.items():
+            if uid == exclude_uid or p.node_name is not None or p.gpu_class != gpu_class:
+                continue
+            theirs = placement_nodes(p.placement, class_nodes, self.node_labels)
+            if theirs is not None and allowed is not None:
+                overlaps = bool(theirs & allowed)
+            elif theirs is not None:
+                overlaps = bool(theirs)
+            elif allowed is not None:
+                overlaps = bool(allowed)
+            else:
+                overlaps = True
+            if overlaps:
+                total += p.gpu_count
+        return total
 
     def reconcile_occupancy(self, placements: list[tuple[int, str, int]]) -> None:
         """Rebuild the occupancy map from a live cluster snapshot.
