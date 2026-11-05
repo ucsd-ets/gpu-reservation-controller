@@ -108,3 +108,12 @@ and `k8s_client.py` / the `main.py` coroutines are driven with `monkeypatch`,
 `SimpleNamespace` pod stubs, and `asyncio.run` (see `tests/test_guards.py`,
 `tests/test_watch_release.py`).  No `pytest-httpx` or kubernetes fake client is
 required or installed.
+
+Give anything that drives `pod_watch_loop` a full `Config`
+(`tests.conftest.make_config`), not a `SimpleNamespace` config.  The loop
+swallows each event's exception (logging `pod.event_failed`), so a missing
+attribute silently ends the event's handling partway while the test's
+assertions still pass.  An autouse fixture in `tests/conftest.py` therefore
+fails any test that logs `pod.event_failed`, unless it is marked
+`@pytest.mark.expects_pod_event_failed` (the deliberate poison tests in
+`tests/test_watch_loop_guard.py`).

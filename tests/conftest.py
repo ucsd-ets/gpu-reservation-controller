@@ -12,7 +12,20 @@ Import from test modules with ``from tests.conftest import ...``.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from datetime import date, datetime, timedelta, timezone
+
+import pytest
+
+# app.main builds its FastAPI app at import, and Config.from_env() raises
+# without these.  Set here because this module is imported before any test
+# module.  In the full suite, two modules happen to setdefault them at
+# collection, so a module importing app.main without setting them passed there
+# and failed when run on its own.  Tests of the missing-variable error delete
+# them with monkeypatch first.
+os.environ.setdefault("RESERVATION_API_URL", "http://reservations.local")
+os.environ.setdefault("RESERVATION_API_KEY", "gpures_test")
 
 from app.config import Config
 from app.controller import ControllerState
@@ -385,3 +398,90 @@ def call_locked(state: ControllerState, fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
     return asyncio.run(_held())
+
+
+# ---------------------------------------------------------------------------
+# Swallowed watch-event guard
+# ---------------------------------------------------------------------------
+
+#: What ``pod_watch_loop`` logs when handling one watch event raises.
+SWALLOWED_WATCH_EVENT = "pod.event_failed"
+
+#: Marker for a test that makes ``pod_watch_loop`` swallow an event on purpose.
+EXPECTS_SWALLOWED_WATCH_EVENT = "expects_pod_event_failed"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        f"{EXPECTS_SWALLOWED_WATCH_EVENT}: the test feeds pod_watch_loop an event "
+        f"that is meant to fail (logging {SWALLOWED_WATCH_EVENT}); unmarked, any "
+        "such event fails the test, and marked, the test fails without one",
+    )
+
+
+def check_swallowed_watch_events(
+    records: list[logging.LogRecord], *, expected: bool
+) -> None:
+    """Fail the current test unless its ``pod.event_failed`` records match *expected*.
+
+    The decision behind :func:`no_swallowed_watch_events`, kept apart from the
+    fixture so it can be tested without a nested pytest run.  Matched on the
+    parsed ``event`` field, not a substring of the rendered line.
+    """
+    swallowed = [
+        r for r in records
+        if SWALLOWED_WATCH_EVENT in r.getMessage()
+        and kv_fields(r.getMessage()).get("event") == SWALLOWED_WATCH_EVENT
+    ]
+    if swallowed and not expected:
+        pytest.fail(
+            "pod_watch_loop swallowed an exception, so the rest of that event's "
+            "handling never ran and the test's assertions may have passed on a "
+            "half-handled event:\n"
+            + "\n".join(f"  {r.getMessage()}" for r in swallowed)
+            + "\nFix the cause (often a SimpleNamespace config or pod stub missing "
+            "an attribute the handler reads; prefer make_config()).  If the test "
+            "poisons the event on purpose, mark it "
+            f"@pytest.mark.{EXPECTS_SWALLOWED_WATCH_EVENT}.",
+            pytrace=False,
+        )
+    if expected and not swallowed:
+        pytest.fail(
+            f"marked {EXPECTS_SWALLOWED_WATCH_EVENT}, but pod_watch_loop logged no "
+            f"{SWALLOWED_WATCH_EVENT}: the event it poisons is now handled cleanly, "
+            "so the test no longer exercises the guard",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def no_swallowed_watch_events(request, caplog):
+    """Fail any test in which ``pod_watch_loop`` swallowed an event.
+
+    The loop handles each watch event under its own ``try/except`` so that one
+    bad event cannot kill the consumer: an exception partway through a handler
+    is logged as ``pod.event_failed`` and the loop moves on to the next event.
+    In a test, that means everything after the crash point silently never runs
+    while assertions about state set *before* it still pass.  Three best-effort
+    routing tests did exactly that: their ``SimpleNamespace`` config lacked a
+    field the handler read just after adding the candidate, so the annotation
+    notice and the admission batch never ran, and the tests passed anyway.
+
+    Every test is checked, not just the ones that remember to ask, because
+    the loop is driven from many modules, each through its own helper.  A test
+    that poisons an event deliberately says so with
+    ``@pytest.mark.expects_pod_event_failed``, and is held to it: a marked test
+    that logs no such event fails too, so the marker cannot outlive the poison
+    and quietly switch the guard off for a test that no longer needs it.
+
+    **Limitation:** this reads caplog's records, so a test that raises caplog's
+    level above ERROR around the loop (``caplog.at_level(logging.CRITICAL)``),
+    or calls ``caplog.clear()`` after it, hides the event from this guard.
+    """
+    yield
+    check_swallowed_watch_events(
+        caplog.get_records("setup") + caplog.get_records("call"),
+        expected=request.node.get_closest_marker(EXPECTS_SWALLOWED_WATCH_EVENT)
+        is not None,
+    )
